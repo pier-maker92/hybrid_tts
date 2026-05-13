@@ -1,0 +1,13 @@
+diffusion_head:
+  sigma: 1e-5
+  audio_latent_dim: 64
+  net_dim: 512
+  net_heads: 8
+  net_depth: 6
+  backbone_dim: 512
+  uncond_prob: 0.1
+  is_causal: false
+  use_conv_layer: false
+  use_window_attention: false
+  use_group_bidirectional: false
+  use_mlp_sampler: false

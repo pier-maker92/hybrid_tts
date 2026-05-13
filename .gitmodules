@@ -1,0 +1,3 @@
+[submodule "MelCausalVAE"]
+	path = modules/submodules/MelCausalVAE
+	url = /scratch/piermel/MelCausalVAE

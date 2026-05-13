@@ -1,0 +1,21 @@
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+numpy==1.26.4
+soundfile
+transformers==5.0.0
+hydra-core
+torchdiffeq
+beartype
+torchcodec==0.7
+vocos==0.1.0
+
+[training]
+deepspeed==0.18.4
+accelerate==1.13.0
+datasets==4.1.0
+utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git
+matplotlib
+wandb
+jiwer
+torchaudio_filters

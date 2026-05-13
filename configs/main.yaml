@@ -1,0 +1,10 @@
+defaults:
+  - defaults/train
+  - defaults/backbone
+  - defaults/diffusion_head
+  - _self_
+  - settings: null
+
+prompt_vocab_size: 256
+discrete_token_vocab_size: 1024
+continuous_dim: 64

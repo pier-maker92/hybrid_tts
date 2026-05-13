@@ -1,0 +1,64 @@
+defaults:
+  training:
+    seed: 42
+    dataset_name: librispeech_aligned
+    output_dir: outputs/hybrid_tts
+    learning_rate: 0.0001
+    min_learning_rate: 1.0e-06
+    per_device_train_batch_size: 8
+    per_device_eval_batch_size: 8
+    gradient_accumulation_steps: 1
+    max_steps: 100000
+    logging_steps: 100
+    eval_steps: 1000
+    save_steps: 1000
+    save_total_limit: 3
+    report_to: wandb
+    wandb_project: hybrid_tts
+    wandb_run_name: baseline
+  backbone:
+    model_name_or_path: Qwen/Qwen2-0.5B
+    pretrained: false
+    vocab_size: 256
+    pad_token_id: 0
+    bos_token_id: 1
+    eos_token_id: 2
+  diffusion_head:
+    sigma: 1.0e-05
+    audio_latent_dim: 64
+    net_dim: 512
+    net_heads: 8
+    net_depth: 6
+    backbone_dim: 512
+    uncond_prob: 0.1
+    is_causal: false
+    use_conv_layer: false
+    use_window_attention: false
+    use_group_bidirectional: false
+    use_mlp_sampler: false
+prompt_vocab_size: 256
+discrete_token_vocab_size: 1024
+continuous_dim: 64
+training:
+  dataset_name: librispeech_aligned
+  output_dir: checkpoints/exps/setting-1
+  learning_rate: 0.0001
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  report_to: none
+  wandb_project: hybrid_tts
+  wandb_run_name: setting-1
+  bf16: true
+  logging_steps: 10
+  eval_strategy: steps
+  eval_steps: 1000
+  save_steps: 1000
+backbone:
+  model_name_or_path: Qwen/Qwen2-0.5B
+  pretrained: false
+diffusion_head:
+  net_dim: 512
+  net_depth: 6
+  net_heads: 8
+  uncond_prob: 0.1
+  use_mlp_sampler: true

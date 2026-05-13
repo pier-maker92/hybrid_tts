@@ -1,0 +1,26 @@
+# @package _global_
+training:
+  dataset_name: librispeech_aligned
+  output_dir: checkpoints/exps/setting-1
+  learning_rate: 1e-4
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  report_to: none
+  wandb_project: hybrid_tts
+  wandb_run_name: setting-1
+  bf16: true
+  logging_steps: 10
+  eval_strategy: "steps"
+  eval_steps: 10
+  save_steps: 1000
+
+backbone:
+  model_name_or_path: "Qwen/Qwen2-0.5B"
+  pretrained: false
+
+diffusion_head:
+  net_dim: 512
+  net_depth: 6
+  net_heads: 8
+  uncond_prob: 0.1
+  use_mlp_sampler: true
