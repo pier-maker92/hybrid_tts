@@ -1,5 +1,2 @@
-[submodule "MelCausalVAE"]
-	path = modules/submodules/MelCausalVAE
-	url = /scratch/piermel/MelCausalVAE
 [submodule "modules/submodules/MelCausalVAE"]
 	url = https://github.com/pier-maker92/MelCausalVAE.git
