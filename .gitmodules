@@ -1,2 +1,3 @@
 [submodule "modules/submodules/MelCausalVAE"]
 	url = https://github.com/pier-maker92/MelCausalVAE.git
+	path = modules/submodules/MelCausalVAE
