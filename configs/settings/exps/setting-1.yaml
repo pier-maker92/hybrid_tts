@@ -3,16 +3,17 @@ training:
   dataset_name: librispeech_aligned
   output_dir: checkpoints/exps/setting-1
   learning_rate: 1e-4
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
   report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: setting-1
   bf16: true
-  logging_steps: 10
+  logging_steps: 1
   eval_strategy: "steps"
-  eval_steps: 10
+  eval_steps: 5
   save_steps: 1000
+  eval_num_samples: 10
 
 backbone:
   model_name_or_path: "Qwen/Qwen2-0.5B"
@@ -24,3 +25,9 @@ diffusion_head:
   net_heads: 8
   uncond_prob: 0.1
   use_mlp_sampler: true
+
+continuous_adapter:
+  hidden_dim: 512
+  num_layers: 2   # Crea 2 strati nascosti + strato di output
+vae_checkpoint: "/Users/software/Research/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
+vocoder_checkpoint: "vocos"

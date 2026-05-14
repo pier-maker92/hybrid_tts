@@ -16,6 +16,8 @@ from modules.submodules.MelCausalVAE.modules.VAE import VAE, VAEConfig
 from modules.submodules.MelCausalVAE.modules.builder import build_model
 import json
 import yaml
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def collate_fn(batch):
@@ -55,7 +57,10 @@ def main():
         "--batch_size", type=int, default=16, help="Batch size for inference"
     )
     parser.add_argument(
-        "--shard_size_mb", type=int, default=512, help="Max size in MB for each parquet shard"
+        "--shard_size_mb",
+        type=int,
+        default=512,
+        help="Max size in MB for each parquet shard",
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of dataloader workers"
@@ -72,9 +77,19 @@ def main():
         local_rank = int(os.environ["LOCAL_RANK"])
         global_rank = int(os.environ["RANK"])
         torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         local_rank = 0
         global_rank = 0
 
@@ -88,7 +103,7 @@ def main():
     model = build_model(cfg_dict)
     checkpoint_path = os.path.join(args.checkpoint_dir, "model.safetensors")
     model.from_pretrained(checkpoint_path)
-    
+
     dtype = torch.bfloat16 if args.bf16 else torch.float32
     model.to(dtype)
     model.to(device)
@@ -122,7 +137,7 @@ def main():
         data_files = {"data": str(input_dir / "*.parquet")}
     else:
         data_files = {d.name: str(d / "*.parquet") for d in subdirs}
-    
+
     dataset = load_dataset("parquet", data_files=data_files)
 
     out_path = Path(output_dir)
@@ -145,13 +160,11 @@ def main():
             pin_memory=True,
         )
 
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
         split_dir = out_path / split
         split_dir.mkdir(parents=True, exist_ok=True)
-        
+
         shard_idx = 0
+
         def get_parquet_file(idx):
             return split_dir / f"data_rank{global_rank}_{idx:05d}.parquet"
 
@@ -167,14 +180,14 @@ def main():
                 try:
                     wav, sr = torchaudio.load(io.BytesIO(audio_item["bytes"]))
                     tensor = wav.squeeze(0).float()
-                    
+
                     # Resample if necessary
                     if sr != target_sr:
                         tensor = torchaudio.functional.resample(tensor, sr, target_sr)
-                    
+
                     # Apply dtype
                     tensor = tensor.to(dtype)
-                    
+
                     audios_srs.append((tensor.to(device), target_sr))
                 except Exception as e:
                     print(f"Error decoding audio: {e}")
@@ -234,9 +247,12 @@ def main():
             if writer is None:
                 writer = pq.ParquetWriter(parquet_file, table.schema)
             writer.write_table(table)
-            
+
             # Check shard size
-            if parquet_file.exists() and parquet_file.stat().st_size >= args.shard_size_mb * 1024 * 1024:
+            if (
+                parquet_file.exists()
+                and parquet_file.stat().st_size >= args.shard_size_mb * 1024 * 1024
+            ):
                 writer.close()
                 writer = None
                 shard_idx += 1

@@ -10,6 +10,7 @@ training:
   max_steps: 100000
   logging_steps: 100
   eval_steps: 1000
+  eval_num_samples: 100
   save_steps: 1000
   save_total_limit: 3
   report_to: wandb

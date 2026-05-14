@@ -1,12 +1,13 @@
 import os
-import math
+import json
 import torch
 import wandb
 import logging
 import datetime
 import hydra
-from omegaconf import DictConfig, OmegaConf
 from typing import Dict, List
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader
 
 from transformers import (
     Trainer,
@@ -17,9 +18,12 @@ from transformers import (
     set_seed,
 )
 
-import torch.distributed as dist
 from accelerate import Accelerator
+from transformers import AutoTokenizer
+from modules.builder import build_model
+from accelerate import InitProcessGroupKwargs
 from data.audio_dataset import DataCollator, TrainDatasetWrapper, TestDatasetWrapper
+from modules.evaluation import run_evaluation
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -46,6 +50,85 @@ class AddGranularLossesToTrainerState(TrainerCallback):
         return control
 
 
+def load_vae(checkpoint_dir: str, device: torch.device):
+    try:
+        from modules.submodules.MelCausalVAE.modules.builder import (
+            build_model as build_vae,
+        )
+
+        config_path = os.path.join(checkpoint_dir, "config.json")
+        with open(config_path, "r") as f:
+            cfg_dict = json.load(f)
+        vae = build_vae(cfg_dict)
+
+        checkpoint_path = os.path.join(checkpoint_dir, "model.safetensors")
+        if os.path.exists(checkpoint_path):
+            vae.from_pretrained(checkpoint_path)
+        else:
+            checkpoint_path = os.path.join(checkpoint_dir, "model.pt")
+            if os.path.exists(checkpoint_path):
+                vae.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+
+        vae.eval()
+        vae.to(device)
+        return vae
+    except Exception as e:
+        logger.error(f"Failed to load VAE from {checkpoint_dir}: {e}")
+        return None
+
+
+def load_vocoder(vocoder_name_or_path: str, device: torch.device):
+    try:
+        from vocos import Vocos
+
+        if vocoder_name_or_path == "bigvgan" or vocoder_name_or_path == "vocos":
+            vocoder = Vocos.from_pretrained("charactr/vocos-mel-24khz").to(device)
+        else:
+            vocoder = Vocos.from_pretrained(vocoder_name_or_path).to(device)
+        return vocoder
+    except Exception as e:
+        logger.error(f"Failed to load Vocoder {vocoder_name_or_path}: {e}")
+        return None
+
+
+class EvaluationCallback(TrainerCallback):
+    def __init__(self, vae, vocoder, vocoder_type, dataset_name, eval_dataset, num_samples=100, batch_size=1):
+        self.vae = vae
+        self.vocoder = vocoder
+        self.vocoder_type = vocoder_type
+        self.dataset_name = dataset_name
+        self.num_samples = num_samples
+        # Build a dedicated DataLoader limited to num_samples
+        if num_samples and num_samples > 0:
+            indices = list(range(min(num_samples, len(eval_dataset))))
+            subset = torch.utils.data.Subset(eval_dataset, indices)
+        else:
+            subset = eval_dataset
+        self.eval_dataloader = DataLoader(
+            subset,
+            batch_size=batch_size,
+            shuffle=False,
+            collate_fn=DataCollator(),
+        )
+        logger.info(f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples.")
+
+    def on_evaluate(self, args, state, control, model, **kwargs):
+        if state.is_world_process_zero:
+            logger.info(f"Running custom evaluation at step {state.global_step}...")
+            run_evaluation(
+                model=model,
+                vae=self.vae,
+                vocoder=self.vocoder,
+                vocoder_type=self.vocoder_type,
+                eval_dataloader=self.eval_dataloader,
+                device=args.device,
+                step=state.global_step,
+                dataset_name=self.dataset_name,
+                num_samples=self.num_samples,
+                run_id=wandb.run.id if wandb.run else "eval_run",
+            )
+
+
 class HybridTTSTrainer(Trainer):
     def __init__(self, dataset_name: str = "dataset", **kwargs):
         super().__init__(**kwargs)
@@ -55,37 +138,13 @@ class HybridTTSTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # We need prompt_ids, discrete_tokens, continuous_tokens
-        # Here we mock extraction of these inputs from the dataset batch
-        # You need to adapt this according to the actual keys in the DataCollator output
-        # Assuming DataCollator outputs: "prompt_ids", "discrete_tokens", "continuous_tokens", "padding_mask"
+        # Assuming DataCollator outputs: "ids", "prompt_ids", "discrete_tokens", "continuous_tokens", "padding_mask"
 
         prompt_ids = inputs.get("prompt_ids", None)
         discrete_tokens = inputs.get("discrete_tokens", None)
         continuous_tokens = inputs.get("continuous_tokens", None)
         padding_mask = inputs.get("padding_mask", None)
-
-        # If inputs are not provided directly by DataCollator (like in MelCausalVAE it's output_audios_srs),
-        # You might need to use MelCausalVAE submodule to extract them first.
-        # For simplicity, we assume they are provided in inputs.
-
-        # We'll calculate a dummy loss if inputs are missing to keep the training loop running
-        if prompt_ids is None or discrete_tokens is None or continuous_tokens is None:
-            # Placeholder for actual feature extraction
-            batch_size = (
-                inputs["output_audios_srs"][0][0].shape[0]
-                if "output_audios_srs" in inputs
-                else 2
-            )
-            device = self.args.device
-            prompt_ids = torch.randint(0, 256, (batch_size, 50)).to(device)
-            discrete_tokens = torch.randint(0, 1024, (batch_size, 100)).to(device)
-            continuous_tokens = torch.randn(
-                batch_size, 100, model.config.continuous_dim
-            ).to(device)
-            padding_mask = torch.zeros(batch_size, 100, dtype=torch.bool).to(device)
-            target_tokens = discrete_tokens.clone()
-        else:
-            target_tokens = inputs.get("target_tokens", discrete_tokens)
+        target_tokens = inputs.get("target_tokens", discrete_tokens)
 
         outputs = model(
             prompt_ids=prompt_ids,
@@ -176,18 +235,17 @@ def main(cfg: DictConfig):
 
     set_seed(training_cfg.get("seed", 42))
 
-    from accelerate import InitProcessGroupKwargs
-
     kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=7200))
     accelerator = Accelerator(kwargs_handlers=[kwargs])
     logger.info(f"Using device: {accelerator.device}")
 
     # Dataset loading logic
     dataset_name = training_cfg.pop("dataset_name")
+    force_vocab_build = training_cfg.get("force_vocab_build", False)
     if dataset_name == "librispeech_aligned":
         from data.librispeech_align import LibriSpeechAlignDataset
 
-        dataset = LibriSpeechAlignDataset()
+        dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
     else:
         # Fallback to dummy
         dataset = None
@@ -209,13 +267,68 @@ def main(cfg: DictConfig):
             resume="allow" if wandb_id else None,
         )
 
-    from modules.builder import build_model
+    vocab_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
+    )
+    if os.path.exists(vocab_path):
+        with open(vocab_path, "r") as f:
+            phoneme_vocab = json.load(f)
+        phoneme_list = list(phoneme_vocab.keys())
+        vocab_size = len(phoneme_vocab)
+    else:
+        phoneme_list = []
+        vocab_size = 256
+
+    backbone_cfg = cfg_dict.get("backbone_config", cfg_dict.get("backbone", {}))
+    is_pretrained = backbone_cfg.get("pretrained", False)
+    model_name_or_path = backbone_cfg.get("model_name_or_path", "Qwen/Qwen2-0.5B")
+
+    if not is_pretrained:
+        cfg_dict["prompt_vocab_size"] = vocab_size + 2  # Phonemes + Special Tokens
+        cfg_dict["prompt_offset"] = 0
+        cfg_dict["start_audio_id"] = vocab_size
+        cfg_dict["end_audio_id"] = vocab_size + 1
+        logger.info(
+            f"Training from scratch: set prompt_vocab_size to {cfg_dict['prompt_vocab_size']}"
+        )
+    else:
+        logger.info(
+            f"Using pretrained backbone, loading tokenizer from {model_name_or_path}"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+
+        # Add phonemes
+        if phoneme_list:
+            num_added = tokenizer.add_tokens(phoneme_list)
+            phoneme_ids = tokenizer.convert_tokens_to_ids(phoneme_list)
+            cfg_dict["prompt_offset"] = min(phoneme_ids)
+            logger.info(
+                f"Added {num_added} phonemes to tokenizer starting at ID {cfg_dict['prompt_offset']}"
+            )
+        else:
+            cfg_dict["prompt_offset"] = 0
+
+        # Add special tokens
+        special_tokens = ["<start_audio>", "<end_audio>"]
+        tokenizer.add_tokens(special_tokens)
+        cfg_dict["start_audio_id"] = tokenizer.convert_tokens_to_ids("<start_audio>")
+        cfg_dict["end_audio_id"] = tokenizer.convert_tokens_to_ids("<end_audio>")
+        logger.info(
+            f"Special tokens IDs: <start_audio>={cfg_dict['start_audio_id']}, <end_audio>={cfg_dict['end_audio_id']}"
+        )
+
+        cfg_dict["prompt_vocab_size"] = len(tokenizer)
 
     logger.info("Creating HybridTTS model...")
     model = build_model(cfg_dict)
 
+    if is_pretrained and "tokenizer" in locals():
+        model.backbone.resize_token_embeddings(len(tokenizer))
+        logger.info("Resized backbone token embeddings to match tokenizer.")
+
     training_cfg["learning_rate"] = float(training_cfg.get("learning_rate"))
     min_learning_rate = float(training_cfg.pop("min_learning_rate", 0.0))
+    eval_num_samples = training_cfg.pop("eval_num_samples", 100)
 
     training_args = TrainingArguments(
         remove_unused_columns=False,
@@ -224,14 +337,53 @@ def main(cfg: DictConfig):
     )
 
     data_collator = DataCollator()
+    # Limit eval_dataset for the Trainer's own eval loop too
+    if test_dataset is not None and eval_num_samples and eval_num_samples > 0:
+        indices = list(range(min(eval_num_samples, len(test_dataset))))
+        eval_dataset = torch.utils.data.Subset(test_dataset, indices)
+        logger.info(f"Trainer eval_dataset limited to {len(eval_dataset)} samples (eval_num_samples={eval_num_samples}).")
+    else:
+        eval_dataset = test_dataset
+
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=test_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         dataset_name=dataset_name,
     )
+
+    # Optional: Load VAE and Vocoder for evaluation
+    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    vocoder_checkpoint = cfg_dict.get("vocoder_checkpoint")
+
+    if vae_checkpoint or vocoder_checkpoint:
+        logger.info("Loading VAE/Vocoder for evaluation...")
+        vae = load_vae(vae_checkpoint, accelerator.device) if vae_checkpoint else None
+        vocoder = (
+            load_vocoder(vocoder_checkpoint, accelerator.device)
+            if vocoder_checkpoint
+            else None
+        )
+        vocoder_type = cfg_dict.get("vocoder_type", "bigvgan")
+
+        if vae is not None or vocoder is not None:
+            trainer.add_callback(
+                EvaluationCallback(
+                    vae=vae,
+                    vocoder=vocoder,
+                    vocoder_type=vocoder_type,
+                    dataset_name=dataset_name,
+                    eval_dataset=test_dataset,
+                    num_samples=eval_num_samples,
+                    batch_size=training_args.per_device_eval_batch_size,
+                )
+            )
+        else:
+            logger.warning(
+                "Could not load VAE or Vocoder. Evaluation callback disabled."
+            )
 
     logger.info("Starting training...")
     trainer.train()

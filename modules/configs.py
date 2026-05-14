@@ -57,6 +57,9 @@ class HybridTTSConfig:
     discrete_token_vocab_size: int = 1024
     continuous_dim: int = 64
     backbone_hidden_size: int = 512
+    start_audio_id: int = 0
+    end_audio_id: int = 0
+    prompt_offset: int = 0
 
     def __post_init__(self):
         # Ensure consistency
