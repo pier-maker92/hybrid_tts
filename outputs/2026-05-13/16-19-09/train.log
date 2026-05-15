@@ -1,9 +1,0 @@
-[2026-05-13 16:19:09,639][__main__][INFO] - Using device: cuda
-[2026-05-13 16:19:09,994][__main__][INFO] - Creating HybridTTS model...
-[2026-05-13 16:19:27,562][root][INFO] - gcc -DNDEBUG -g -fwrapv -O3 -Wall -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -fPIC -c /tmp/tmpqnr0aoox/test.c -o /tmp/tmpqnr0aoox/test.o
-[2026-05-13 16:19:27,626][root][INFO] - gcc /tmp/tmpqnr0aoox/test.o -laio -o /tmp/tmpqnr0aoox/a.out
-[2026-05-13 16:19:28,196][root][INFO] - gcc -DNDEBUG -g -fwrapv -O3 -Wall -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -fPIC -c /tmp/tmp0wqyghib/test.c -o /tmp/tmp0wqyghib/test.o
-[2026-05-13 16:19:28,213][root][INFO] - gcc /tmp/tmp0wqyghib/test.o -L/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/cudacore/12.6.2 -L/cvmfs/soft.computecanada.ca/easybuild/software/2023/x86-64-v3/Core/cudacore/12.6.2/lib64 -lcufile -o /tmp/tmp0wqyghib/a.out
-[2026-05-13 16:19:28,310][root][INFO] - gcc -DNDEBUG -g -fwrapv -O3 -Wall -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -O2 -ftree-vectorize -march=x86-64-v4 -fno-math-errno -fPIC -fPIC -c /tmp/tmptxve7yef/test.c -o /tmp/tmptxve7yef/test.o
-[2026-05-13 16:19:28,327][root][INFO] - gcc /tmp/tmptxve7yef/test.o -laio -o /tmp/tmptxve7yef/a.out
-[2026-05-13 16:19:35,454][__main__][INFO] - Starting training...

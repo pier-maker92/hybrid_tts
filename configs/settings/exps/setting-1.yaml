@@ -3,17 +3,19 @@ training:
   dataset_name: librispeech_aligned
   output_dir: checkpoints/exps/setting-1
   learning_rate: 1e-4
-  per_device_train_batch_size: 2
+  per_device_train_batch_size: 8
   gradient_accumulation_steps: 1
-  report_to: none
+  report_to: wandb
   wandb_project: hybrid_tts
   wandb_run_name: setting-1
   bf16: true
   logging_steps: 1
   eval_strategy: "steps"
-  eval_steps: 5
+  eval_steps: 1000
   save_steps: 1000
-  eval_num_samples: 10
+  eval_num_samples: 100
+  num_train_epochs: 100
+  run_id: ""
 
 backbone:
   model_name_or_path: "Qwen/Qwen2-0.5B"
@@ -21,8 +23,7 @@ backbone:
 
 diffusion_head:
   net_dim: 512
-  net_depth: 6
-  net_heads: 8
+  net_depth: 3
   uncond_prob: 0.1
   use_mlp_sampler: true
 

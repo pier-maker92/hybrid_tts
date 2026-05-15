@@ -157,3 +157,5 @@ wandb/
 data/*.json
 !data/phoneme_vocab.json    
 outputs/
+
+*.pyc

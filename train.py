@@ -142,8 +142,10 @@ class EvaluationCallback(TrainerCallback):
             else None
         )
         try:
+            # Unwrap model if it's DDP
+            unwrapped_model = getattr(model, "module", model)
             run_evaluation(
-                model=model,
+                model=unwrapped_model,
                 vae=vae,
                 vocoder=vocoder,
                 vocoder_type=self.vocoder_type,
@@ -162,10 +164,34 @@ class EvaluationCallback(TrainerCallback):
 
 class HybridTTSTrainer(Trainer):
     def __init__(self, dataset_name: str = "dataset", **kwargs):
+        eval_num_samples = kwargs.pop("eval_num_samples", 100)
+        self.eval_num_samples = (
+            eval_num_samples if eval_num_samples is not None else float("inf")
+        )
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         granular_losses = ["token_loss", "diffusion_loss", "total_loss"]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Run evaluation and limit number of samples.
+        """
+        if eval_dataset is None:
+            eval_dataset = self.eval_dataset
+
+        if eval_dataset is not None and self.eval_num_samples < float("inf"):
+            num_samples = min(int(self.eval_num_samples), len(eval_dataset))
+            indices = list(range(num_samples))
+            eval_dataset = torch.utils.data.Subset(eval_dataset, indices)
+            logger.info(f"Evaluating on a subset of {num_samples} samples.")
+
+        return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # We need prompt_ids, discrete_tokens, continuous_tokens
@@ -189,8 +215,11 @@ class HybridTTSTrainer(Trainer):
 
         # Token Loss
         loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+        # Handle DDP wrapping
+        unwrapped_model = getattr(model, "module", model)
         token_loss = loss_fct(
-            token_logits.view(-1, model.config.discrete_token_vocab_size),
+            token_logits.view(-1, unwrapped_model.config.discrete_token_vocab_size),
             target_tokens.view(-1),
         )
 
@@ -270,22 +299,24 @@ def main(cfg: DictConfig):
     accelerator = Accelerator(kwargs_handlers=[kwargs])
     logger.info(f"Using device: {accelerator.device}")
 
-    # Dataset loading logic
-    dataset_name = training_cfg.pop("dataset_name")
+    # Create AudioDataset
+    dataset_name = training_cfg.pop("dataset_name", None)
     force_vocab_build = training_cfg.get("force_vocab_build", False)
-    if dataset_name == "librispeech_aligned":
-        from data.librispeech_align import LibriSpeechAlignDataset
 
+    if dataset_name == "mls":
+        from data.mls import MLSDataset
+        dataset = MLSDataset()
+    elif dataset_name == "libritts":
+        from data.libri_tts import LibriTTS
+        dataset = LibriTTS()
+    elif dataset_name in ["librispeech_aligned", "librispeech-aligned", "librispeech-aligned_prepared"]:
+        from data.librispeech_align import LibriSpeechAlignDataset
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
     else:
-        # Fallback to dummy
-        dataset = None
+        raise ValueError(f"Dataset {dataset_name} not supported")
 
-    if dataset:
-        train_dataset = TrainDatasetWrapper(dataset, "train")
-        test_dataset = TestDatasetWrapper(dataset, "test")
-    else:
-        train_dataset, test_dataset = None, None
+    train_dataset = TrainDatasetWrapper(dataset, "train")
+    test_dataset = TestDatasetWrapper(dataset, "test")
 
     wandb_project = training_cfg.pop("wandb_project", None)
     wandb_run_name = training_cfg.pop("wandb_run_name", None)
@@ -360,6 +391,7 @@ def main(cfg: DictConfig):
     training_cfg["learning_rate"] = float(training_cfg.get("learning_rate"))
     min_learning_rate = float(training_cfg.pop("min_learning_rate", 0.0))
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
+    run_id = training_cfg.pop("run_id", None)
 
     training_args = TrainingArguments(
         remove_unused_columns=False,
@@ -368,23 +400,14 @@ def main(cfg: DictConfig):
     )
 
     data_collator = DataCollator()
-    # Limit eval_dataset for the Trainer's own eval loop too
-    if test_dataset is not None and eval_num_samples and eval_num_samples > 0:
-        indices = list(range(min(eval_num_samples, len(test_dataset))))
-        eval_dataset = torch.utils.data.Subset(test_dataset, indices)
-        logger.info(
-            f"Trainer eval_dataset limited to {len(eval_dataset)} samples (eval_num_samples={eval_num_samples})."
-        )
-    else:
-        eval_dataset = test_dataset
-
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=test_dataset,
         data_collator=data_collator,
         dataset_name=dataset_name,
+        eval_num_samples=eval_num_samples,
     )
 
     # Optional: Register EvaluationCallback with checkpoint paths (VAE/Vocoder loaded lazily).

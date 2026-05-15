@@ -7,7 +7,8 @@ training:
   per_device_train_batch_size: 8
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 1
-  max_steps: 100000
+  num_train_epochs: 100
+  max_steps: -1
   logging_steps: 100
   eval_steps: 1000
   eval_num_samples: 100
@@ -16,3 +17,4 @@ training:
   report_to: wandb
   wandb_project: hybrid_tts
   wandb_run_name: baseline
+  run_id: ""
