@@ -107,7 +107,7 @@ class DataCollator(object):
                 pad_len = max_d - curr_len
 
                 padded_d.append(
-                    torch.nn.functional.pad(d_tensor, (0, pad_len), value=-100)
+                    torch.nn.functional.pad(d_tensor, (0, pad_len), value=0)
                 )
                 padded_c.append(
                     torch.nn.functional.pad(c_tensor, (0, 0, 0, pad_len), value=0.0)
@@ -122,6 +122,11 @@ class DataCollator(object):
                 padding_mask.append(mask)
 
             batch["discrete_tokens"] = torch.stack(padded_d)
+            # Create targets for CrossEntropyLoss (padding = -100)
+            target_tokens = torch.stack(padded_d).clone()
+            target_tokens[torch.stack(padding_mask)] = -100
+            batch["target_tokens"] = target_tokens
+            
             batch["continuous_tokens"] = torch.stack(padded_c)
             batch["padding_mask"] = torch.stack(padding_mask)
 

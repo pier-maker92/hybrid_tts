@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 from modules.builder import build_model
 from accelerate import InitProcessGroupKwargs
 from data.audio_dataset import DataCollator, TrainDatasetWrapper, TestDatasetWrapper
-from modules.evaluation import run_evaluation
+from evaluation import run_evaluation
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -92,12 +92,23 @@ def load_vocoder(vocoder_name_or_path: str, device: torch.device):
 
 
 class EvaluationCallback(TrainerCallback):
-    def __init__(self, vae, vocoder, vocoder_type, dataset_name, eval_dataset, num_samples=100, batch_size=1):
-        self.vae = vae
-        self.vocoder = vocoder
+    def __init__(
+        self,
+        vae_checkpoint,
+        vocoder_checkpoint,
+        vocoder_type,
+        dataset_name,
+        eval_dataset,
+        eval_device,
+        num_samples=100,
+        batch_size=1,
+    ):
+        self.vae_checkpoint = vae_checkpoint
+        self.vocoder_checkpoint = vocoder_checkpoint
         self.vocoder_type = vocoder_type
         self.dataset_name = dataset_name
         self.num_samples = num_samples
+        self.eval_device = eval_device
         # Build a dedicated DataLoader limited to num_samples
         if num_samples and num_samples > 0:
             indices = list(range(min(num_samples, len(eval_dataset))))
@@ -110,23 +121,43 @@ class EvaluationCallback(TrainerCallback):
             shuffle=False,
             collate_fn=DataCollator(),
         )
-        logger.info(f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples.")
+        logger.info(
+            f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples (device={self.eval_device})."
+        )
 
     def on_evaluate(self, args, state, control, model, **kwargs):
-        if state.is_world_process_zero:
-            logger.info(f"Running custom evaluation at step {state.global_step}...")
+        if not state.is_world_process_zero:
+            return
+
+        device = self.eval_device
+        logger.info(
+            f"Running custom evaluation at step {state.global_step} on {device}"
+        )
+
+        # Load VAE and Vocoder lazily — only during eval, then release GPU memory.
+        vae = load_vae(self.vae_checkpoint, device) if self.vae_checkpoint else None
+        vocoder = (
+            load_vocoder(self.vocoder_checkpoint, device)
+            if self.vocoder_checkpoint
+            else None
+        )
+        try:
             run_evaluation(
                 model=model,
-                vae=self.vae,
-                vocoder=self.vocoder,
+                vae=vae,
+                vocoder=vocoder,
                 vocoder_type=self.vocoder_type,
                 eval_dataloader=self.eval_dataloader,
-                device=args.device,
+                device=device,
                 step=state.global_step,
                 dataset_name=self.dataset_name,
                 num_samples=self.num_samples,
                 run_id=wandb.run.id if wandb.run else "eval_run",
             )
+        finally:
+            # Free GPU memory immediately after eval.
+            del vae, vocoder
+            torch.cuda.empty_cache()
 
 
 class HybridTTSTrainer(Trainer):
@@ -341,7 +372,9 @@ def main(cfg: DictConfig):
     if test_dataset is not None and eval_num_samples and eval_num_samples > 0:
         indices = list(range(min(eval_num_samples, len(test_dataset))))
         eval_dataset = torch.utils.data.Subset(test_dataset, indices)
-        logger.info(f"Trainer eval_dataset limited to {len(eval_dataset)} samples (eval_num_samples={eval_num_samples}).")
+        logger.info(
+            f"Trainer eval_dataset limited to {len(eval_dataset)} samples (eval_num_samples={eval_num_samples})."
+        )
     else:
         eval_dataset = test_dataset
 
@@ -354,36 +387,27 @@ def main(cfg: DictConfig):
         dataset_name=dataset_name,
     )
 
-    # Optional: Load VAE and Vocoder for evaluation
+    # Optional: Register EvaluationCallback with checkpoint paths (VAE/Vocoder loaded lazily).
     vae_checkpoint = cfg_dict.get("vae_checkpoint")
     vocoder_checkpoint = cfg_dict.get("vocoder_checkpoint")
 
     if vae_checkpoint or vocoder_checkpoint:
-        logger.info("Loading VAE/Vocoder for evaluation...")
-        vae = load_vae(vae_checkpoint, accelerator.device) if vae_checkpoint else None
-        vocoder = (
-            load_vocoder(vocoder_checkpoint, accelerator.device)
-            if vocoder_checkpoint
-            else None
-        )
         vocoder_type = cfg_dict.get("vocoder_type", "bigvgan")
-
-        if vae is not None or vocoder is not None:
-            trainer.add_callback(
-                EvaluationCallback(
-                    vae=vae,
-                    vocoder=vocoder,
-                    vocoder_type=vocoder_type,
-                    dataset_name=dataset_name,
-                    eval_dataset=test_dataset,
-                    num_samples=eval_num_samples,
-                    batch_size=training_args.per_device_eval_batch_size,
-                )
+        trainer.add_callback(
+            EvaluationCallback(
+                vae_checkpoint=vae_checkpoint,
+                vocoder_checkpoint=vocoder_checkpoint,
+                vocoder_type=vocoder_type,
+                dataset_name=dataset_name,
+                eval_dataset=test_dataset,
+                eval_device=accelerator.device,
+                num_samples=eval_num_samples,
+                batch_size=training_args.per_device_eval_batch_size,
             )
-        else:
-            logger.warning(
-                "Could not load VAE or Vocoder. Evaluation callback disabled."
-            )
+        )
+        logger.info(
+            "EvaluationCallback registered (VAE/Vocoder will be loaded lazily at eval time)."
+        )
 
     logger.info("Starting training...")
     trainer.train()

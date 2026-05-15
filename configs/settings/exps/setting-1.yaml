@@ -29,5 +29,5 @@ diffusion_head:
 continuous_adapter:
   hidden_dim: 512
   num_layers: 2   # Crea 2 strati nascosti + strato di output
-vae_checkpoint: "/Users/software/Research/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
+vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
 vocoder_checkpoint: "vocos"

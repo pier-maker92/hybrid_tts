@@ -10,7 +10,7 @@ beartype
 torchcodec==0.7
 vocos==0.1.0
 
-[training]
+[train]
 deepspeed==0.18.4
 accelerate==1.13.0
 datasets==4.1.0

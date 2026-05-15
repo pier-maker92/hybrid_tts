@@ -17,7 +17,10 @@ from modules.submodules.MelCausalVAE.modules.feature_extractor import (
 )
 
 # Specify custom cache directory
-parquet_dir = f"~/Research/datasets/librispeech-aligned_prepared"
+SLURM_TMPDIR = os.getenv("SLURM_TMPDIR")
+if SLURM_TMPDIR is None:
+    raise ValueError("SLURM_TMPDIR environment variable not set.")
+parquet_dir = f"{SLURM_TMPDIR}/datasets/librispeech-aligned_prepared"
 # import mel spec encoder
 mel_spec_encoder = FeatureExtractor(config=MelSpectrogramConfig())
 

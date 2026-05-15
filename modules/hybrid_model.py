@@ -46,10 +46,14 @@ class DynamicNormalizer(nn.Module):
 
             return (x - batch_mean) / (batch_var + self.eps).sqrt()
         else:
-            return (x - self.running_mean) / (self.running_var + self.eps).sqrt()
+            mean = self.running_mean.to(x.dtype)
+            var = self.running_var.to(x.dtype)
+            return (x - mean) / (var + self.eps).sqrt()
 
     def denormalize(self, x):
-        return x * (self.running_var + self.eps).sqrt() + self.running_mean
+        mean = self.running_mean.to(x.dtype)
+        var = self.running_var.to(x.dtype)
+        return x * (var + self.eps).sqrt() + mean
 
 
 class MLPAdapter(nn.Module):
@@ -125,6 +129,7 @@ class HybridTTS(nn.Module):
         """
         Forward pass for training.
         """
+
         # 1. Prompt Embeddings
         p_emb = self.prompt_emb(prompt_ids + self.config.prompt_offset)
         B, L_prompt, _ = p_emb.shape
@@ -183,8 +188,10 @@ class HybridTTS(nn.Module):
         )
 
         # 7. Backbone Pass
+        # Cast to backbone's actual parameter dtype to handle both AMP and full-bf16.
+        bb_dtype = next(self.backbone.parameters()).dtype
         outputs = self.backbone(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+            inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask
         )
         full_hidden_states = outputs.last_hidden_state
 
@@ -250,7 +257,7 @@ class HybridTTS(nn.Module):
         padding_mask = batch["padding_mask"]
 
         # 1. Forward pass to get context hidden states
-        # We use the ground truth tokens here for reconstruction task
+        # continuous_tokens will be cast to model dtype inside forward.
         outputs = self.forward(
             prompt_ids=prompt_ids,
             discrete_tokens=discrete_tokens,
@@ -271,7 +278,9 @@ class HybridTTS(nn.Module):
         # For simplicity in this task, let's just use the diffusion_head.generate directly
         # with the context_vector that we expect.
 
-        # Re-calculate embeddings (same as forward)
+        # Re-calculate embeddings (same as forward).
+        # Cast continuous_tokens once here to match model dtype.
+        continuous_tokens = continuous_tokens.to(self.dtype)
         p_emb = self.prompt_emb(prompt_ids + self.config.prompt_offset)
         d_emb = self.discrete_emb(discrete_tokens)
         norm_c = self.continuous_norm(continuous_tokens, padding_mask=padding_mask)
@@ -297,8 +306,9 @@ class HybridTTS(nn.Module):
         audio_attn = (~padding_mask).long()
         attention_mask = torch.cat([prompt_attn, start_attn, audio_attn], dim=1)
 
+        bb_dtype = next(self.backbone.parameters()).dtype
         outputs_bb = self.backbone(
-            inputs_embeds=inputs_embeds, attention_mask=attention_mask
+            inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask
         )
         full_hidden_states = outputs_bb.last_hidden_state
 

@@ -15,12 +15,12 @@ Requires-Dist: torchdiffeq
 Requires-Dist: beartype
 Requires-Dist: torchcodec==0.7
 Requires-Dist: vocos==0.1.0
-Provides-Extra: training
-Requires-Dist: deepspeed==0.18.4; extra == "training"
-Requires-Dist: accelerate==1.13.0; extra == "training"
-Requires-Dist: datasets==4.1.0; extra == "training"
-Requires-Dist: utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git ; extra == "training"
-Requires-Dist: matplotlib; extra == "training"
-Requires-Dist: wandb; extra == "training"
-Requires-Dist: jiwer; extra == "training"
-Requires-Dist: torchaudio_filters; extra == "training"
+Provides-Extra: train
+Requires-Dist: deepspeed==0.18.4; extra == "train"
+Requires-Dist: accelerate==1.13.0; extra == "train"
+Requires-Dist: datasets==4.1.0; extra == "train"
+Requires-Dist: utmosv2 @ git+https://github.com/sarulab-speech/UTMOSv2.git ; extra == "train"
+Requires-Dist: matplotlib; extra == "train"
+Requires-Dist: wandb; extra == "train"
+Requires-Dist: jiwer; extra == "train"
+Requires-Dist: torchaudio_filters; extra == "train"
