@@ -126,7 +126,7 @@ class DataCollator(object):
             target_tokens = torch.stack(padded_d).clone()
             target_tokens[torch.stack(padding_mask)] = -100
             batch["target_tokens"] = target_tokens
-            
+
             batch["continuous_tokens"] = torch.stack(padded_c)
             batch["padding_mask"] = torch.stack(padding_mask)
 
@@ -157,9 +157,7 @@ class TestDatasetWrapper(SimpleAudioDataset):
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
 
         # Robust transcription field lookup
-        transcription = (
-            data.get("text_normalized") or data.get("transcript") or "transcript"
-        )
+        transcription = data.get("text_normalized") or data.get("transcript")
         self._process_transcription(data_dict, transcription)
 
         data_dict["language"] = data.get("language", "en")

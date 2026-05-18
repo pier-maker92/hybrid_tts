@@ -197,11 +197,13 @@ class HybridTTSTrainer(Trainer):
         # We need prompt_ids, discrete_tokens, continuous_tokens
         # Assuming DataCollator outputs: "ids", "prompt_ids", "discrete_tokens", "continuous_tokens", "padding_mask"
 
-        prompt_ids = inputs.get("prompt_ids", None)
-        discrete_tokens = inputs.get("discrete_tokens", None)
-        continuous_tokens = inputs.get("continuous_tokens", None)
-        padding_mask = inputs.get("padding_mask", None)
-        target_tokens = inputs.get("target_tokens", discrete_tokens)
+        prompt_ids = inputs.get("prompt_ids")
+        discrete_tokens = inputs.get("discrete_tokens")
+        continuous_tokens = inputs.get("continuous_tokens")
+        padding_mask = inputs.get("padding_mask")
+        target_tokens = inputs.get("target_tokens")
+        if target_tokens is None:
+            target_tokens = discrete_tokens
 
         outputs = model(
             prompt_ids=prompt_ids,
@@ -291,17 +293,17 @@ class HybridTTSTrainer(Trainer):
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-    training_cfg = cfg_dict.get("training", {})
+    training_cfg = cfg_dict.get("training")
 
-    set_seed(training_cfg.get("seed", 42))
+    set_seed(training_cfg.get("seed"))
 
     kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=7200))
     accelerator = Accelerator(kwargs_handlers=[kwargs])
     logger.info(f"Using device: {accelerator.device}")
 
     # Create AudioDataset
-    dataset_name = training_cfg.pop("dataset_name", None)
-    force_vocab_build = training_cfg.get("force_vocab_build", False)
+    dataset_name = training_cfg.pop("dataset_name")
+    force_vocab_build = training_cfg.get("force_vocab_build")
 
     if dataset_name == "mls":
         from data.mls import MLSDataset
@@ -318,10 +320,10 @@ def main(cfg: DictConfig):
     train_dataset = TrainDatasetWrapper(dataset, "train")
     test_dataset = TestDatasetWrapper(dataset, "test")
 
-    wandb_project = training_cfg.pop("wandb_project", None)
-    wandb_run_name = training_cfg.pop("wandb_run_name", None)
-    wandb_id = training_cfg.pop("wandb_id", None)
-    if training_cfg.get("report_to", "none") == "wandb" and accelerator.is_main_process:
+    wandb_project = training_cfg.pop("wandb_project")
+    wandb_run_name = training_cfg.pop("wandb_run_name")
+    wandb_id = training_cfg.pop("wandb_id")
+    if training_cfg.get("report_to") == "wandb" and accelerator.is_main_process:
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
@@ -341,9 +343,11 @@ def main(cfg: DictConfig):
         phoneme_list = []
         vocab_size = 256
 
-    backbone_cfg = cfg_dict.get("backbone_config", cfg_dict.get("backbone", {}))
-    is_pretrained = backbone_cfg.get("pretrained", False)
-    model_name_or_path = backbone_cfg.get("model_name_or_path", "Qwen/Qwen2-0.5B")
+    backbone_cfg = cfg_dict.get("backbone_config")
+    if backbone_cfg is None:
+        backbone_cfg = cfg_dict.get("backbone")
+    is_pretrained = backbone_cfg.get("pretrained")
+    model_name_or_path = backbone_cfg.get("model_name_or_path")
 
     if not is_pretrained:
         cfg_dict["prompt_vocab_size"] = vocab_size + 2  # Phonemes + Special Tokens
@@ -415,7 +419,7 @@ def main(cfg: DictConfig):
     vocoder_checkpoint = cfg_dict.get("vocoder_checkpoint")
 
     if vae_checkpoint or vocoder_checkpoint:
-        vocoder_type = cfg_dict.get("vocoder_type", "bigvgan")
+        vocoder_type = cfg_dict.get("vocoder_type")
         trainer.add_callback(
             EvaluationCallback(
                 vae_checkpoint=vae_checkpoint,

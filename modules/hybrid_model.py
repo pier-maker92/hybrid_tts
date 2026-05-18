@@ -13,8 +13,8 @@ class DynamicNormalizer(nn.Module):
         self.dim = dim
         self.momentum = momentum
         self.eps = eps
-        self.register_buffer("running_mean", torch.zeros(dim))
-        self.register_buffer("running_var", torch.ones(dim))
+        self.register_buffer("running_mean", torch.zeros(1))
+        self.register_buffer("running_var", torch.ones(1))
 
     def forward(self, x, padding_mask=None):
         # x: (B, L, C)
@@ -26,22 +26,22 @@ class DynamicNormalizer(nn.Module):
                 mask = mask.unsqueeze(-1)  # (B, L, 1)
                 count = mask.sum()
                 if count > 0:
-                    batch_mean = (x * mask).sum(dim=(0, 1)) / count
-                    batch_var = ((x - batch_mean) ** 2 * mask).sum(dim=(0, 1)) / count
+                    batch_mean = (x * mask).sum() / (count * x.shape[-1])
+                    batch_var = (((x - batch_mean) ** 2) * mask).sum() / (count * x.shape[-1])
                 else:
-                    batch_mean = x.mean(dim=(0, 1))
-                    batch_var = x.var(dim=(0, 1), unbiased=False)
+                    batch_mean = x.mean()
+                    batch_var = x.var(unbiased=False)
             else:
-                batch_mean = x.mean(dim=(0, 1))
-                batch_var = x.var(dim=(0, 1), unbiased=False)
+                batch_mean = x.mean()
+                batch_var = x.var(unbiased=False)
 
             # Update running stats
             with torch.no_grad():
                 self.running_mean.copy_(
-                    (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
+                    (1 - self.momentum) * self.running_mean + self.momentum * batch_mean.reshape(1)
                 )
                 self.running_var.copy_(
-                    (1 - self.momentum) * self.running_var + self.momentum * batch_var
+                    (1 - self.momentum) * self.running_var + self.momentum * batch_var.reshape(1)
                 )
 
             return (x - batch_mean) / (batch_var + self.eps).sqrt()
@@ -138,6 +138,10 @@ class HybridTTS(nn.Module):
         d_emb = self.discrete_emb(discrete_tokens)
 
         # Normalize continuous tokens before adapter
+        continuous_tokens = continuous_tokens.to(d_emb.dtype)
+        if continuous_tokens.shape[-1] == 64:
+            continuous_tokens = continuous_tokens[..., 32:]
+
         norm_continuous_tokens = self.continuous_norm(
             continuous_tokens, padding_mask=padding_mask
         )
@@ -203,12 +207,16 @@ class HybridTTS(nn.Module):
 
         # 9. Output Heads
         # Discrete Token Head
-        token_logits = self.token_head(audio_hidden_states)
+        token_logits = self.token_head(audio_hidden_states.to(next(self.token_head.parameters()).dtype))
 
         # Diffusion Head (Continuous)
         # target_continuous is the actual continuous representation from VAE
         if target_continuous is None:
             target_continuous = continuous_tokens  # Fallback if not provided separately
+
+        target_continuous = target_continuous.to(d_emb.dtype)
+        if target_continuous.shape[-1] == 64:
+            target_continuous = target_continuous[..., 32:]
 
         # Normalize targets for the diffusion head
         target_continuous = self.continuous_norm(
@@ -226,7 +234,7 @@ class HybridTTS(nn.Module):
                     device=target_continuous.device,
                 )
             ),
-            context_vector=audio_hidden_states,
+            context_vector=audio_hidden_states.to(next(self.diffusion_head.parameters()).dtype),
         )
 
         return HybridTTSOutput(
@@ -280,7 +288,9 @@ class HybridTTS(nn.Module):
 
         # Re-calculate embeddings (same as forward).
         # Cast continuous_tokens once here to match model dtype.
-        continuous_tokens = continuous_tokens.to(self.dtype)
+        continuous_tokens = continuous_tokens.to(d_emb.dtype)
+        if continuous_tokens.shape[-1] == 64:
+            continuous_tokens = continuous_tokens[..., 32:]
         p_emb = self.prompt_emb(prompt_ids + self.config.prompt_offset)
         d_emb = self.discrete_emb(discrete_tokens)
         norm_c = self.continuous_norm(continuous_tokens, padding_mask=padding_mask)
@@ -318,19 +328,30 @@ class HybridTTS(nn.Module):
         # 1. Generate reconstructed continuous latents using our diffusion head
         latents_output = self.diffusion_head.generate(
             num_steps=num_steps,
-            context_vector=audio_hidden_states,
+            context_vector=audio_hidden_states.to(next(self.diffusion_head.parameters()).dtype),
             temperature=temperature,
             guidance_scale=guidance_scale,
             padding_mask=padding_mask,
         )
-        z = latents_output.audio_features  # [B, L, C]
+        z = latents_output.audio_features  # [B, L, C] — in normalized space
+
+        # Denormalize before passing to VAE decoder (which expects original scale)
+        z = self.continuous_norm.denormalize(z)
+
+        # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
+        tokens_tensor = batch["discrete_tokens"].long()
+        with torch.no_grad():
+            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [B, L, 32]
+        
+        # Concatenate to reconstruct full 64-dimensional latent context vector
+        z_vae = torch.cat([vq_emb, z], dim=-1)
 
         # 2. Use these generated latents as context for the VAE to generate Mel
         reconstructed_mel, reconstructed_padding_mask = vae.sample(
             num_steps=num_steps,
             temperature=temperature,
             guidance_scale=guidance_scale,
-            z=z,
+            z=z_vae,
             padding_mask=latents_output.padding_mask,
         )
 
