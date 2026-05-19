@@ -53,30 +53,43 @@ class HybridTTSConfig:
     token_head_config: TokenHeadConfig = field(default_factory=TokenHeadConfig)
 
     # Dimensions for Adaptive Norm & Embedding
-    prompt_vocab_size: int = 256
-    discrete_token_vocab_size: int = 1024
-    continuous_dim: int = 64
-    backbone_hidden_size: int = 512
-    start_audio_id: int = 0
-    end_audio_id: int = 0
-    prompt_offset: int = 0
+    prompt_vocab_size: int
+    discrete_token_vocab_size: int
+    continuous_dim: int
+    start_audio_id: int
+    end_audio_id: int
+    pad_token_id: int
+    prompt_offset: int
+    debug: bool = False
+    backbone_hidden_size: Optional[int] = None
 
     def __post_init__(self):
-        # Ensure consistency
+        # Sync VAE/tokenizer-derived dims (known before backbone load).
         self.backbone_config.vocab_size = self.prompt_vocab_size
         self.token_head_config.vocab_size = self.discrete_token_vocab_size
-        self.token_head_config.in_dim = self.backbone_hidden_size
 
         if self.continuous_adapter_config is not None:
             self.continuous_adapter_config.in_dim = self.continuous_dim
-            self.continuous_adapter_config.out_dim = self.backbone_hidden_size
 
         self.diffusion_head_config.audio_latent_dim = self.continuous_dim
-        self.diffusion_head_config.backbone_dim = self.backbone_hidden_size
+
+    def apply_backbone_dims(self, hidden_size: int) -> None:
+        """Propagate HF backbone hidden size into sub-configs after model load."""
+        self.backbone_hidden_size = hidden_size
+        self.token_head_config.in_dim = hidden_size
+
+        if self.continuous_adapter_config is not None:
+            self.continuous_adapter_config.out_dim = hidden_size
+
+        self.diffusion_head_config.backbone_dim = hidden_size
 
     @property
     def hidden_size(self) -> int:
-        """Return hidden dimension for DeepSpeed compatibility"""
+        """Return hidden dimension for DeepSpeed compatibility."""
+        if self.backbone_hidden_size is None:
+            raise RuntimeError(
+                "backbone_hidden_size is not set. Instantiate HybridTTS first."
+            )
         return self.backbone_hidden_size
 
     def to_dict(self):

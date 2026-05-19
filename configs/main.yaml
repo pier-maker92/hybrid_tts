@@ -11,3 +11,4 @@ continuous_dim: 64
 
 training:
   run_id: ""
+  seed: 42

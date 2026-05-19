@@ -1,16 +1,20 @@
 import os
 import sys
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import json
 import argparse
-import numpy as np
 from tqdm import tqdm
 from typing import Optional, List
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from datasets import load_dataset, concatenate_datasets
-from data.audio_dataset import SimpleAudioDataset, DataCollator, TrainDatasetWrapper
+from g2p_en import G2p
+from data.audio_dataset import (
+    SimpleAudioDataset,
+    DataCollator,
+    TrainDatasetWrapper,
+    TestDatasetWrapper,
+)
+from modules.hybrid_model import HybridTokenizer
 from modules.submodules.MelCausalVAE.modules.feature_extractor import (
     FeatureExtractor,
     MelSpectrogramConfig,
@@ -27,6 +31,20 @@ mel_spec_encoder = FeatureExtractor(config=MelSpectrogramConfig())
 
 def simple_collate_fn(batch):
     return batch
+
+
+def build_vocab_and_map(batch, phoneme_vocab):
+    g2p = G2p()
+    phoneme_ids_batch = []
+    transcriptions = batch.get("transcript") or batch.get("transcription") or []
+    for transcription in transcriptions:
+        phoneme_ids = []
+        if transcription:
+            phonemes = g2p(transcription)
+            for p in phonemes:
+                phoneme_ids.append(phoneme_vocab.get(p, 0))
+        phoneme_ids_batch.append(phoneme_ids)
+    return {"phoneme_ids": phoneme_ids_batch, "prompt_ids": phoneme_ids_batch}
 
 
 class LibriSpeechAlignDataset(SimpleAudioDataset):
@@ -56,24 +74,20 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
             ].append(dataset[partition])
 
         self.phoneme_vocab = {}
-        import json
+
+        g2p = G2p()
 
         vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
 
         if not force_vocab_build and os.path.exists(vocab_path):
-            try:
-                with open(vocab_path, "r") as f:
-                    self.phoneme_vocab = json.load(f)
-                if self.phoneme_vocab:
-                    print(
-                        f"Loaded existing phoneme vocabulary from {vocab_path} (size: {len(self.phoneme_vocab)})"
-                    )
-            except Exception as e:
-                print(f"Error loading vocabulary from {vocab_path}: {e}")
+            with open(vocab_path, "r") as f:
+                self.phoneme_vocab = json.load(f)
+            if self.phoneme_vocab:
+                print(
+                    f"Loaded existing phoneme vocabulary from {vocab_path} (size: {len(self.phoneme_vocab)})"
+                )
 
         if not self.phoneme_vocab:
-            from tqdm import tqdm
-
             print("Building phoneme vocabulary...")
             # First pass: build vocabulary
             for destination in partitions_per_destination:
@@ -81,10 +95,12 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
                 for example in tqdm(
                     ds, desc=f"Building phoneme vocab for {destination}"
                 ):
-                    alignments = example.get("phonemes")
-                    if alignments is not None:
-                        for phoneme_dict in alignments:
-                            p = phoneme_dict["phoneme"]
+                    transcription = example.get("transcript") or example.get(
+                        "transcription"
+                    )
+                    if transcription:
+                        phonemes = g2p(transcription)
+                        for p in phonemes:
                             if p not in self.phoneme_vocab:
                                 self.phoneme_vocab[p] = len(self.phoneme_vocab)
 
@@ -94,20 +110,14 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
                 f"Phoneme vocabulary saved to {vocab_path} (size: {len(self.phoneme_vocab)})"
             )
 
-        def build_vocab_and_map(batch):
-            phoneme_ids_batch = []
-            for alignments in batch["phonemes"]:
-                phoneme_ids = []
-                if alignments is not None:
-                    for phoneme_dict in alignments:
-                        p = phoneme_dict["phoneme"]
-                        phoneme_ids.append(self.phoneme_vocab.get(p, 0))
-                phoneme_ids_batch.append(phoneme_ids)
-            return {"phoneme_ids": phoneme_ids_batch, "prompt_ids": phoneme_ids_batch}
-
         for destination in partitions_per_destination:
             ds = concatenate_datasets(partitions_per_destination[destination])
-            ds = ds.map(build_vocab_and_map, batched=True, num_proc=1)
+            ds = ds.map(
+                build_vocab_and_map,
+                fn_kwargs={"phoneme_vocab": self.phoneme_vocab},
+                batched=True,
+                num_proc=1,
+            )
             setattr(self, f"{destination}_dataset", ds)
 
     def _partition_to_destination(self, partition_name):
@@ -132,35 +142,32 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
 # parser.add_argument("-n", "--num_samples", type=int, default=100000)
 # args = parser.parse_args()
 # if __name__ == "__main__":
+
+#     vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
+#     with open(vocab_path, "r") as f:
+#         phoneme_vocab = json.load(f)
+#     dataset = LibriSpeechAlignDataset()
+#     tok = HybridTokenizer(
+#         phoneme_vocab=phoneme_vocab,
+#         start_audio_id=len(phoneme_vocab),
+#         end_audio_id=len(phoneme_vocab) + 1,
+#         pad_id=len(phoneme_vocab) + 2,
+#     )
+#     dataset = TestDatasetWrapper(dataset, "train")
 #     # data collator
-#     data_collator = DataCollator()
-#     dataset = TrainDatasetWrapper(MLSDataset(), "train")
+#     data_collator = DataCollator(pad_id=tok.pad_id)
+
 #     dataloader = DataLoader(
 #         dataset,
 #         batch_size=args.batch_size,
 #         collate_fn=data_collator,
-#         num_workers=min(os.cpu_count(), 16),
-#         shuffle=True,
+#         num_workers=1,  # min(os.cpu_count(), 16),
+#         shuffle=False,
 #     )
 #     means = []
 #     stds = []
 #     counter = 0
-#     if args.stats:
-#         pbar = tqdm(total=min(args.num_samples, len(dataloader)))
-#         for batch in dataloader:
-#             audio_srs = batch["output_audios_srs"]
-#             mel_spec = mel_spec_encoder(audio_srs)
-#             featues, padding_mask = mel_spec.audio_features, mel_spec.padding_mask
-#             for feature, mask in zip(featues, padding_mask):
-#                 means.append(feature[~mask].mean())
-#                 stds.append(feature[~mask].std())
-#             counter += args.batch_size
-#             if counter >= args.num_samples or counter >= len(dataloader):
-#                 break
-#             pbar.update(args.batch_size)
-#         pbar.close()
-#         print(f"Mean: {np.mean(means)}")
-#         print(f"Std: {np.mean(stds)}")
-#     else:
-#         print(dataset[0])
+
+#     pbar = tqdm(total=min(args.num_samples, len(dataloader)))
+#     for batch in dataloader:
 #         breakpoint()

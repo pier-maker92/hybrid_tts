@@ -3,9 +3,9 @@ training:
   dataset_name: librispeech_aligned
   output_dir: checkpoints/exps/setting-1
   learning_rate: 1e-4
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
-  report_to: wandb
+  report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: setting-1
   bf16: true
@@ -30,5 +30,8 @@ diffusion_head:
 continuous_adapter:
   hidden_dim: 512
   num_layers: 2   # Crea 2 strati nascosti + strato di output
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
+
+vae_checkpoint: "/Users/software/Research/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
 vocoder_checkpoint: "vocos"
+debug: false
+

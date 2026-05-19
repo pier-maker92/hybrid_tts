@@ -72,6 +72,9 @@ class TrainDatasetWrapper(SimpleAudioDataset):
 class DataCollator(object):
     """Collate examples for supervised fine-tuning."""
 
+    def __init__(self, pad_id):
+        self.pad_id = pad_id
+
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
 
@@ -84,15 +87,27 @@ class DataCollator(object):
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
 
         if all(x is not None for x in [p_ids, d_tokens, c_tokens]):
-            # Padding phoneme_ids
+            # Padding phoneme_ids + build prompt_mask (True = valid, False = pad)
             max_p = max(len(x) for x in p_ids)
             padded_p = []
+            prompt_mask = []
             for p in p_ids:
+                curr_len = len(p)
+                pad_len = max_p - curr_len
                 p_tensor = torch.tensor(p, dtype=torch.long)
                 padded_p.append(
-                    torch.nn.functional.pad(p_tensor, (0, max_p - len(p)), value=0)
+                    torch.nn.functional.pad(p_tensor, (0, pad_len), value=self.pad_id)
+                )
+                prompt_mask.append(
+                    torch.cat(
+                        [
+                            torch.ones(curr_len, dtype=torch.bool),
+                            torch.zeros(pad_len, dtype=torch.bool),
+                        ]
+                    )
                 )
             batch["prompt_ids"] = torch.stack(padded_p)
+            batch["prompt_mask"] = torch.stack(prompt_mask)
 
             # Padding discrete/continuous tokens
             max_d = max(len(x) for x in d_tokens)
@@ -107,10 +122,12 @@ class DataCollator(object):
                 pad_len = max_d - curr_len
 
                 padded_d.append(
-                    torch.nn.functional.pad(d_tensor, (0, pad_len), value=0)
+                    torch.nn.functional.pad(d_tensor, (0, pad_len), value=self.pad_id)
                 )
                 padded_c.append(
-                    torch.nn.functional.pad(c_tensor, (0, 0, 0, pad_len), value=0.0)
+                    torch.nn.functional.pad(
+                        c_tensor, (0, 0, 0, pad_len), value=self.pad_id
+                    )
                 )
 
                 mask = torch.cat(

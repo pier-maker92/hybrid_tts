@@ -2,13 +2,20 @@ import os
 import json
 import torch
 import wandb
+import hydra
 import logging
 import datetime
-import hydra
 from typing import Dict, List
-from omegaconf import DictConfig, OmegaConf
+from accelerate import Accelerator
+from evaluation import run_evaluation
+from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
-
+from modules.builder import build_model
+from omegaconf import DictConfig, OmegaConf
+from data.audio_dataset import DataCollator
+from accelerate import InitProcessGroupKwargs
+from modules.hybrid_model import HybridTokenizer
+from util import build_dataset, build_tokenizer, wandb_init
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -18,12 +25,6 @@ from transformers import (
     set_seed,
 )
 
-from accelerate import Accelerator
-from transformers import AutoTokenizer
-from modules.builder import build_model
-from accelerate import InitProcessGroupKwargs
-from data.audio_dataset import DataCollator, TrainDatasetWrapper, TestDatasetWrapper
-from evaluation import run_evaluation
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -100,6 +101,7 @@ class EvaluationCallback(TrainerCallback):
         dataset_name,
         eval_dataset,
         eval_device,
+        pad_id,
         num_samples=100,
         batch_size=1,
     ):
@@ -119,7 +121,7 @@ class EvaluationCallback(TrainerCallback):
             subset,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=DataCollator(),
+            collate_fn=DataCollator(pad_id=pad_id),
         )
         logger.info(
             f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples (device={self.eval_device})."
@@ -201,6 +203,7 @@ class HybridTTSTrainer(Trainer):
         discrete_tokens = inputs.get("discrete_tokens")
         continuous_tokens = inputs.get("continuous_tokens")
         padding_mask = inputs.get("padding_mask")
+        prompt_mask = inputs.get("prompt_mask")
         target_tokens = inputs.get("target_tokens")
         if target_tokens is None:
             target_tokens = discrete_tokens
@@ -210,6 +213,7 @@ class HybridTTSTrainer(Trainer):
             discrete_tokens=discrete_tokens,
             continuous_tokens=continuous_tokens,
             padding_mask=padding_mask,
+            prompt_mask=prompt_mask,
         )
 
         token_logits = outputs.token_logits
@@ -295,102 +299,38 @@ def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
     training_cfg = cfg_dict.get("training")
 
-    set_seed(training_cfg.get("seed"))
+    seed = training_cfg.get("seed") if training_cfg else None
+    if seed is not None:
+        set_seed(seed)
 
+    # initialize accelerator
     kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=7200))
     accelerator = Accelerator(kwargs_handlers=[kwargs])
     logger.info(f"Using device: {accelerator.device}")
 
-    # Create AudioDataset
-    dataset_name = training_cfg.pop("dataset_name")
-    force_vocab_build = training_cfg.get("force_vocab_build")
-
-    if dataset_name == "mls":
-        from data.mls import MLSDataset
-        dataset = MLSDataset()
-    elif dataset_name == "libritts":
-        from data.libri_tts import LibriTTS
-        dataset = LibriTTS()
-    elif dataset_name in ["librispeech_aligned", "librispeech-aligned", "librispeech-aligned_prepared"]:
-        from data.librispeech_align import LibriSpeechAlignDataset
-        dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
-    else:
-        raise ValueError(f"Dataset {dataset_name} not supported")
-
-    train_dataset = TrainDatasetWrapper(dataset, "train")
-    test_dataset = TestDatasetWrapper(dataset, "test")
-
-    wandb_project = training_cfg.pop("wandb_project")
-    wandb_run_name = training_cfg.pop("wandb_run_name")
-    wandb_id = training_cfg.pop("wandb_id")
-    if training_cfg.get("report_to") == "wandb" and accelerator.is_main_process:
-        wandb.init(
-            project=wandb_project,
-            name=wandb_run_name,
-            id=wandb_id,
-            resume="allow" if wandb_id else None,
-        )
-
-    vocab_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
-    )
-    if os.path.exists(vocab_path):
-        with open(vocab_path, "r") as f:
-            phoneme_vocab = json.load(f)
-        phoneme_list = list(phoneme_vocab.keys())
-        vocab_size = len(phoneme_vocab)
-    else:
-        phoneme_list = []
-        vocab_size = 256
+    # initialize wandb
+    logger.info("Initializing W&B...")
+    wandb_init(training_cfg, accelerator)
+    # build dataset
+    logger.info("Building dataset...")
+    train_dataset, test_dataset, dataset_name = build_dataset(training_cfg)
 
     backbone_cfg = cfg_dict.get("backbone_config")
-    if backbone_cfg is None:
-        backbone_cfg = cfg_dict.get("backbone")
+    backbone_cfg = cfg_dict.get("backbone")
     is_pretrained = backbone_cfg.get("pretrained")
+    if is_pretrained:
+        raise NotImplementedError("Pretrained backbone not supported yet.")
     model_name_or_path = backbone_cfg.get("model_name_or_path")
 
-    if not is_pretrained:
-        cfg_dict["prompt_vocab_size"] = vocab_size + 2  # Phonemes + Special Tokens
-        cfg_dict["prompt_offset"] = 0
-        cfg_dict["start_audio_id"] = vocab_size
-        cfg_dict["end_audio_id"] = vocab_size + 1
-        logger.info(
-            f"Training from scratch: set prompt_vocab_size to {cfg_dict['prompt_vocab_size']}"
-        )
-    else:
-        logger.info(
-            f"Using pretrained backbone, loading tokenizer from {model_name_or_path}"
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-
-        # Add phonemes
-        if phoneme_list:
-            num_added = tokenizer.add_tokens(phoneme_list)
-            phoneme_ids = tokenizer.convert_tokens_to_ids(phoneme_list)
-            cfg_dict["prompt_offset"] = min(phoneme_ids)
-            logger.info(
-                f"Added {num_added} phonemes to tokenizer starting at ID {cfg_dict['prompt_offset']}"
-            )
-        else:
-            cfg_dict["prompt_offset"] = 0
-
-        # Add special tokens
-        special_tokens = ["<start_audio>", "<end_audio>"]
-        tokenizer.add_tokens(special_tokens)
-        cfg_dict["start_audio_id"] = tokenizer.convert_tokens_to_ids("<start_audio>")
-        cfg_dict["end_audio_id"] = tokenizer.convert_tokens_to_ids("<end_audio>")
-        logger.info(
-            f"Special tokens IDs: <start_audio>={cfg_dict['start_audio_id']}, <end_audio>={cfg_dict['end_audio_id']}"
-        )
-
-        cfg_dict["prompt_vocab_size"] = len(tokenizer)
+    # build tokenizer
+    logger.info("Creating HybridTTS tokenizer...")
+    tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
     logger.info("Creating HybridTTS model...")
     model = build_model(cfg_dict)
 
-    if is_pretrained and "tokenizer" in locals():
-        model.backbone.resize_token_embeddings(len(tokenizer))
-        logger.info("Resized backbone token embeddings to match tokenizer.")
+    # Attach HybridTokenizer so that debug mode can decode input sequences
+    model.tokenizer = tok
 
     training_cfg["learning_rate"] = float(training_cfg.get("learning_rate"))
     min_learning_rate = float(training_cfg.pop("min_learning_rate", 0.0))
@@ -403,7 +343,7 @@ def main(cfg: DictConfig):
         **training_cfg,
     )
 
-    data_collator = DataCollator()
+    data_collator = DataCollator(pad_id=tok.pad_id)
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,
@@ -415,7 +355,7 @@ def main(cfg: DictConfig):
     )
 
     # Optional: Register EvaluationCallback with checkpoint paths (VAE/Vocoder loaded lazily).
-    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    vae_checkpoint = cfg_dict.get("vae_checkpoint", None)
     vocoder_checkpoint = cfg_dict.get("vocoder_checkpoint")
 
     if vae_checkpoint or vocoder_checkpoint:
@@ -430,6 +370,7 @@ def main(cfg: DictConfig):
                 eval_device=accelerator.device,
                 num_samples=eval_num_samples,
                 batch_size=training_args.per_device_eval_batch_size,
+                pad_id=tok.pad_id,
             )
         )
         logger.info(
