@@ -86,7 +86,6 @@ class DiT(torch.nn.Module):
     def handle_context_vector(
         self,
         context_vector: torch.FloatTensor,
-        target: Optional[torch.FloatTensor] = None,
         temperature: Optional[float] = None,
         generator: Optional[torch.Generator] = None,
         padding_mask: Optional[torch.BoolTensor] = None,
@@ -96,12 +95,6 @@ class DiT(torch.nn.Module):
         context_vector = context_vector.repeat_interleave(self.expansion_factor, dim=1)
         if padding_mask is not None:
             padding_mask = padding_mask.repeat_interleave(self.expansion_factor, dim=1)
-        if target is not None:
-            min_length = min(context_vector.shape[1], target.shape[1])
-            context_vector = context_vector[:, :min_length, :]
-            target = target[:, :min_length, :]
-            if padding_mask is not None:
-                padding_mask = padding_mask[:, :min_length]
 
         temperature = temperature or 1.0
         x0 = (
@@ -201,9 +194,7 @@ class DiT(torch.nn.Module):
         context_vector: torch.FloatTensor,
         **kwargs,
     ):
-        context_vector, prior, _ = self.handle_context_vector(
-            context_vector, target=target
-        )
+        context_vector, prior, _ = self.handle_context_vector(context_vector)
 
         # ---- flow ----
         state, times, v_target = self.prepare_flow(
@@ -214,7 +205,10 @@ class DiT(torch.nn.Module):
 
         # ---- get the flow ----
         loss = self.let_it_flow(
-            times=times, state=state, target=v_target, flow_mask=target_padding_mask
+            times=times,
+            state=state,
+            target=v_target,
+            flow_mask=target_padding_mask,
         )
 
         return DecoderOutput(

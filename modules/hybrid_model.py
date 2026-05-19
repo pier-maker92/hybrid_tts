@@ -278,6 +278,44 @@ class HybridTTS(nn.Module):
 
         return audio_ext, audio_ext_attn, valid_lens
 
+    def _extract_audio_hidden_states(
+        self,
+        full_hidden_states: torch.Tensor,
+        L_prompt: int,
+        L_audio_max: int,
+        valid_lens: torch.Tensor,
+    ):
+        """
+        Select hidden states that predict audio frames 0 .. L_audio_max-1.
+
+        In the audio_ext block, frame t is predicted from position t:
+          t=0 → <start_audio>, t>=1 → audio_emb[t-1].
+
+        Returns:
+            audio_hidden_states : (B, L_audio_max, H)
+            audio_hidden_mask   : (B, L_audio_max) True = valid (non-pad) frame
+        """
+        audio_hidden_states = full_hidden_states[:, L_prompt : L_prompt + L_audio_max, :]
+        device = full_hidden_states.device
+        positions = torch.arange(L_audio_max, device=device).unsqueeze(0)
+        audio_hidden_mask = positions < valid_lens.unsqueeze(1)
+        audio_hidden_states = audio_hidden_states.masked_fill(
+            ~audio_hidden_mask.unsqueeze(-1), 0.0
+        )
+        return audio_hidden_states, audio_hidden_mask
+
+    def _assert_audio_masks_aligned(
+        self,
+        padding_mask: torch.BoolTensor,
+        audio_hidden_mask: torch.BoolTensor,
+    ) -> None:
+        """padding_mask True=pad; audio_hidden_mask True=valid predictor frame."""
+        context_pad = ~audio_hidden_mask
+        assert torch.equal(padding_mask, context_pad), (
+            "padding_mask and context padding derived from audio hidden states "
+            "must match"
+        )
+
     def _debug_log(
         self,
         prompt_ids: torch.Tensor,  # (B, L_prompt)
@@ -410,21 +448,11 @@ class HybridTTS(nn.Module):
         full_hidden_states = outputs.last_hidden_state
 
         # ------------------------------------------------------------------
-        # 8. Slice audio hidden states for the output heads (autoregressive)
-        #
-        #    Sequence in full_hidden_states:
-        #      [0 .. L_prompt-1]           → prompt tokens
-        #      [L_prompt]                  → <start_audio>  → predicts audio[0]
-        #      [L_prompt+1 .. L_prompt+k]  → audio[0..k-1] → predicts audio[1..k]
-        #      [L_prompt+k+1]              → <end_audio> for sample with k valid frames
-        #
-        #    We take hidden states at positions L_prompt .. L_prompt+L_audio_max-1
-        #    (start + audio[0..L-2]), which are L_audio_max positions predicting
-        #    audio[0..L-1] (L_audio_max targets).
+        # 8. Audio hidden states for output heads (per-sample valid lengths)
         # ------------------------------------------------------------------
-        audio_hidden_states = full_hidden_states[
-            :, L_prompt : L_prompt + L_audio_max, :
-        ]
+        audio_hidden_states, audio_hidden_mask = self._extract_audio_hidden_states(
+            full_hidden_states, L_prompt, L_audio_max, valid_lens
+        )
 
         # ------------------------------------------------------------------
         # 9. Output heads
@@ -444,12 +472,20 @@ class HybridTTS(nn.Module):
             target_continuous, padding_mask=padding_mask
         )
 
+        self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
+
+        audio_hidden_states = audio_hidden_states.to(
+            next(self.diffusion_head.parameters()).dtype
+        )
+        assert audio_hidden_states.shape[:2] == target_continuous.shape[:2], (
+            f"context/target length mismatch: {audio_hidden_states.shape[:2]} "
+            f"vs {target_continuous.shape[:2]}"
+        )
+
         diffusion_output = self.diffusion_head(
             target=target_continuous,
             target_padding_mask=padding_mask,
-            context_vector=audio_hidden_states.to(
-                next(self.diffusion_head.parameters()).dtype
-            ),
+            context_vector=audio_hidden_states,
         )
 
         return HybridTTSOutput(
@@ -521,10 +557,11 @@ class HybridTTS(nn.Module):
         )
         full_hidden_states = outputs_bb.last_hidden_state
 
-        # Same slice as in forward
-        audio_hidden_states = full_hidden_states[
-            :, L_prompt : L_prompt + L_audio_max, :
-        ]
+        audio_hidden_states, audio_hidden_mask = self._extract_audio_hidden_states(
+            full_hidden_states, L_prompt, L_audio_max, valid_lens
+        )
+
+        self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
 
         # Generate with diffusion head (custom num_steps / guidance_scale)
         latents_output = self.diffusion_head.generate(
