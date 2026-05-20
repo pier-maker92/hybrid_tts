@@ -53,6 +53,8 @@ class DiT(torch.nn.Module):
         # context
         self.context_vector_proj = nn.Sequential(
             nn.Linear(self.backbone_dim, self.net_dim),
+            nn.SiLU(),
+            nn.Linear(self.net_dim, self.net_dim),
             nn.LayerNorm(self.net_dim),
         )
 

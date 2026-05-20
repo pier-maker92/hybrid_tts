@@ -3,11 +3,12 @@ import os
 import sys
 import json
 import torch
-import torchaudio
 import argparse
 import logging
-from typing import List, Dict, Any, Optional
+import torchaudio
+from tqdm import tqdm
 from omegaconf import OmegaConf
+from typing import List, Dict, Any, Optional
 
 # Set up logging
 logging.basicConfig(
@@ -414,7 +415,7 @@ def generate_joint_tokens(
 
     step_padding_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
 
-    for step in range(max_len):
+    for step in tqdm(range(max_len)):
         # 1. Get the hidden state of the last token in the current sequence
         last_hidden = get_last_hidden_joint(
             model, prompt_tensor, committed_tokens, committed_continuous

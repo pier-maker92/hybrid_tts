@@ -93,8 +93,9 @@ class DynamicNormalizer(nn.Module):
         self.dim = dim
         self.momentum = momentum
         self.eps = eps
-        self.register_buffer("running_mean", torch.zeros(1))
-        self.register_buffer("running_var", torch.ones(1))
+        # Register buffers with shape (1, 1, dim) for easy broadcasting
+        self.register_buffer("running_mean", torch.zeros(1, 1, dim))
+        self.register_buffer("running_var", torch.ones(1, 1, dim))
 
     def forward(self, x, padding_mask=None):
         # x: (B, L, C)
@@ -103,25 +104,25 @@ class DynamicNormalizer(nn.Module):
                 mask = (~padding_mask).to(x.dtype).unsqueeze(-1)  # (B, L, 1)
                 count = mask.sum()
                 if count > 0:
-                    batch_mean = (x * mask).sum() / (count * x.shape[-1])
-                    batch_var = (((x - batch_mean) ** 2) * mask).sum() / (
-                        count * x.shape[-1]
-                    )
+                    # Sum over batch (0) and length (1) dimensions to get channel-wise values
+                    batch_mean = (x * mask).sum(dim=(0, 1)) / count  # (C,)
+                    batch_var = (((x - batch_mean.view(1, 1, -1)) ** 2) * mask).sum(dim=(0, 1)) / count  # (C,)
+                    
+                    batch_mean = batch_mean.view(1, 1, -1)  # (1, 1, C)
+                    batch_var = batch_var.view(1, 1, -1)    # (1, 1, C)
                 else:
-                    batch_mean = x.mean()
-                    batch_var = x.var(unbiased=False)
+                    batch_mean = x.mean(dim=(0, 1), keepdim=True)
+                    batch_var = x.var(dim=(0, 1), keepdim=True, unbiased=False)
             else:
-                batch_mean = x.mean()
-                batch_var = x.var(unbiased=False)
+                batch_mean = x.mean(dim=(0, 1), keepdim=True)
+                batch_var = x.var(dim=(0, 1), keepdim=True, unbiased=False)
 
             with torch.no_grad():
                 self.running_mean.copy_(
-                    (1 - self.momentum) * self.running_mean
-                    + self.momentum * batch_mean.reshape(1)
+                    (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
                 )
                 self.running_var.copy_(
-                    (1 - self.momentum) * self.running_var
-                    + self.momentum * batch_var.reshape(1)
+                    (1 - self.momentum) * self.running_var + self.momentum * batch_var
                 )
             return (x - batch_mean) / (batch_var + self.eps).sqrt()
         else:
@@ -212,7 +213,11 @@ class HybridTTS(nn.Module):
         self.norm_continuous = nn.LayerNorm(hidden_size)
 
         # ---- Output heads ----------------------------------------------------
-        self.token_head = nn.Linear(hidden_size, config.discrete_token_vocab_size)
+        self.token_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, config.discrete_token_vocab_size)
+        )
         self.diffusion_head = DiT(config.diffusion_head_config)
 
         # ---- Optional tokenizer for debug decoding --------------------------
@@ -392,6 +397,7 @@ class HybridTTS(nn.Module):
         continuous_tokens = continuous_tokens.to(d_emb.dtype)
         if continuous_tokens.shape[-1] == 64:
             continuous_tokens = continuous_tokens[..., 32:]
+        
 
         if padding_mask is None:
             L_audio = discrete_tokens.shape[1]

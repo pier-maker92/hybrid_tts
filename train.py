@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import torch
 import wandb
 import hydra
@@ -170,10 +171,51 @@ class HybridTTSTrainer(Trainer):
         self.eval_num_samples = (
             eval_num_samples if eval_num_samples is not None else float("inf")
         )
+        self.min_learning_rate = kwargs.pop("min_learning_rate", 0.0)
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         granular_losses = ["token_loss", "diffusion_loss", "total_loss"]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if optimizer is None:
+            optimizer = self.optimizer
+
+        lr_type = self.args.lr_scheduler_type
+        if lr_type not in ["cosine", "linear"]:
+            return super().create_scheduler(num_training_steps, optimizer)
+
+        warmup_steps = self.args.get_warmup_steps(num_training_steps)
+        initial_lr = self.args.learning_rate
+        min_lr = self.min_learning_rate
+
+        logger.info(
+            f"Setting up custom LambdaLR scheduler: lr_scheduler_type={lr_type}, "
+            f"warmup_steps={warmup_steps}, initial_lr={initial_lr}, min_learning_rate={min_lr}"
+        )
+
+        def get_lr_lambda(current_step):
+            # 1. Warmup phase
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            
+            # 2. Decay phase
+            progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            
+            min_lr_ratio = min_lr / initial_lr if initial_lr > 0 else 0.0
+            
+            if lr_type == "cosine":
+                decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            elif lr_type == "linear":
+                decay = 1.0 - progress
+            else:
+                decay = 1.0
+                
+            return min_lr_ratio + (1.0 - min_lr_ratio) * decay
+
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
+        return self.lr_scheduler
 
     def evaluate(
         self,
@@ -286,6 +328,8 @@ class HybridTTSTrainer(Trainer):
                     grad_norm if isinstance(grad_norm, float) else grad_norm.item()
                 )
 
+            logs["learning_rate"] = self._get_learning_rate()
+
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
@@ -352,6 +396,7 @@ def main(cfg: DictConfig):
         data_collator=data_collator,
         dataset_name=dataset_name,
         eval_num_samples=eval_num_samples,
+        min_learning_rate=min_learning_rate,
     )
 
     # Optional: Register EvaluationCallback with checkpoint paths (VAE/Vocoder loaded lazily).

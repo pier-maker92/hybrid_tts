@@ -1,21 +1,28 @@
 # @package _global_
 training:
   dataset_name: librispeech_aligned
-  output_dir: checkpoints/exps/setting-1
-  learning_rate: 1e-4
+  output_dir: checkpoints/exps/debug
+
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
+  logging_steps: 1
+  # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: setting-1-test
+  wandb_run_name: debug
+  run_id: ""
   bf16: true
-  logging_steps: 1
+  # eval
   eval_strategy: "no"
   eval_steps: null
   save_steps: 10
   eval_num_samples: 4
   num_train_epochs: 100
-  run_id: ""
+  # lr
+  learning_rate: 1e-4
+  min_learning_rate: 1e-5
+  lr_scheduler_type: "cosine"   # Change to "linear", "constant", "cosine_with_restarts", etc.
+  warmup_ratio: 0.1             # Uses 10% of total training steps for linear warmup
 
 backbone:
   model_name_or_path: "Qwen/Qwen2-0.5B"
@@ -28,7 +35,7 @@ diffusion_head:
   use_mlp_sampler: true
 
 continuous_adapter:
-  hidden_dim: 512
+  hidden_dim: 128
   num_layers: 2   # Crea 2 strati nascosti + strato di output
 
 vae_checkpoint: "/Users/software/Research/MelCausalVAE/checkpoints/exps/vq-setting-5-dropout-fixed"
