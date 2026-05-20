@@ -106,10 +106,12 @@ class DynamicNormalizer(nn.Module):
                 if count > 0:
                     # Sum over batch (0) and length (1) dimensions to get channel-wise values
                     batch_mean = (x * mask).sum(dim=(0, 1)) / count  # (C,)
-                    batch_var = (((x - batch_mean.view(1, 1, -1)) ** 2) * mask).sum(dim=(0, 1)) / count  # (C,)
-                    
+                    batch_var = (((x - batch_mean.view(1, 1, -1)) ** 2) * mask).sum(
+                        dim=(0, 1)
+                    ) / count  # (C,)
+
                     batch_mean = batch_mean.view(1, 1, -1)  # (1, 1, C)
-                    batch_var = batch_var.view(1, 1, -1)    # (1, 1, C)
+                    batch_var = batch_var.view(1, 1, -1)  # (1, 1, C)
                 else:
                     batch_mean = x.mean(dim=(0, 1), keepdim=True)
                     batch_var = x.var(dim=(0, 1), keepdim=True, unbiased=False)
@@ -216,7 +218,7 @@ class HybridTTS(nn.Module):
         self.token_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, config.discrete_token_vocab_size)
+            nn.Linear(hidden_size, config.discrete_token_vocab_size),
         )
         self.diffusion_head = DiT(config.diffusion_head_config)
 
@@ -300,7 +302,9 @@ class HybridTTS(nn.Module):
             audio_hidden_states : (B, L_audio_max, H)
             audio_hidden_mask   : (B, L_audio_max) True = valid (non-pad) frame
         """
-        audio_hidden_states = full_hidden_states[:, L_prompt : L_prompt + L_audio_max, :]
+        audio_hidden_states = full_hidden_states[
+            :, L_prompt : L_prompt + L_audio_max, :
+        ]
         device = full_hidden_states.device
         positions = torch.arange(L_audio_max, device=device).unsqueeze(0)
         audio_hidden_mask = positions < valid_lens.unsqueeze(1)
@@ -354,6 +358,40 @@ class HybridTTS(nn.Module):
         logger.debug("\n".join(lines))
         print("\n".join(lines))  # also print so it shows up without debug log level
 
+    def noise_augment_continuous_token(
+        self,
+        continuous_tokens: torch.FloatTensor,
+        padding_mask: torch.BoolTensor,
+        target_std: float = 1.0,
+    ):
+        """Add Gaussian noise to continuous tokens."""
+        std = (
+            torch.rand(
+                continuous_tokens.shape[0],
+                continuous_tokens.shape[1],
+                1,
+                dtype=continuous_tokens.dtype,
+                device=continuous_tokens.device,
+            )
+            * target_std
+        )
+
+        if getattr(self.config, "no_augment_ratio", 0.0) > 0.0:
+            # Randomly select a portion of the batch to NOT be augmented (std=0)
+            B = continuous_tokens.shape[0]
+            keep_mask = (
+                torch.rand(B, 1, 1, device=continuous_tokens.device)
+                >= self.config.no_augment_ratio
+            )
+            std = std * keep_mask.to(std.dtype)
+
+        noise = torch.randn_like(continuous_tokens) * std
+        corrupted_continuous_tokens = continuous_tokens + noise
+        corrupted_continuous_tokens = corrupted_continuous_tokens.masked_fill(
+            ~padding_mask.unsqueeze(-1), 0.0
+        )
+        return corrupted_continuous_tokens
+
     # -------------------------------------------------------------------------
     # Forward
     # -------------------------------------------------------------------------
@@ -397,7 +435,6 @@ class HybridTTS(nn.Module):
         continuous_tokens = continuous_tokens.to(d_emb.dtype)
         if continuous_tokens.shape[-1] == 64:
             continuous_tokens = continuous_tokens[..., 32:]
-        
 
         if padding_mask is None:
             L_audio = discrete_tokens.shape[1]
@@ -405,8 +442,17 @@ class HybridTTS(nn.Module):
                 (B, L_audio), dtype=torch.bool, device=discrete_tokens.device
             )
 
-        norm_ct = self.continuous_norm(continuous_tokens, padding_mask=padding_mask)
-        c_emb = self.continuous_adapter(norm_ct)
+        continuous_tokens = self.continuous_norm(
+            continuous_tokens, padding_mask=padding_mask
+        )
+
+        if self.training:
+            corrupted_continuous_tokens = self.noise_augment_continuous_token(
+                continuous_tokens, padding_mask=padding_mask, target_std=0.1
+            )
+            c_emb = self.continuous_adapter(corrupted_continuous_tokens)
+        else:
+            c_emb = self.continuous_adapter(continuous_tokens)
 
         d_emb = self.norm_discrete(d_emb)
         c_emb = self.norm_continuous(c_emb)
@@ -428,6 +474,16 @@ class HybridTTS(nn.Module):
             prompt_mask = torch.ones(
                 (B, L_prompt), dtype=torch.bool, device=p_emb.device
             )
+
+        if self.training and getattr(self.config, "uncond_prob", 0.0) > 0.0:
+            # Mask out prompt for a subset of the batch for unconditional generation
+            drop_prompt_mask = (
+                torch.rand(B, 1, device=p_emb.device) < self.config.uncond_prob
+            )
+            prompt_mask = prompt_mask.masked_fill(drop_prompt_mask, False)
+            # zero information leakage in case of any attention mask edge-cases
+            p_emb = p_emb.masked_fill(drop_prompt_mask.unsqueeze(-1), 0.0)
+
         prompt_attn = prompt_mask.long()
 
         # ------------------------------------------------------------------
@@ -467,16 +523,7 @@ class HybridTTS(nn.Module):
             audio_hidden_states.to(next(self.token_head.parameters()).dtype)
         )
 
-        if target_continuous is None:
-            target_continuous = continuous_tokens
-
-        target_continuous = target_continuous.to(d_emb.dtype)
-        if target_continuous.shape[-1] == 64:
-            target_continuous = target_continuous[..., 32:]
-
-        target_continuous = self.continuous_norm(
-            target_continuous, padding_mask=padding_mask
-        )
+        target_continuous = target_continuous or continuous_tokens
 
         self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
 

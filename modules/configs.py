@@ -61,6 +61,8 @@ class HybridTTSConfig:
     pad_token_id: int
     prompt_offset: int
     debug: bool = False
+    uncond_prob: float = 0.0
+    no_augment_ratio: float = 0.0
     backbone_hidden_size: Optional[int] = None
 
     def __post_init__(self):

@@ -82,6 +82,8 @@ def build_model(cfg_dict: Dict[str, Any]) -> HybridTTS:
         else TokenHeadConfig()
     )
 
+    training_cfg = cfg_dict.get("training", {})
+    
     hybrid_config = HybridTTSConfig(
         backbone_config=backbone_config,
         diffusion_head_config=diffusion_head_config,
@@ -95,6 +97,8 @@ def build_model(cfg_dict: Dict[str, Any]) -> HybridTTS:
         start_audio_id=cfg_dict.get("start_audio_id"),
         end_audio_id=cfg_dict.get("end_audio_id"),
         debug=cfg_dict.get("debug", False),
+        uncond_prob=training_cfg.get("uncond_prob", 0.0),
+        no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
     )
 
     return HybridTTS(config=hybrid_config)

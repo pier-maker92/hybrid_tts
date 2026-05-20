@@ -378,6 +378,9 @@ def main(cfg: DictConfig):
 
     training_cfg["learning_rate"] = float(training_cfg.get("learning_rate"))
     min_learning_rate = float(training_cfg.pop("min_learning_rate", 0.0))
+    # Pop custom config keys so they don't get passed to HuggingFace TrainingArguments
+    _ = training_cfg.pop("uncond_prob", 0.0)
+    _ = training_cfg.pop("no_augment_ratio", 0.0)
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
 

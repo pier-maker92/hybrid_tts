@@ -7,7 +7,7 @@ training:
   gradient_accumulation_steps: 1
   logging_steps: 1
   # report
-  report_to: wandb
+  report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: debug
   run_id: ""
@@ -23,6 +23,8 @@ training:
   min_learning_rate: 1e-5
   lr_scheduler_type: "cosine"   # Change to "linear", "constant", "cosine_with_restarts", etc.
   warmup_ratio: 0.1             # Uses 10% of total training steps for linear warmup
+  uncond_prob: 0.1
+  no_augment_ratio: 0.2
 
 backbone:
   model_name_or_path: "Qwen/Qwen2-0.5B"
