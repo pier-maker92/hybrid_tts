@@ -31,7 +31,7 @@ backbone:
 diffusion_head:
   net_dim: 512
   net_depth: 3
-  uncond_prob: 0.1
+  uncond_prob: 0.0
   use_mlp_sampler: true
 
 continuous_adapter:
