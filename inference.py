@@ -134,10 +134,11 @@ def load_hybrid_model(
     is_pretrained = backbone_cfg.get("pretrained")
 
     if not is_pretrained:
-        cfg_dict["prompt_vocab_size"] = vocab_size + 2  # Phonemes + Special Tokens
+        cfg_dict["prompt_vocab_size"] = vocab_size + 3  # Phonemes + Special Tokens
         cfg_dict["prompt_offset"] = 0
-        cfg_dict["start_audio_id"] = vocab_size
-        cfg_dict["end_audio_id"] = vocab_size + 1
+        cfg_dict["pad_token_id"] = vocab_size
+        cfg_dict["start_audio_id"] = vocab_size + 1
+        cfg_dict["end_audio_id"] = vocab_size + 2
         logger.info(
             f"Configured scratch HybridTTS: prompt_vocab_size={cfg_dict['prompt_vocab_size']}, start_audio_id={cfg_dict['start_audio_id']}"
         )
@@ -257,11 +258,6 @@ def generate_discrete_tokens(
 
         # Replace the dummy token at index t-1 with the actual sampled token
         generated_tokens[-1] = next_token
-
-        # If we reached the end token, stop!
-        if next_token == model.config.end_audio_id:
-            logger.info(f"Reached END token at step {step}")
-            break
 
         # Otherwise, append a dummy token for the next step
         generated_tokens.append(0)
@@ -442,10 +438,6 @@ def generate_joint_tokens(
         committed_tokens.append(next_token)
         committed_continuous.append(c_t.to(model_dtype))
 
-        if next_token == model.config.end_audio_id:
-            logger.info(f"Reached END token at step {step}")
-            break
-
     logger.info(f"Jointly generated {len(committed_tokens)} tokens.")
 
     # Stack continuous latents → [1, L, dim]
@@ -533,7 +525,7 @@ def main():
     parser.add_argument(
         "--setting",
         type=str,
-        default="setting-1",
+        default="2",
         help="Experiment setting config name under configs/settings/exps/ (default: setting-1)",
     )
     parser.add_argument(
@@ -545,26 +537,26 @@ def main():
     parser.add_argument(
         "--num_steps",
         type=int,
-        default=8,
+        default=4,
         help="Number of diffusion steps for latents generation and VAE decoding (default: 16)",
     )
     parser.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
-        help="Temperature for discrete autoregressive token sampling (default: 1.0)",
+        default=0.0,
+        help="Temperature for discrete autoregressive token sampling (default: 0.0)",
     )
     parser.add_argument(
         "--diffusion_temperature",
         type=float,
         default=1.0,
-        help="Temperature for the CFM diffusion head (default: 1.0)",
+        help="Temperature for the CFM diffusion head (default: 0.2)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=1.0,
-        help="CFG guidance scale for the diffusion head (default: 1.0)",
+        help="CFG guidance scale for the diffusion head (default: 1.3)",
     )
     parser.add_argument(
         "--top_k",
@@ -585,9 +577,20 @@ def main():
         help="Maximum generation length of discrete tokens (default: 500)",
     )
     parser.add_argument(
+        "--ratio",
+        type=float,
+        default=2.2,
+        help="Ratio of generated VQ frames per phoneme (default: 2.2)",
+    )
+    parser.add_argument(
         "--token_first",
         action="store_true",
         help="Ablation mode: generate all discrete tokens first, and then run diffusion once on the sequence (default: False)",
+    )
+    parser.add_argument(
+        "--decode_only_token",
+        action="store_true",
+        help="Use only the generated quantized tokens in the VAE (continuous features set to zero) (default: False)",
     )
     args = parser.parse_args()
 
@@ -668,135 +671,150 @@ def main():
         logger.error("Empty phoneme input. Nothing to synthesize.")
         sys.exit(1)
 
-    if not args.token_first:
-        # Main joint inference mechanism: discrete tokens and continuous latents generated step-by-step
-        discrete_tokens, z = generate_joint_tokens(
-            hybrid_model,
-            prompt_ids,
-            max_len=args.max_len,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            num_steps=args.num_steps,
-            diffusion_temperature=args.diffusion_temperature,
-            guidance_scale=args.guidance_scale,
-        )
-
-        # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
-        logger.info("Decoding continuous features using VAE...")
-        # Strip the END token's continuous frame — it has no audio content
-        if discrete_tokens and discrete_tokens[-1] == hybrid_model.config.end_audio_id:
-            z = z[:, :-1, :]
-            logger.info("Stripped END token continuous frame before VAE decoding.")
-        # For a single sequence, padding mask is all False
-        padding_mask = torch.zeros(z.shape[:2], dtype=torch.bool, device=device)
-        # Denormalize continuous latents only before VAE decoder
-        z_denorm = hybrid_model.continuous_norm.denormalize(z)
-
-        # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
-        audio_tokens = list(discrete_tokens)
-        if audio_tokens and audio_tokens[-1] == hybrid_model.config.end_audio_id:
-            audio_tokens = audio_tokens[:-1]
-        
-        tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-        with torch.no_grad():
-            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
-        vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
-        
-        z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
-
-        reconstructed_mel, reconstructed_padding_mask = vae.sample(
-            num_steps=args.num_steps,
-            temperature=args.diffusion_temperature,
-            guidance_scale=args.guidance_scale,
-            z=z_vae,
-            padding_mask=padding_mask,
-        )
+    # Calculate target length based on prompt length if default max_len is used
+    if args.max_len == 500:
+        target_len = int(len(prompt_ids) * args.ratio)
+        logger.info(f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})")
     else:
-        # Ablation mode: generate all discrete tokens first, and then run diffusion once on the sequence
-        logger.info(
-            "Running in ablation mode (--token_first): generating all discrete tokens first..."
-        )
-        # Step 1: Generate discrete tokens autoregressively
-        discrete_tokens = generate_discrete_tokens(
-            hybrid_model,
-            prompt_ids,
-            max_len=args.max_len,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-        )
-
-        if not discrete_tokens:
-            logger.error("Failed to generate discrete tokens.")
-            sys.exit(1)
-
-        # Step 2: Get hidden states for the complete audio sequence from backbone
-        logger.info("Extracting audio hidden states from backbone...")
-        audio_hidden_states = get_audio_hidden_states(
-            hybrid_model, prompt_ids, discrete_tokens
-        )
-
-        # Step 3: Run the diffusion head to generate continuous features (latents)
-        logger.info(
-            f"Running diffusion head (steps={args.num_steps}, guidance={args.guidance_scale})..."
-        )
-        padding_mask = torch.zeros(
-            (1, audio_hidden_states.shape[1]), dtype=torch.bool, device=device
-        )
-        latents_output = hybrid_model.diffusion_head.generate(
-            num_steps=args.num_steps,
-            context_vector=audio_hidden_states,
-            temperature=args.diffusion_temperature,
-            guidance_scale=args.guidance_scale,
-            padding_mask=padding_mask,
-        )
-        z = latents_output.audio_features
-
-        # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
-        logger.info("Decoding continuous features using VAE...")
-        # Denormalize continuous latents only before VAE decoder
-        z_denorm = hybrid_model.continuous_norm.denormalize(z)
-
-        # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
-        audio_tokens = list(discrete_tokens)
-        if audio_tokens and audio_tokens[-1] == hybrid_model.config.end_audio_id:
-            audio_tokens = audio_tokens[:-1]
-        
-        tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-        with torch.no_grad():
-            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
-        vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
-        
-        z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
-
-        reconstructed_mel, reconstructed_padding_mask = vae.sample(
-            num_steps=args.num_steps,
-            temperature=args.diffusion_temperature,
-            guidance_scale=args.guidance_scale,
-            z=z_vae,
-            padding_mask=latents_output.padding_mask,
-        )
-
-    # Step 5: Synthesize waveform using Vocoder
-    logger.info("Synthesizing waveform using Vocoder...")
-    mel = reconstructed_mel[0]
-    mask = reconstructed_padding_mask[0]
-    # Squeeze the padding mask if applicable
-    mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
+        target_len = args.max_len
+        logger.info(f"Using explicitly specified max_len: {target_len} frames")
 
     with torch.no_grad():
+        if not args.token_first:
+            # Main joint inference mechanism: discrete tokens and continuous latents generated step-by-step
+            discrete_tokens, z = generate_joint_tokens(
+                hybrid_model,
+                prompt_ids,
+                max_len=target_len,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                num_steps=args.num_steps,
+                diffusion_temperature=args.diffusion_temperature,
+                guidance_scale=args.guidance_scale,
+            )
+
+            # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
+            logger.info("Decoding continuous features using VAE...")
+            # For a single sequence, padding mask is all False
+            padding_mask = torch.zeros(z.shape[:2], dtype=torch.bool, device=device)
+            # Denormalize continuous latents only before VAE decoder
+            z_denorm = hybrid_model.continuous_norm.denormalize(z)
+
+            # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
+            audio_tokens = list(discrete_tokens)
+            
+            tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
+            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
+            vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
+            
+            if args.decode_only_token:
+                logger.info("Using only generated quantized tokens (continuous features zeroed out).")
+                z_denorm = torch.zeros_like(z_denorm)
+
+            z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
+
+            reconstructed_mel, reconstructed_padding_mask = vae.sample(
+                num_steps=16,
+                temperature=0.2,
+                guidance_scale=1.4,
+                z=z_vae,
+                padding_mask=padding_mask,
+            )
+        else:
+            # Ablation mode: generate all discrete tokens first, and then run diffusion once on the sequence
+            logger.info(
+                "Running in ablation mode (--token_first): generating all discrete tokens first..."
+            )
+            # Step 1: Generate discrete tokens autoregressively
+            discrete_tokens = generate_discrete_tokens(
+                hybrid_model,
+                prompt_ids,
+                max_len=target_len,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+            )
+
+            if not discrete_tokens:
+                logger.error("Failed to generate discrete tokens.")
+                sys.exit(1)
+
+            if not args.decode_only_token:
+                # Step 2: Get hidden states for the complete audio sequence from backbone
+                logger.info("Extracting audio hidden states from backbone...")
+                audio_hidden_states = get_audio_hidden_states(
+                    hybrid_model, prompt_ids, discrete_tokens
+                )
+
+                # Step 3: Run the diffusion head to generate continuous features (latents)
+                logger.info(
+                    f"Running diffusion head (steps={args.num_steps}, guidance={args.guidance_scale})..."
+                )
+                padding_mask = torch.zeros(
+                    (1, audio_hidden_states.shape[1]), dtype=torch.bool, device=device
+                )
+                latents_output = hybrid_model.diffusion_head.generate(
+                    num_steps=args.num_steps,
+                    context_vector=audio_hidden_states,
+                    temperature=args.diffusion_temperature,
+                    guidance_scale=args.guidance_scale,
+                    padding_mask=padding_mask,
+                )
+                z = latents_output.audio_features
+
+                # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
+                logger.info("Decoding continuous features using VAE...")
+                # Denormalize continuous latents only before VAE decoder
+                z_denorm = hybrid_model.continuous_norm.denormalize(z)
+                vae_padding_mask = latents_output.padding_mask
+            else:
+                logger.info("Skipping backbone extraction and diffusion head (decode_only_token is active).")
+                # Create a zero tensor for z_denorm with shape [1, L_audio, continuous_dim]
+                z_denorm = torch.zeros(
+                    (1, len(discrete_tokens), hybrid_model.config.continuous_dim),
+                    dtype=dtype,
+                    device=device,
+                )
+                vae_padding_mask = torch.zeros(
+                    (1, len(discrete_tokens)), dtype=torch.bool, device=device
+                )
+
+            # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
+            audio_tokens = list(discrete_tokens)
+            
+            tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
+            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
+            vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
+            
+            z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
+
+            reconstructed_mel, reconstructed_padding_mask = vae.sample(
+                num_steps=args.num_steps,
+                temperature=args.diffusion_temperature,
+                guidance_scale=args.guidance_scale,
+                z=z_vae,
+                padding_mask=vae_padding_mask,
+            )
+
+        # Step 5: Synthesize waveform using Vocoder
+        logger.info("Synthesizing waveform using Vocoder...")
+        mel = reconstructed_mel[0]
+        mask = reconstructed_padding_mask[0]
+        # Squeeze the padding mask if applicable
+        mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
+
         recon_audio = vocoder.decode(mel).squeeze()
 
-    # Normalize audio and save to disk
-    recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
+        # Normalize audio and save to disk
+        recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
 
-    # Ensure correct shape [1, num_samples]
-    if recon_audio.dim() == 1:
-        recon_audio = recon_audio.unsqueeze(0)
+        # Ensure correct shape [1, num_samples]
+        if recon_audio.dim() == 1:
+            recon_audio = recon_audio.unsqueeze(0)
 
-    torchaudio.save(args.output, recon_audio.cpu(), 24000)
-    logger.info(f"SUCCESS: Audio generated and saved to '{args.output}'!")
+        torchaudio.save(args.output, recon_audio.cpu(), 24000)
+        logger.info(f"SUCCESS: Audio generated and saved to '{args.output}'!")
 
 
 if __name__ == "__main__":
