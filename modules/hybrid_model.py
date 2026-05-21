@@ -86,7 +86,7 @@ class HybridTokenizer:
 
 
 class DynamicNormalizer(nn.Module):
-    def __init__(self, dim, momentum=0.1, eps=1e-5):
+    def __init__(self, dim, momentum=0.001, eps=1e-5):
         super().__init__()
         self.dim = dim
         self.momentum = momentum
@@ -374,7 +374,7 @@ class HybridTTS(nn.Module):
         noise = torch.randn_like(continuous_tokens) * std
         corrupted_continuous_tokens = continuous_tokens + noise
         corrupted_continuous_tokens = corrupted_continuous_tokens.masked_fill(
-            ~padding_mask.unsqueeze(-1), 0.0
+            padding_mask.unsqueeze(-1), 0.0
         )
         return corrupted_continuous_tokens
 
@@ -434,15 +434,29 @@ class HybridTTS(nn.Module):
 
         if self.training:
             corrupted_continuous_tokens = self.noise_augment_continuous_token(
-                continuous_tokens, padding_mask=padding_mask, target_std=0.1
+                continuous_tokens, padding_mask=padding_mask, target_std=0.8
             )
             c_emb = self.continuous_adapter(corrupted_continuous_tokens)
-            print(" inference continuous token")
         else:
             c_emb = self.continuous_adapter(continuous_tokens)
 
         d_emb = self.norm_discrete(d_emb)
         c_emb = self.norm_continuous(c_emb)
+        
+        # Calculate continuous ratio over valid frames
+        valid_mask = ~padding_mask
+        c_norm = c_emb.norm(dim=-1)
+        total_norm = (d_emb + c_emb).norm(dim=-1)
+        ratio = c_norm / (total_norm + 1e-8)
+        if valid_mask.any():
+            continuous_ratio = ratio[valid_mask].mean()
+        else:
+            continuous_ratio = torch.tensor(0.0, device=d_emb.device)
+        
+        valid_audio = (~padding_mask).unsqueeze(-1)
+        d_emb = d_emb * valid_audio
+        c_emb = c_emb * valid_audio
+        
         audio_emb = d_emb + c_emb  # (B, L_audio_max, H)
         L_audio_max = audio_emb.shape[1]
 
@@ -459,9 +473,18 @@ class HybridTTS(nn.Module):
             drop_prompt_mask = (
                 torch.rand(B, 1, device=p_emb.device) < self.config.uncond_prob
             )
-            prompt_mask = prompt_mask.masked_fill(drop_prompt_mask, False)
+            
+            non_special = (
+                (prompt_ids + self.config.prompt_offset != self.config.start_audio_id)
+                &
+                (prompt_ids + self.config.prompt_offset != self.config.end_audio_id)
+            )
+            
+            mask_to_drop = drop_prompt_mask & non_special
+            
+            prompt_mask = prompt_mask.masked_fill(mask_to_drop, False)
             # zero information leakage in case of any attention mask edge-cases
-            p_emb = p_emb.masked_fill(drop_prompt_mask.unsqueeze(-1), 0.0)
+            p_emb = p_emb.masked_fill(mask_to_drop.unsqueeze(-1), 0.0)
 
         # ------------------------------------------------------------------
         # 5. Build full sequence
@@ -524,6 +547,7 @@ class HybridTTS(nn.Module):
             token_logits=token_logits,
             diffusion_loss=diffusion_output.loss,
             diffusion_output=diffusion_output,
+            continuous_ratio=continuous_ratio,
         )
 
     # -------------------------------------------------------------------------
@@ -566,6 +590,11 @@ class HybridTTS(nn.Module):
         c_emb = self.continuous_adapter(norm_c)
         d_emb = self.norm_discrete(d_emb)
         c_emb = self.norm_continuous(c_emb)
+        
+        valid_audio = (~padding_mask).unsqueeze(-1)
+        d_emb = d_emb * valid_audio
+        c_emb = c_emb * valid_audio
+        
         audio_emb = d_emb + c_emb
         L_audio_max = audio_emb.shape[1]
 

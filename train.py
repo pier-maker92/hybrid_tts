@@ -181,8 +181,22 @@ class HybridTTSTrainer(Trainer):
         self.min_learning_rate = kwargs.pop("min_learning_rate", 0.0)
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
-        granular_losses = ["token_loss", "diffusion_loss", "total_loss"]
+        granular_losses = ["token_loss", "diffusion_loss", "total_loss", "continuous_ratio"]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+            
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self._train_batch_size,
+            shuffle=True,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            drop_last=self.args.dataloader_drop_last,
+        )
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if optimizer is None:
@@ -288,6 +302,7 @@ class HybridTTSTrainer(Trainer):
                 "token_loss": token_loss.detach(),
                 "diffusion_loss": diffusion_loss.detach(),
                 "total_loss": total_loss.detach(),
+                "continuous_ratio": outputs.continuous_ratio.detach() if outputs.continuous_ratio is not None else torch.tensor(0.0, device=total_loss.device),
             }
             for key in self.control.granular_losses:
                 if flat_metrics.get(key) is not None:
@@ -392,6 +407,7 @@ def main(cfg: DictConfig):
     _ = training_cfg.pop("no_augment_ratio", 0.0)
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
+    resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
 
     training_args = TrainingArguments(
         remove_unused_columns=False,
@@ -441,7 +457,7 @@ def main(cfg: DictConfig):
         )
 
     logger.info("Starting training...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 
 if __name__ == "__main__":
