@@ -105,6 +105,7 @@ class EvaluationCallback(TrainerCallback):
         pad_id,
         num_samples=100,
         batch_size=1,
+        **kwargs,
     ):
         self.vae_checkpoint = vae_checkpoint
         self.vocoder_checkpoint = vocoder_checkpoint
@@ -112,6 +113,8 @@ class EvaluationCallback(TrainerCallback):
         self.dataset_name = dataset_name
         self.num_samples = num_samples
         self.eval_device = eval_device
+        self.start_audio_id = kwargs.get("start_audio_id")
+        self.end_audio_id = kwargs.get("end_audio_id")
         # Build a dedicated DataLoader limited to num_samples
         if num_samples and num_samples > 0:
             indices = list(range(min(num_samples, len(eval_dataset))))
@@ -122,7 +125,11 @@ class EvaluationCallback(TrainerCallback):
             subset,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=DataCollator(pad_id=pad_id),
+            collate_fn=DataCollator(
+                pad_id=pad_id,
+                start_audio_id=self.start_audio_id,
+                end_audio_id=self.end_audio_id,
+            ),
         )
         logger.info(
             f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples (device={self.eval_device})."
@@ -198,20 +205,22 @@ class HybridTTSTrainer(Trainer):
             # 1. Warmup phase
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
-            
+
             # 2. Decay phase
-            progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+            progress = float(current_step - warmup_steps) / float(
+                max(1, num_training_steps - warmup_steps)
+            )
             progress = min(1.0, max(0.0, progress))
-            
+
             min_lr_ratio = min_lr / initial_lr if initial_lr > 0 else 0.0
-            
+
             if lr_type == "cosine":
                 decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             elif lr_type == "linear":
                 decay = 1.0 - progress
             else:
                 decay = 1.0
-                
+
             return min_lr_ratio + (1.0 - min_lr_ratio) * decay
 
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr_lambda)
@@ -390,7 +399,11 @@ def main(cfg: DictConfig):
         **training_cfg,
     )
 
-    data_collator = DataCollator(pad_id=tok.pad_id)
+    data_collator = DataCollator(
+        pad_id=tok.pad_id,
+        start_audio_id=tok.start_audio_id - tok.prompt_offset,
+        end_audio_id=tok.end_audio_id - tok.prompt_offset,
+    )
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,
@@ -419,6 +432,8 @@ def main(cfg: DictConfig):
                 num_samples=eval_num_samples,
                 batch_size=training_args.per_device_eval_batch_size,
                 pad_id=tok.pad_id,
+                start_audio_id=tok.start_audio_id - tok.prompt_offset,
+                end_audio_id=tok.end_audio_id - tok.prompt_offset,
             )
         )
         logger.info(

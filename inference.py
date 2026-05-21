@@ -283,7 +283,6 @@ def get_audio_hidden_states(
     prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     discrete_tensor = torch.tensor([discrete_tokens], dtype=torch.long, device=device)
 
-    L_prompt = prompt_tensor.shape[1]
     L_audio = discrete_tensor.shape[1]
 
     # continuous_tokens: zeros of shape [1, L_audio, continuous_dim]
@@ -302,24 +301,27 @@ def get_audio_hidden_states(
     c_emb = model.norm_continuous(c_emb)
     audio_emb = d_emb + c_emb
 
-    start_ids = torch.full(
-        (1, 1), model.config.start_audio_id, device=device, dtype=torch.long
-    )
-    start_emb = model.prompt_emb(start_ids)
+    lut_ids = prompt_tensor + model.config.prompt_offset
+    start_idx = (lut_ids == model.config.start_audio_id).long().argmax(dim=1).item()
+    end_idx = (lut_ids == model.config.end_audio_id).long().argmax(dim=1).item()
 
-    inputs_embeds = torch.cat([p_emb, start_emb, audio_emb], dim=1)
+    prefix_emb = p_emb[:, :start_idx + 1, :]
+    end_emb = p_emb[:, end_idx:end_idx+1, :]
 
-    prompt_attn = torch.ones((1, L_prompt), dtype=torch.long, device=device)
-    start_attn = torch.ones((1, 1), dtype=torch.long, device=device)
+    inputs_embeds = torch.cat([prefix_emb, audio_emb, end_emb], dim=1)
+
+    prefix_attn = torch.ones((1, start_idx + 1), dtype=torch.long, device=device)
     audio_attn = (~padding_mask).long()
-    attention_mask = torch.cat([prompt_attn, start_attn, audio_attn], dim=1)
+    end_attn = torch.ones((1, 1), dtype=torch.long, device=device)
+    attention_mask = torch.cat([prefix_attn, audio_attn, end_attn], dim=1)
 
     outputs_bb = model.backbone(
         inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask
     )
     full_hidden_states = outputs_bb.last_hidden_state
 
-    audio_hidden_states = full_hidden_states[:, L_prompt : L_prompt + L_audio, :]
+    # Hidden states corresponding to start_audio up to the last audio token (length L_audio)
+    audio_hidden_states = full_hidden_states[:, start_idx : start_idx + L_audio, :]
     return audio_hidden_states
 
 
@@ -332,49 +334,48 @@ def get_last_hidden_joint(
 ) -> torch.Tensor:
     """
     Returns the hidden state of the last token in the sequence:
-      [Prompt | START]                          <- step 0 (START output)
-      [Prompt | START | (a_0,c_0) | ...]        <- step t (last audio token output)
-
-    Exactly mirrors the training sequence with teacher-forcing, but using
-    committed (generated) tokens instead of ground-truth tokens.
-    The hidden state at position -1 is always used to predict the NEXT (a_t, c_t).
+      [Prompt | START | <END>]                          <- step 0 (START output)
+      [Prompt | START | (a_0,c_0) | ... | <END>]        <- step t (last audio token output)
     """
     device = model.device
     bb_dtype = next(model.backbone.parameters()).dtype
-    L_prompt = prompt_tensor.shape[1]
 
-    p_emb = model.prompt_emb(prompt_tensor + model.config.prompt_offset)
-    start_ids = torch.full((1, 1), model.config.start_audio_id, device=device, dtype=torch.long)
-    start_emb = model.prompt_emb(start_ids)
+    lut_ids = prompt_tensor + model.config.prompt_offset
+    start_idx = (lut_ids == model.config.start_audio_id).long().argmax(dim=1).item()
+    end_idx = (lut_ids == model.config.end_audio_id).long().argmax(dim=1).item()
 
-    prompt_attn = torch.ones((1, L_prompt), dtype=torch.long, device=device)
-    start_attn  = torch.ones((1, 1),        dtype=torch.long, device=device)
-    attention_mask = torch.cat([prompt_attn, start_attn], dim=1)
+    p_emb = model.prompt_emb(lut_ids)
+
+    prefix_emb = p_emb[:, :start_idx + 1, :]
+    end_emb = p_emb[:, end_idx:end_idx+1, :]
+
+    prefix_attn = torch.ones((1, start_idx + 1), dtype=torch.long, device=device)
+    end_attn = torch.ones((1, 1), dtype=torch.long, device=device)
 
     if len(committed_tokens) == 0:
-        # Step 0: sequence is just [Prompt | START]
-        inputs_embeds = torch.cat([p_emb, start_emb], dim=1)
+        inputs_embeds = torch.cat([prefix_emb, end_emb], dim=1)
+        attention_mask = torch.cat([prefix_attn, end_attn], dim=1)
+        # We want the hidden state of START, which is at position start_idx (since length is start_idx + 1 before end_emb)
+        target_pos = start_idx
     else:
-        # Step t: sequence is [Prompt | START | (a_0,c_0) | ... | (a_{t-1},c_{t-1})]
-        discrete_tensor    = torch.tensor([committed_tokens], dtype=torch.long, device=device)
-        # committed_continuous is a list of [dim] tensors, already in normalized space
-        continuous_tensor  = torch.stack(committed_continuous, dim=0).unsqueeze(0)  # [1, t, dim]
+        discrete_tensor = torch.tensor([committed_tokens], dtype=torch.long, device=device)
+        continuous_tensor = torch.stack(committed_continuous, dim=0).unsqueeze(0)  # [1, t, dim]
 
         d_emb = model.discrete_emb(discrete_tensor)
-        # continuous from diffusion head is already normalized — apply adapter directly
         c_emb = model.continuous_adapter(continuous_tensor)
 
         d_emb = model.norm_discrete(d_emb)
         c_emb = model.norm_continuous(c_emb)
         audio_emb = d_emb + c_emb
 
-        inputs_embeds  = torch.cat([p_emb, start_emb, audio_emb], dim=1)
-        audio_attn     = torch.ones((1, len(committed_tokens)), dtype=torch.long, device=device)
-        attention_mask = torch.cat([attention_mask, audio_attn], dim=1)
+        inputs_embeds = torch.cat([prefix_emb, audio_emb, end_emb], dim=1)
+        audio_attn = torch.ones((1, len(committed_tokens)), dtype=torch.long, device=device)
+        attention_mask = torch.cat([prefix_attn, audio_attn, end_attn], dim=1)
+        # We want the hidden state of the last audio token, which is at start_idx + len(committed_tokens)
+        target_pos = start_idx + len(committed_tokens)
 
-    outputs_bb       = model.backbone(inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask)
-    # The last position in the sequence is always the token whose output we need
-    last_hidden      = outputs_bb.last_hidden_state[:, -1:, :]   # [1, 1, hidden_dim]
+    outputs_bb = model.backbone(inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask)
+    last_hidden = outputs_bb.last_hidden_state[:, target_pos:target_pos+1, :]
     return last_hidden
 
 
@@ -671,6 +672,11 @@ def main():
     if not prompt_ids:
         logger.error("Empty phoneme input. Nothing to synthesize.")
         sys.exit(1)
+
+    # Append <start_audio> and <end_audio> explicitly
+    start_audio_id = cfg_dict["start_audio_id"] - cfg_dict["prompt_offset"]
+    end_audio_id = cfg_dict["end_audio_id"] - cfg_dict["prompt_offset"]
+    prompt_ids.extend([start_audio_id, end_audio_id])
 
     # Calculate target length based on prompt length if default max_len is used
     if args.max_len == 500:

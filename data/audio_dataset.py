@@ -72,8 +72,10 @@ class TrainDatasetWrapper(SimpleAudioDataset):
 class DataCollator(object):
     """Collate examples for supervised fine-tuning."""
 
-    def __init__(self, pad_id):
+    def __init__(self, pad_id, start_audio_id=None, end_audio_id=None):
         self.pad_id = pad_id
+        self.start_audio_id = start_audio_id
+        self.end_audio_id = end_audio_id
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
@@ -88,6 +90,10 @@ class DataCollator(object):
 
         if all(x is not None for x in [p_ids, d_tokens, c_tokens]):
             # Padding phoneme_ids + build prompt_mask (True = valid, False = pad)
+            # Append <start_audio> and <end_audio> to each sequence
+            if self.start_audio_id is not None and self.end_audio_id is not None:
+                p_ids = [list(p) + [self.start_audio_id, self.end_audio_id] for p in p_ids]
+
             max_p = max(len(x) for x in p_ids)
             padded_p = []
             prompt_mask = []

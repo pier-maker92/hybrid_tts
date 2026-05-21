@@ -75,10 +75,8 @@ class HybridTokenizer:
         prompt_str = self.decode_prompt(prompt_ids[:valid_prompt_len])
         pad_prompt = valid_prompt_len < len(prompt_ids)
         return (
-            f"PROMPT({valid_prompt_len}{'*' if pad_prompt else ''}): {prompt_str} "
-            f"| <start_audio> "
-            f"| AUDIO({valid_audio_len}/{L_audio_max} frames) "
-            f"| <end_audio>@pos={1 + valid_audio_len}"
+            f"PROMPT_WITH_TAGS({valid_prompt_len}{'*' if pad_prompt else ''}): {prompt_str} "
+            f"| AUDIO_INSERTED({valid_audio_len}/{L_audio_max} frames)"
         )
 
 
@@ -163,16 +161,10 @@ class HybridTTS(nn.Module):
     """
     Sequence layout fed to the backbone (per sample i in the batch):
 
-        [phoneme_0 ... phoneme_{P_i-1} | <PAD> ... | <start_audio> |
-         audio_0 ... audio_{A_i-1} | <end_audio> | <PAD> ...]
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-              L_prompt_max positions     L_audio_max + 2 positions
-                                         (start + audio_max + end)
+        [phoneme_0 ... phoneme_{P_i-1} | <start_audio> | audio_0 ... audio_{A_i-1} | <end_audio> | <PAD> ...]
 
-    The <end_audio> token is placed at the per-sample valid position
-    (1 + valid_audio_len[i]) inside the audio_extended block via scatter,
-    so every sample in the batch gets its own end-of-audio marker at the
-    correct frame, regardless of padding.
+    The dataloader prepares prompt_ids with <start_audio> and <end_audio>.
+    _build_full_sequence finds the <start_audio> and <end_audio> positions, and inserts audio frames between them.
     """
 
     def __init__(self, config: HybridTTSConfig):
@@ -230,87 +222,83 @@ class HybridTTS(nn.Module):
     # Internal helpers
     # -------------------------------------------------------------------------
 
-    def _build_audio_extended(
+    def _build_full_sequence(
         self,
-        audio_emb: torch.Tensor,  # (B, L_audio_max, H)
-        padding_mask: torch.BoolTensor,  # (B, L_audio_max) True=pad
+        p_emb: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.BoolTensor,
+        audio_emb: torch.Tensor,
+        padding_mask: torch.BoolTensor,
     ):
         """
-        Build the extended audio embedding block and its attention mask.
-
-        Returns:
-            audio_ext_emb  : (B, L_audio_max + 2, H)
-                             [<start> | audio_0 ... audio_{L-1} | <end> | PAD ...]
-            audio_ext_attn : (B, L_audio_max + 2) long   1=attend, 0=ignore
-            valid_lens     : (B,)  number of valid audio frames per sample
+        Insert audio embeddings between <start_audio> and <end_audio> in the prompt.
         """
-        B, L_audio_max, H = audio_emb.shape
-        device = audio_emb.device
+        B, L_prompt, H = p_emb.shape
+        B, L_audio_max, _ = audio_emb.shape
+        device = p_emb.device
 
-        # Valid audio frame counts per sample
-        valid_lens = (~padding_mask).sum(dim=1)  # (B,)
+        lut_ids = prompt_ids + self.config.prompt_offset
+        start_indices = (lut_ids == self.config.start_audio_id).long().argmax(dim=1)
+        end_indices = (lut_ids == self.config.end_audio_id).long().argmax(dim=1)
 
-        # Initialise the extended block with PAD embeddings
+        valid_audio_lens = (~padding_mask).sum(dim=1)
+
+        L_full = L_prompt + L_audio_max
+
         pad_emb = self.prompt_emb(
-            torch.full(
-                (1, 1), self.config.pad_token_id, dtype=torch.long, device=device
-            )
-        )  # (1, 1, H)
-        audio_ext = pad_emb.expand(B, L_audio_max + 2, H).clone()
-
-        # Position 0 → <start_audio>
-        start_ids = torch.full(
-            (B, 1), self.config.start_audio_id, dtype=torch.long, device=device
+            torch.full((1,), self.config.pad_token_id, dtype=torch.long, device=device)
         )
-        audio_ext[:, 0, :] = self.prompt_emb(start_ids).squeeze(1)
+        inputs_embeds = pad_emb.view(1, 1, H).expand(B, L_full, H).clone()
+        attention_mask = torch.zeros((B, L_full), dtype=torch.long, device=device)
 
-        # Positions 1 .. L_audio_max → audio frame embeddings
-        audio_ext[:, 1 : L_audio_max + 1, :] = audio_emb
+        for i in range(B):
+            s_idx = start_indices[i].item()
+            e_idx = end_indices[i].item()
+            a_len = valid_audio_lens[i].item()
 
-        # Position (valid_len + 1) → <end_audio>  (per sample, via scatter)
-        end_ids = torch.full(
-            (B, 1), self.config.end_audio_id, dtype=torch.long, device=device
-        )
-        end_emb = self.prompt_emb(end_ids)  # (B, 1, H)
-        # end positions: valid_len + 1, clamped so it never exceeds L_audio_max + 1
-        end_pos = (valid_lens + 1).clamp(max=L_audio_max + 1)  # (B,)
-        end_pos_idx = end_pos.view(B, 1, 1).expand(B, 1, H)
-        audio_ext.scatter_(1, end_pos_idx, end_emb)
+            # 1. Prompt up to <start_audio>
+            inputs_embeds[i, 0 : s_idx + 1] = p_emb[i, 0 : s_idx + 1]
+            attention_mask[i, 0 : s_idx + 1] = prompt_mask[i, 0 : s_idx + 1].long()
 
-        # Attention mask: attend to positions 0 .. valid_len+1 (inclusive)
-        positions = torch.arange(L_audio_max + 2, device=device).unsqueeze(
-            0
-        )  # (1, L+2)
-        audio_ext_attn = (positions <= (valid_lens + 1).unsqueeze(1)).long()  # (B, L+2)
+            # 2. Audio frames
+            if a_len > 0:
+                inputs_embeds[i, s_idx + 1 : s_idx + 1 + a_len] = audio_emb[i, 0:a_len]
+                attention_mask[i, s_idx + 1 : s_idx + 1 + a_len] = 1
 
-        return audio_ext, audio_ext_attn, valid_lens
+            # 3. <end_audio>
+            inputs_embeds[i, s_idx + 1 + a_len] = p_emb[i, e_idx]
+            attention_mask[i, s_idx + 1 + a_len] = 1
+
+        return inputs_embeds, attention_mask, start_indices, valid_audio_lens
 
     def _extract_audio_hidden_states(
         self,
         full_hidden_states: torch.Tensor,
-        L_prompt: int,
+        start_indices: torch.Tensor,
         L_audio_max: int,
         valid_lens: torch.Tensor,
     ):
         """
         Select hidden states that predict audio frames 0 .. L_audio_max-1.
-
-        In the audio_ext block, frame t is predicted from position t:
-          t=0 → <start_audio>, t>=1 → audio_emb[t-1].
-
-        Returns:
-            audio_hidden_states : (B, L_audio_max, H)
-            audio_hidden_mask   : (B, L_audio_max) True = valid (non-pad) frame
+        These are the hidden states from <start_audio> to the LAST AUDIO FRAME BEFORE <end_audio>.
         """
-        audio_hidden_states = full_hidden_states[
-            :, L_prompt : L_prompt + L_audio_max, :
-        ]
+        B, L_seq, H = full_hidden_states.shape
         device = full_hidden_states.device
+
         positions = torch.arange(L_audio_max, device=device).unsqueeze(0)
+        gather_indices = start_indices.unsqueeze(1) + positions
+        gather_indices = gather_indices.clamp(max=L_seq - 1)
+        gather_indices_expanded = gather_indices.unsqueeze(-1).expand(B, L_audio_max, H)
+
+        audio_hidden_states = torch.gather(
+            full_hidden_states, 1, gather_indices_expanded
+        )
+
         audio_hidden_mask = positions < valid_lens.unsqueeze(1)
         audio_hidden_states = audio_hidden_states.masked_fill(
             ~audio_hidden_mask.unsqueeze(-1), 0.0
         )
+
         return audio_hidden_states, audio_hidden_mask
 
     def _assert_audio_masks_aligned(
@@ -349,10 +337,8 @@ class HybridTTS(nn.Module):
                 # Fallback: raw IDs
                 raw_p = prompt_ids[i, :valid_p].tolist()
                 desc = (
-                    f"PROMPT({valid_p}): {raw_p} "
-                    f"| <start_audio> "
-                    f"| AUDIO({valid_a}/{L_audio_max} frames) "
-                    f"| <end_audio>@pos={1 + valid_a}"
+                    f"PROMPT_WITH_TAGS({valid_p}): {raw_p} "
+                    f"| AUDIO_INSERTED({valid_a}/{L_audio_max} frames) "
                 )
             lines.append(f"  sample[{i}]: {desc}")
         logger.debug("\n".join(lines))
@@ -451,6 +437,7 @@ class HybridTTS(nn.Module):
                 continuous_tokens, padding_mask=padding_mask, target_std=0.1
             )
             c_emb = self.continuous_adapter(corrupted_continuous_tokens)
+            print(" inference continuous token")
         else:
             c_emb = self.continuous_adapter(continuous_tokens)
 
@@ -460,15 +447,7 @@ class HybridTTS(nn.Module):
         L_audio_max = audio_emb.shape[1]
 
         # ------------------------------------------------------------------
-        # 3. Build audio_extended: [<start> | audio | <end@valid_pos> | PAD]
-        # ------------------------------------------------------------------
-        audio_ext_emb, audio_ext_attn, valid_lens = self._build_audio_extended(
-            audio_emb, padding_mask
-        )
-        # audio_ext_emb shape: (B, L_audio_max + 2, H)
-
-        # ------------------------------------------------------------------
-        # 4. Prompt attention mask
+        # 4. Prompt attention mask & Unconditional Drop Out
         # ------------------------------------------------------------------
         if prompt_mask is None:
             prompt_mask = torch.ones(
@@ -484,14 +463,14 @@ class HybridTTS(nn.Module):
             # zero information leakage in case of any attention mask edge-cases
             p_emb = p_emb.masked_fill(drop_prompt_mask.unsqueeze(-1), 0.0)
 
-        prompt_attn = prompt_mask.long()
-
         # ------------------------------------------------------------------
-        # 5. Concatenate full sequence
-        #    [prompt (L_prompt) | audio_ext (L_audio_max + 2)]
+        # 5. Build full sequence
         # ------------------------------------------------------------------
-        inputs_embeds = torch.cat([p_emb, audio_ext_emb], dim=1)
-        attention_mask = torch.cat([prompt_attn, audio_ext_attn], dim=1)
+        inputs_embeds, attention_mask, start_indices, valid_lens = (
+            self._build_full_sequence(
+                p_emb, prompt_ids, prompt_mask, audio_emb, padding_mask
+            )
+        )
 
         # ------------------------------------------------------------------
         # 6. Optional debug: decode and print the sequence
@@ -513,7 +492,7 @@ class HybridTTS(nn.Module):
         # 8. Audio hidden states for output heads (per-sample valid lengths)
         # ------------------------------------------------------------------
         audio_hidden_states, audio_hidden_mask = self._extract_audio_hidden_states(
-            full_hidden_states, L_prompt, L_audio_max, valid_lens
+            full_hidden_states, start_indices, L_audio_max, valid_lens
         )
 
         # ------------------------------------------------------------------
@@ -590,18 +569,16 @@ class HybridTTS(nn.Module):
         audio_emb = d_emb + c_emb
         L_audio_max = audio_emb.shape[1]
 
-        audio_ext_emb, audio_ext_attn, valid_lens = self._build_audio_extended(
-            audio_emb, padding_mask
-        )
-
         if prompt_mask is None:
             prompt_mask = torch.ones(
                 (B, L_prompt), dtype=torch.bool, device=p_emb.device
             )
-        prompt_attn = prompt_mask.long()
 
-        inputs_embeds = torch.cat([p_emb, audio_ext_emb], dim=1)
-        attention_mask = torch.cat([prompt_attn, audio_ext_attn], dim=1)
+        inputs_embeds, attention_mask, start_indices, valid_lens = (
+            self._build_full_sequence(
+                p_emb, prompt_ids, prompt_mask, audio_emb, padding_mask
+            )
+        )
 
         bb_dtype = next(self.backbone.parameters()).dtype
         outputs_bb = self.backbone(
@@ -611,7 +588,7 @@ class HybridTTS(nn.Module):
         full_hidden_states = outputs_bb.last_hidden_state
 
         audio_hidden_states, audio_hidden_mask = self._extract_audio_hidden_states(
-            full_hidden_states, L_prompt, L_audio_max, valid_lens
+            full_hidden_states, start_indices, L_audio_max, valid_lens
         )
 
         self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
