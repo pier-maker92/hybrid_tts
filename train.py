@@ -6,7 +6,7 @@ import wandb
 import hydra
 import logging
 import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 from accelerate import Accelerator
 from evaluation import run_evaluation
 from transformers import AutoTokenizer
@@ -322,6 +322,18 @@ class HybridTTSTrainer(Trainer):
         super()._maybe_log_save_evaluate(
             tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
         )
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        if state_dict is None:
+            state_dict = self.model.state_dict()
+        
+        # Safetensors does not support saving shared tensors.
+        # Since backbone.lm_head.weight is tied to backbone.model.embed_tokens.weight,
+        # we clone one of them to prevent the RuntimeError during save_file.
+        if "backbone.lm_head.weight" in state_dict:
+            state_dict["backbone.lm_head.weight"] = state_dict["backbone.lm_head.weight"].clone()
+            
+        super()._save(output_dir, state_dict)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main")

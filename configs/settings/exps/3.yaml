@@ -25,7 +25,7 @@ training:
   lr_scheduler_type: "cosine"   # Change to "linear", "constant", "cosine_with_restarts", etc.
   warmup_ratio: 0.03             # Uses 3% of total training steps for linear warmup
   # cfg
-  uncond_prob: 0.1
+  uncond_prob: 0.0
   no_augment_ratio: 0.7
   discrete_only: true
   # resume
