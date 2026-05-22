@@ -302,50 +302,26 @@ class HybridTTSTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    def _maybe_log_save_evaluate(self, *args, **kwargs):
-        tr_loss = args[0]
-        grad_norm = args[1]
-        model = args[2]
-        trial = args[3]
-        epoch = args[4]
-        ignore_keys_for_eval = args[5]
-
+    def _maybe_log_save_evaluate(
+        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
+    ):
         if (
             self.control.should_log
             and self.state.global_step > self._globalstep_last_logged
         ):
-            logs: Dict[str, float] = {}
-            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-            tr_loss -= tr_loss
-            logs["loss"] = round(
-                tr_loss_scalar
-                / (self.state.global_step - self._globalstep_last_logged),
-                4,
-            )
-
             if hasattr(self.control, "granular_losses"):
+                extra_logs = {}
+                steps = self.state.global_step - self._globalstep_last_logged
                 for k, v in self.control.granular_losses.items():
-                    logs[k] = self._nested_gather(v).mean().item()
-                    self.control.granular_losses[k] -= self.control.granular_losses[k]
-                    logs[k] = round(
-                        logs[k]
-                        / (self.state.global_step - self._globalstep_last_logged),
-                        4,
-                    )
+                    val = self._nested_gather(v).mean().item()
+                    extra_logs[k] = round(val / steps, 4)
+                    self.control.granular_losses[k].zero_()
+                self.log(extra_logs)
+            # Do NOT touch tr_loss or _globalstep_last_logged — let super handle them
 
-            if grad_norm is not None:
-                logs["grad_norm"] = (
-                    grad_norm if isinstance(grad_norm, float) else grad_norm.item()
-                )
-
-            logs["learning_rate"] = self._get_learning_rate()
-
-            self._total_loss_scalar += tr_loss_scalar
-            self._globalstep_last_logged = self.state.global_step
-            self.store_flos()
-            self.log(logs)
-
-        super()._maybe_log_save_evaluate(*args, **kwargs)
+        super()._maybe_log_save_evaluate(
+            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
+        )
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="main")
