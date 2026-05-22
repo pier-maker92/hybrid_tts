@@ -184,20 +184,6 @@ class HybridTTSTrainer(Trainer):
         granular_losses = ["token_loss", "diffusion_loss", "total_loss", "continuous_ratio"]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
 
-    def get_train_dataloader(self) -> DataLoader:
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-            
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self._train_batch_size,
-            shuffle=True,
-            collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            drop_last=self.args.dataloader_drop_last,
-        )
-
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if optimizer is None:
             optimizer = self.optimizer
@@ -405,6 +391,7 @@ def main(cfg: DictConfig):
     # Pop custom config keys so they don't get passed to HuggingFace TrainingArguments
     _ = training_cfg.pop("uncond_prob", 0.0)
     _ = training_cfg.pop("no_augment_ratio", 0.0)
+    _ = training_cfg.pop("discrete_only", False)
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)

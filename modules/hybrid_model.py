@@ -432,16 +432,22 @@ class HybridTTS(nn.Module):
             continuous_tokens, padding_mask=padding_mask
         )
 
-        if self.training:
-            corrupted_continuous_tokens = self.noise_augment_continuous_token(
-                continuous_tokens, padding_mask=padding_mask, target_std=0.8
-            )
-            c_emb = self.continuous_adapter(corrupted_continuous_tokens)
+        if getattr(self.config, "discrete_only", False):
+            c_emb = torch.zeros_like(d_emb)
         else:
-            c_emb = self.continuous_adapter(continuous_tokens)
+            if self.training:
+                corrupted_continuous_tokens = self.noise_augment_continuous_token(
+                    continuous_tokens, padding_mask=padding_mask, target_std=0.8
+                )
+                c_emb = self.continuous_adapter(corrupted_continuous_tokens)
+            else:
+                c_emb = self.continuous_adapter(continuous_tokens)
+
+            c_emb = self.norm_continuous(c_emb)
+            valid_audio = (~padding_mask).unsqueeze(-1)
+            c_emb = c_emb * valid_audio
 
         d_emb = self.norm_discrete(d_emb)
-        c_emb = self.norm_continuous(c_emb)
         
         # Calculate continuous ratio over valid frames
         valid_mask = ~padding_mask
@@ -455,7 +461,6 @@ class HybridTTS(nn.Module):
         
         valid_audio = (~padding_mask).unsqueeze(-1)
         d_emb = d_emb * valid_audio
-        c_emb = c_emb * valid_audio
         
         audio_emb = d_emb + c_emb  # (B, L_audio_max, H)
         L_audio_max = audio_emb.shape[1]
@@ -525,27 +530,36 @@ class HybridTTS(nn.Module):
             audio_hidden_states.to(next(self.token_head.parameters()).dtype)
         )
 
-        target_continuous = target_continuous or continuous_tokens
+        if getattr(self.config, "discrete_only", False):
+            dummy_loss = 0.0
+            if self.training:
+                dummy_loss = 0.0 * sum(p.sum() for p in self.diffusion_head.parameters() if p.requires_grad)
+                dummy_loss += 0.0 * sum(p.sum() for p in self.continuous_adapter.parameters() if p.requires_grad)
+            diffusion_loss = torch.tensor(0.0, device=d_emb.device) + dummy_loss
+            diffusion_output = None
+        else:
+            target_continuous = target_continuous or continuous_tokens
 
-        self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
+            self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
 
-        audio_hidden_states = audio_hidden_states.to(
-            next(self.diffusion_head.parameters()).dtype
-        )
-        assert audio_hidden_states.shape[:2] == target_continuous.shape[:2], (
-            f"context/target length mismatch: {audio_hidden_states.shape[:2]} "
-            f"vs {target_continuous.shape[:2]}"
-        )
+            audio_hidden_states = audio_hidden_states.to(
+                next(self.diffusion_head.parameters()).dtype
+            )
+            assert audio_hidden_states.shape[:2] == target_continuous.shape[:2], (
+                f"context/target length mismatch: {audio_hidden_states.shape[:2]} "
+                f"vs {target_continuous.shape[:2]}"
+            )
 
-        diffusion_output = self.diffusion_head(
-            target=target_continuous,
-            target_padding_mask=padding_mask,
-            context_vector=audio_hidden_states,
-        )
+            diffusion_output = self.diffusion_head(
+                target=target_continuous,
+                target_padding_mask=padding_mask,
+                context_vector=audio_hidden_states,
+            )
+            diffusion_loss = diffusion_output.loss
 
         return HybridTTSOutput(
             token_logits=token_logits,
-            diffusion_loss=diffusion_output.loss,
+            diffusion_loss=diffusion_loss,
             diffusion_output=diffusion_output,
             continuous_ratio=continuous_ratio,
         )

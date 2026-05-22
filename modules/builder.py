@@ -99,6 +99,7 @@ def build_model(cfg_dict: Dict[str, Any]) -> HybridTTS:
         debug=cfg_dict.get("debug", False),
         uncond_prob=training_cfg.get("uncond_prob", 0.0),
         no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
+        discrete_only=training_cfg.get("discrete_only", False),
     )
 
     return HybridTTS(config=hybrid_config)

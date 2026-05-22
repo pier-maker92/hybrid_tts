@@ -63,6 +63,7 @@ class HybridTTSConfig:
     debug: bool = False
     uncond_prob: float = 0.0
     no_augment_ratio: float = 0.0
+    discrete_only: bool = False
     backbone_hidden_size: Optional[int] = None
 
     def __post_init__(self):
