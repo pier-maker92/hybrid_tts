@@ -302,9 +302,7 @@ class HybridTTSTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    def _maybe_log_save_evaluate(
-        self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
-    ):
+    def _maybe_log_save_evaluate(self, *args, **kwargs):
         if (
             self.control.should_log
             and self.state.global_step > self._globalstep_last_logged
@@ -319,9 +317,7 @@ class HybridTTSTrainer(Trainer):
                 self.log(extra_logs)
             # Do NOT touch tr_loss or _globalstep_last_logged — let super handle them
 
-        super()._maybe_log_save_evaluate(
-            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval
-        )
+        super()._maybe_log_save_evaluate(*args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if state_dict is None:
