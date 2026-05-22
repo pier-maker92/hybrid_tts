@@ -129,6 +129,8 @@ class EvaluationCallback(TrainerCallback):
                 pad_id=pad_id,
                 start_audio_id=self.start_audio_id,
                 end_audio_id=self.end_audio_id,
+                vq_vocab_size=kwargs.get("vq_vocab_size"),
+                prompt_vocab_size=kwargs.get("prompt_vocab_size"),
             ),
         )
         logger.info(
@@ -181,7 +183,12 @@ class HybridTTSTrainer(Trainer):
         self.min_learning_rate = kwargs.pop("min_learning_rate", 0.0)
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
-        granular_losses = ["token_loss", "diffusion_loss", "total_loss", "continuous_ratio"]
+        granular_losses = [
+            "token_loss",
+            "diffusion_loss",
+            "total_loss",
+            "continuous_ratio",
+        ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
@@ -247,28 +254,17 @@ class HybridTTSTrainer(Trainer):
         return super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # We need prompt_ids, discrete_tokens, continuous_tokens
-        # Assuming DataCollator outputs: "ids", "prompt_ids", "discrete_tokens", "continuous_tokens", "padding_mask"
-
-        prompt_ids = inputs.get("prompt_ids")
-        discrete_tokens = inputs.get("discrete_tokens")
-        continuous_tokens = inputs.get("continuous_tokens")
-        padding_mask = inputs.get("padding_mask")
-        prompt_mask = inputs.get("prompt_mask")
-        target_tokens = inputs.get("target_tokens")
-        if target_tokens is None:
-            target_tokens = discrete_tokens
 
         outputs = model(
-            prompt_ids=prompt_ids,
-            discrete_tokens=discrete_tokens,
-            continuous_tokens=continuous_tokens,
-            padding_mask=padding_mask,
-            prompt_mask=prompt_mask,
+            discrete_sequence=inputs.get("discrete_sequence"),
+            attention_mask=inputs.get("attention_mask"),
+            continuous_sequence=inputs.get("continuous_sequence"),
+            audio_attention_mask=inputs.get("audio_attention_mask"),
         )
 
         token_logits = outputs.token_logits
-        diffusion_loss = outputs.diffusion_loss
+        diffusion_loss = outputs.diffusion_loss or torch.tensor(0)
+        target_tokens = inputs.get("target_tokens")
 
         # Token Loss
         loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
@@ -276,7 +272,7 @@ class HybridTTSTrainer(Trainer):
         # Handle DDP wrapping
         unwrapped_model = getattr(model, "module", model)
         token_loss = loss_fct(
-            token_logits.view(-1, unwrapped_model.config.discrete_token_vocab_size),
+            token_logits.view(-1, unwrapped_model.config.discrete_token_vocab_size + 1),
             target_tokens.view(-1),
         )
 
@@ -288,7 +284,11 @@ class HybridTTSTrainer(Trainer):
                 "token_loss": token_loss.detach(),
                 "diffusion_loss": diffusion_loss.detach(),
                 "total_loss": total_loss.detach(),
-                "continuous_ratio": outputs.continuous_ratio.detach() if outputs.continuous_ratio is not None else torch.tensor(0.0, device=total_loss.device),
+                "continuous_ratio": (
+                    outputs.continuous_ratio.detach()
+                    if outputs.continuous_ratio is not None
+                    else torch.tensor(0.0, device=total_loss.device)
+                ),
             }
             for key in self.control.granular_losses:
                 if flat_metrics.get(key) is not None:
@@ -391,7 +391,7 @@ def main(cfg: DictConfig):
     # Pop custom config keys so they don't get passed to HuggingFace TrainingArguments
     _ = training_cfg.pop("uncond_prob", 0.0)
     _ = training_cfg.pop("no_augment_ratio", 0.0)
-    _ = training_cfg.pop("discrete_only", False)
+    discrete_only_flag = training_cfg.pop("discrete_only", False)
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
@@ -406,6 +406,8 @@ def main(cfg: DictConfig):
         pad_id=tok.pad_id,
         start_audio_id=tok.start_audio_id - tok.prompt_offset,
         end_audio_id=tok.end_audio_id - tok.prompt_offset,
+        vq_vocab_size=model.config.discrete_token_vocab_size,
+        prompt_vocab_size=model.config.prompt_vocab_size,
     )
     trainer = HybridTTSTrainer(
         model=model,
@@ -437,6 +439,8 @@ def main(cfg: DictConfig):
                 pad_id=tok.pad_id,
                 start_audio_id=tok.start_audio_id - tok.prompt_offset,
                 end_audio_id=tok.end_audio_id - tok.prompt_offset,
+                vq_vocab_size=model.config.discrete_token_vocab_size,
+                prompt_vocab_size=model.config.prompt_vocab_size,
             )
         )
         logger.info(

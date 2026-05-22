@@ -43,8 +43,9 @@ def build_dataset(training_cfg: Dict[str, Any]):
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
-    train_dataset = TrainDatasetWrapper(dataset, "train")
-    test_dataset = TestDatasetWrapper(dataset, "test")
+    discrete_only = training_cfg.get("discrete_only", False)
+    train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
+    test_dataset = TestDatasetWrapper(dataset, "test", discrete_only=discrete_only)
 
     return train_dataset, test_dataset, dataset_name
 
@@ -58,15 +59,14 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
     if os.path.exists(vocab_path):
         with open(vocab_path, "r") as f:
             phoneme_vocab = json.load(f)
-        phoneme_list = list(phoneme_vocab.keys())
         vocab_size = len(phoneme_vocab)
     else:
         raise ValueError("Phoneme vocabulary not found. Please build it first.")
 
     cfg_dict["prompt_vocab_size"] = vocab_size + 3
-    cfg_dict["pad_token_id"] = vocab_size
+    cfg_dict["pad_token_id"] = vocab_size + 2
     cfg_dict["start_audio_id"] = vocab_size + 1
-    cfg_dict["end_audio_id"] = vocab_size + 2
+    cfg_dict["end_audio_id"] = vocab_size + 0
     cfg_dict["prompt_offset"] = 0
 
     return HybridTokenizer(
@@ -76,4 +76,3 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
         pad_id=cfg_dict["pad_token_id"],
         prompt_offset=cfg_dict["prompt_offset"],
     )
-    return tok
