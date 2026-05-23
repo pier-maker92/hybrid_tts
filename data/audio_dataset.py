@@ -80,7 +80,9 @@ class TrainDatasetWrapper(SimpleAudioDataset):
 class DataCollator(object):
     """Collate examples for supervised fine-tuning."""
 
-    def __init__(self, pad_id, start_audio_id, end_audio_id, vq_vocab_size, prompt_vocab_size):
+    def __init__(
+        self, pad_id, start_audio_id, end_audio_id, vq_vocab_size, prompt_vocab_size
+    ):
         self.pad_id = pad_id
         self.start_audio_id = start_audio_id
         self.end_audio_id = end_audio_id
@@ -101,17 +103,17 @@ class DataCollator(object):
 
         attention_mask = []
         discrete_sequence = []
-        audio_attention_mask = []
+        audio_padding_mask = []
         continuous_sequence = []
         target_tokens = []
         for p_id, d_token, c_token in zip(p_ids, d_tokens, c_tokens):
             # vocab mapping
             # prompt tokens keep their original IDs
             p_id = p_id + [self.start_audio_id]
-            
+
             # discrete tokens are shifted by prompt_vocab_size
             shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
-            
+
             # sequence ends with audio_eos_id
             sequence = p_id + shifted_d_token + [self.audio_eos_id]
             # append
@@ -122,17 +124,18 @@ class DataCollator(object):
             attention_mask.append(torch.tensor([1] * len(sequence)).bool())
             # continuous tail
             if c_token:
-                assert (
-                    len(c_token)
-                    == len(d_token) - 1  # we have already added the audio_eos token
-                ), "continuous_tokens and discrete_tokens must have the same length"
+                assert len(c_token) == len(
+                    d_token
+                ), (  # we have already added the audio_eos token
+                    "continuous_tokens and discrete_tokens must have the same length"
+                )
                 if (
                     len(c_token[0]) == 64
                 ):  # FIXME this is a temprary fix to handle the way I have extracted continuous token from prepare_data.py
                     # in the future, continuous token will be exactly the tail of the VQ
                     c_token = [c[32:] for c in c_token]
                 continuous_sequence.append(torch.tensor(c_token))
-                audio_attention_mask.append(torch.tensor([1] * len(c_token)).bool())
+                audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
 
         # all discrete
         discrete_sequence = pad_sequence(
@@ -158,16 +161,16 @@ class DataCollator(object):
                 batch_first=True,
                 padding_value=0,
             )
-            audio_attention_mask = pad_sequence(
-                audio_attention_mask,
+            audio_padding_mask = pad_sequence(
+                audio_padding_mask,
                 batch_first=True,
-                padding_value=0,
+                padding_value=1,
             )
             batch["continuous_sequence"] = continuous_sequence
-            batch["audio_attention_mask"] = audio_attention_mask
+            batch["audio_padding_mask"] = audio_padding_mask
         else:
             batch["continuous_sequence"] = None
-            batch["audio_attention_mask"] = None
+            batch["audio_padding_mask"] = None
 
         # Include transcriptions if available
         transcriptions = [inst.get("transcription") for inst in instances]

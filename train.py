@@ -259,7 +259,7 @@ class HybridTTSTrainer(Trainer):
             discrete_sequence=inputs.get("discrete_sequence"),
             attention_mask=inputs.get("attention_mask"),
             continuous_sequence=inputs.get("continuous_sequence"),
-            audio_attention_mask=inputs.get("audio_attention_mask"),
+            audio_padding_mask=inputs.get("audio_padding_mask"),
         )
 
         token_logits = outputs.token_logits
@@ -322,13 +322,15 @@ class HybridTTSTrainer(Trainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if state_dict is None:
             state_dict = self.model.state_dict()
-        
+
         # Safetensors does not support saving shared tensors.
         # Since backbone.lm_head.weight is tied to backbone.model.embed_tokens.weight,
         # we clone one of them to prevent the RuntimeError during save_file.
         if "backbone.lm_head.weight" in state_dict:
-            state_dict["backbone.lm_head.weight"] = state_dict["backbone.lm_head.weight"].clone()
-            
+            state_dict["backbone.lm_head.weight"] = state_dict[
+                "backbone.lm_head.weight"
+            ].clone()
+
         super()._save(output_dir, state_dict)
 
 

@@ -195,7 +195,7 @@ class HybridTTS(nn.Module):
             self.continuous_adapter = nn.Linear(config.continuous_dim, hidden_size)
 
         # ---- Normalisations --------------------------------------------------
-        self.continuous_norm = DynamicNormalizer(config.continuous_dim)
+        self.dynamic_normalizer = DynamicNormalizer(config.continuous_dim)
         self.norm_continuous = nn.LayerNorm(hidden_size)
 
         # ---- Output heads ----------------------------------------------------
@@ -223,18 +223,33 @@ class HybridTTS(nn.Module):
         end_indices = (discrete_sequence == audio_eos_id).long().argmax(dim=1)
         return start_indices, end_indices
 
-    def _build_full_sequence(
+    def _add_continuous_token(
         self,
-        p_emb: torch.Tensor,
-        prompt_ids: torch.Tensor,
-        prompt_mask: torch.BoolTensor,
-        audio_emb: torch.Tensor,
-        padding_mask: torch.BoolTensor,
+        continuous_sequence: torch.FloatTensor,
+        audio_padding_mask: torch.BoolTensor,
+        discrete_emb: torch.LongTensor,
+        start_positions: torch.Tensor,
+        attention_mask: torch.BoolTensor,
     ):
         """
         Insert audio embeddings between <start_audio> and <end_audio> in the prompt.
         """
-        pass
+        B, L_audio, hidden_dim = continuous_sequence.shape
+        index_3d = (start_positions + 1).unsqueeze(-1)
+        offset = torch.arange(L_audio, device=continuous_sequence.device).unsqueeze(0)
+        audio_positions = index_3d + offset
+        continuous_sequence = continuous_sequence * (~audio_padding_mask).unsqueeze(-1)
+
+        audio_positions = (
+            (torch.where((~audio_padding_mask), audio_positions, 0))
+            .unsqueeze(-1)
+            .repeat(1, 1, hidden_dim)
+        )
+        discrete_emb.scatter_add_(
+            dim=1, index=audio_positions, src=continuous_sequence.to(discrete_emb.dtype)
+        )
+
+        return discrete_emb[:, : attention_mask.shape[1]]
 
     def _extract_audio_hidden_states(
         self,
@@ -267,49 +282,6 @@ class HybridTTS(nn.Module):
         )
         audio_hidden_states[~audio_masks] = pad_embed
         return audio_hidden_states
-
-    def _assert_audio_masks_aligned(
-        self,
-        padding_mask: torch.BoolTensor,
-        audio_hidden_mask: torch.BoolTensor,
-    ) -> None:
-        """padding_mask True=pad; audio_hidden_mask True=valid predictor frame."""
-        context_pad = ~audio_hidden_mask
-        assert torch.equal(padding_mask, context_pad), (
-            "padding_mask and context padding derived from audio hidden states "
-            "must match"
-        )
-
-    def _debug_log(
-        self,
-        prompt_ids: torch.Tensor,  # (B, L_prompt)
-        prompt_mask: torch.BoolTensor,  # (B, L_prompt)
-        valid_lens: torch.Tensor,  # (B,)
-        L_audio_max: int,
-    ):
-        """Print a human-readable view of what enters the backbone."""
-        B = prompt_ids.shape[0]
-        lines = ["[DEBUG] Backbone input sequences:"]
-        for i in range(B):
-            valid_p = int(prompt_mask[i].sum().item())
-            valid_a = int(valid_lens[i].item())
-            if self.tokenizer is not None:
-                desc = self.tokenizer.decode_sample(
-                    prompt_ids[i],
-                    valid_prompt_len=valid_p,
-                    valid_audio_len=valid_a,
-                    L_audio_max=L_audio_max,
-                )
-            else:
-                # Fallback: raw IDs
-                raw_p = prompt_ids[i, :valid_p].tolist()
-                desc = (
-                    f"PROMPT_WITH_TAGS({valid_p}): {raw_p} "
-                    f"| AUDIO_INSERTED({valid_a}/{L_audio_max} frames) "
-                )
-            lines.append(f"  sample[{i}]: {desc}")
-        logger.debug("\n".join(lines))
-        print("\n".join(lines))  # also print so it shows up without debug log level
 
     def noise_augment_continuous_token(
         self,
@@ -354,7 +326,7 @@ class HybridTTS(nn.Module):
         discrete_sequence: torch.LongTensor,
         attention_mask: torch.BoolTensor,
         continuous_sequence: torch.FloatTensor,
-        audio_attention_mask: torch.BoolTensor,
+        audio_padding_mask: torch.BoolTensor,
         **kwargs,
     ) -> HybridTTSOutput:
         """
@@ -364,14 +336,31 @@ class HybridTTS(nn.Module):
             discrete_sequence: (B, L_discrete) prompt tokens
             attention_mask: (B, L_discrete) True = valid, False = pad
             continuous_sequence: (B, L_audio, C) continuous tokens
-            audio_attention_mask: (B, L_audio) True = valid, False = pad
+            audio_padding_mask: (B, L_audio) False = valid, True = pad
         """
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         embed_layer = self.backbone.get_input_embeddings()
-        discrete_emb = embed_layer(discrete_sequence)
+        input_embs = embed_layer(discrete_sequence)
+
+        if continuous_sequence is not None:
+            continuous_sequence = self.dynamic_normalizer(continuous_sequence)
+            adapted_c_emb = self.norm_continuous(
+                self.continuous_adapter(continuous_sequence)
+            )
+            adapted_c_emb = self.noise_augment_continuous_token(
+                adapted_c_emb, audio_padding_mask
+            )
+
+            input_embs = self._add_continuous_token(
+                continuous_sequence=adapted_c_emb,
+                audio_padding_mask=audio_padding_mask,
+                discrete_emb=input_embs,
+                start_positions=start_idx,
+                attention_mask=attention_mask,
+            )
 
         last_hidden_state = self.backbone(
-            inputs_embeds=discrete_emb,
+            inputs_embeds=input_embs,
             attention_mask=attention_mask,
             output_hidden_states=True,
         ).hidden_states[
@@ -383,19 +372,28 @@ class HybridTTS(nn.Module):
             start_idx,
             end_idx,
         )
-
+        # token logits
         tied_weights = self.backbone.get_input_embeddings().weight[
             self.config.prompt_vocab_size : self.config.prompt_vocab_size
             + self.config.discrete_token_vocab_size
             + 1
         ]
-
         token_logits = F.linear(audio_hidden_states, tied_weights)
+        # diffuion loss
+        if continuous_sequence is not None:
+            diffusion_loss = self.diffusion_head(
+                target=continuous_sequence,
+                target_padding_mask=audio_padding_mask,
+                context_vector=audio_hidden_states[
+                    :, :-1
+                ],  # we stop at last audio frame
+            ).loss
+        else:
+            diffusion_loss = None
 
         return HybridTTSOutput(
             token_logits=token_logits,
-            diffusion_loss=None,
-            diffusion_output=None,
+            diffusion_loss=diffusion_loss,
             continuous_ratio=None,
             target_tokens=None,
         )
@@ -405,7 +403,7 @@ class HybridTTS(nn.Module):
     # -------------------------------------------------------------------------
 
     @torch.no_grad()
-    def encode_decode(
+    def sample(
         self,
         batch: Dict[str, torch.Tensor],
         vae: nn.Module,
@@ -418,99 +416,7 @@ class HybridTTS(nn.Module):
         Reconstruct audio features from ground-truth tokens via the diffusion head.
         Used for evaluation.
         """
-        self.eval()
-
-        prompt_ids = batch["prompt_ids"]
-        discrete_tokens = batch["discrete_tokens"]
-        continuous_tokens = batch["continuous_tokens"]
-        padding_mask = batch["padding_mask"]
-        prompt_mask = batch.get("prompt_mask")  # may be absent in old batches
-
-        unified_embed_tokens = self.backbone.get_input_embeddings()
-
-        # Re-run the backbone to get hidden states
-        p_emb = unified_embed_tokens(prompt_ids + self.config.prompt_offset)
-        B, L_prompt, H = p_emb.shape
-
-        d_emb = unified_embed_tokens(discrete_tokens + self.config.prompt_vocab_size)
-
-        continuous_tokens = continuous_tokens.to(d_emb.dtype)
-        if continuous_tokens.shape[-1] == 64:
-            continuous_tokens = continuous_tokens[..., 32:]
-
-        norm_c = self.continuous_norm(continuous_tokens, padding_mask=padding_mask)
-        c_emb = self.continuous_adapter(norm_c)
-        c_emb = self.norm_continuous(c_emb)
-
-        valid_audio = (~padding_mask).unsqueeze(-1)
-        d_emb = d_emb * valid_audio
-        c_emb = c_emb * valid_audio
-
-        audio_emb = d_emb + c_emb
-        L_audio_max = audio_emb.shape[1]
-
-        if prompt_mask is None:
-            prompt_mask = torch.ones(
-                (B, L_prompt), dtype=torch.bool, device=p_emb.device
-            )
-
-        inputs_embeds, attention_mask, start_indices, valid_lens = (
-            self._build_full_sequence(
-                p_emb, prompt_ids, prompt_mask, audio_emb, padding_mask
-            )
-        )
-
-        bb_dtype = next(self.backbone.parameters()).dtype
-        outputs_bb = self.backbone(
-            inputs_embeds=inputs_embeds.to(bb_dtype),
-            attention_mask=attention_mask,
-        )
-        full_hidden_states = outputs_bb.last_hidden_state
-
-        audio_hidden_states, audio_hidden_mask = self._extract_audio_hidden_states(
-            full_hidden_states, start_indices, L_audio_max, valid_lens
-        )
-
-        self._assert_audio_masks_aligned(padding_mask, audio_hidden_mask)
-
-        # Generate with diffusion head (custom num_steps / guidance_scale)
-        latents_output = self.diffusion_head.generate(
-            num_steps=num_steps,
-            context_vector=audio_hidden_states.to(
-                next(self.diffusion_head.parameters()).dtype
-            ),
-            temperature=temperature,
-            guidance_scale=guidance_scale,
-            padding_mask=padding_mask,
-        )
-        z = latents_output.audio_features  # (B, L, C) — normalised space
-        z = self.continuous_norm.denormalize(z)  # back to original scale
-
-        # Reconstruct full 64-dim latent by prepending VQ codebook embeddings
-        tokens_tensor = batch["discrete_tokens"].long()
-        vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # (B, L, 32)
-        z_vae = torch.cat([vq_emb, z], dim=-1)  # (B, L, 64)
-
-        reconstructed_mel, reconstructed_padding_mask = vae.sample(
-            num_steps=num_steps,
-            temperature=temperature,
-            guidance_scale=guidance_scale,
-            z=z_vae,
-            padding_mask=latents_output.padding_mask,
-        )
-
-        tied_weights = self.backbone.get_input_embeddings().weight[
-            self.config.prompt_vocab_size : self.config.prompt_vocab_size
-            + self.config.discrete_token_vocab_size
-            + 1
-        ]
-        return {
-            "decoder_output": DecoderOutput(
-                audio_features=reconstructed_mel,
-                padding_mask=reconstructed_padding_mask,
-            ),
-            "token_logits": F.linear(audio_hidden_states, tied_weights),
-        }
+        raise NotImplementedError("not implemented")
 
     # -------------------------------------------------------------------------
     # Properties
