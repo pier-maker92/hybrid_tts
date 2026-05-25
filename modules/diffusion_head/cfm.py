@@ -249,7 +249,11 @@ class DiT(torch.nn.Module):
                 state=state,
                 cfg_scale=cfg_scale,
                 context_vector=context_vector,
-                attention_mask=~upsampled_padding_mask,
+                attention_mask=(
+                    ~upsampled_padding_mask
+                    if upsampled_padding_mask is not None
+                    else None
+                ),
             )
             return features
 
