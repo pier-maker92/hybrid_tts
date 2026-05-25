@@ -1,23 +1,17 @@
 import os
-import sys
+import io
+import json
 import torch
 import argparse
 import datasets
 import torchaudio
-import io
-from datasets import load_dataset, Dataset
-from typing import Dict, Any
-from pathlib import Path
-from tqdm import tqdm
-from torch.utils.data import DataLoader, DistributedSampler
-
-# Ensure we can import from the hybrid_tts project
-from modules.submodules.MelCausalVAE.modules.VAE import VAE, VAEConfig
-from modules.submodules.MelCausalVAE.modules.builder import build_model
-import json
-import yaml
 import pyarrow as pa
+from tqdm import tqdm
+from pathlib import Path
 import pyarrow.parquet as pq
+from datasets import load_dataset
+from torch.utils.data import DataLoader, DistributedSampler
+from modules.submodules.MelCausalVAE.modules.builder import build_model
 
 
 def collate_fn(batch):
