@@ -225,8 +225,9 @@ class HybridTTS(nn.Module):
 
         # Unified vocabulary: prompt tokens + discrete audio tokens + 1 for audio EOS
         self.unified_vocab_size = (
-            config.prompt_vocab_size + config.discrete_token_vocab_size + 1
+            config.prompt_vocab_size + config.discrete_token_vocab_size #+ 1
         )
+
         bb_cfg.vocab_size = self.unified_vocab_size
         bb_cfg.pad_token_id = config.pad_token_id
 
@@ -249,7 +250,7 @@ class HybridTTS(nn.Module):
         self.diffusion_head = DiT(config.diffusion_head_config)
         self.token_head = nn.Linear(
             hidden_size,
-            config.discrete_token_vocab_size + 1,
+            self.unified_vocab_size,
             bias=False,
         )
 
@@ -272,6 +273,7 @@ class HybridTTS(nn.Module):
         audio_eos_id = (
             self.config.prompt_vocab_size + self.config.discrete_token_vocab_size
         )
+        #audio_eos_id = self.config.prompt_vocab_size 
         end_indices = (discrete_sequence == audio_eos_id).long().argmax(dim=1)
         return start_indices, end_indices
 
@@ -416,15 +418,15 @@ class HybridTTS(nn.Module):
             attention_mask=attention_mask,
         )
 
-        audio_hidden_states = self._extract_audio_hidden_states(
-            last_hidden_state,
-            start_idx,
-            end_idx,
-        )
         # token logits
-        token_logits = self.token_head(audio_hidden_states)
+        token_logits = self.token_head(last_hidden_state[:, :-1])
         # diffuion loss
         if continuous_sequence is not None:
+            audio_hidden_states = self._extract_audio_hidden_states(
+                last_hidden_state,
+                start_idx,
+                end_idx,
+            )
             diffusion_loss = self.diffusion_head(
                 target=continuous_sequence,
                 target_padding_mask=audio_padding_mask,

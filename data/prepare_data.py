@@ -124,15 +124,32 @@ def main():
         if args.bf16:
             print("Using bfloat16 precision for inference.")
 
-    # Identify subdirectories to treat as splits (e.g. train_clean_100, dev_clean, etc.)
-    subdirs = [d for d in input_dir.iterdir() if d.is_dir()]
-    if not subdirs:
-        # Fallback to the directory itself if no subdirs
-        data_files = {"data": str(input_dir / "*.parquet")}
+    # Identify dataset type based on name
+    if "LJSpeech-1.1" in args.dataset_name:
+        dataset = load_dataset(
+            "csv",
+            data_files={"train": str(input_dir / "metadata.csv")},
+            sep="|",
+            column_names=["id", "transcription", "normalized_transcription"],
+            quoting=3,  # QUOTE_NONE
+        )
+        for split in dataset.keys():
+            dataset[split] = dataset[split].filter(
+                lambda x: x["transcription"] is not None and len(str(x["transcription"]).strip()) > 0
+            )
+            dataset[split] = dataset[split].map(
+                lambda x: {"audio": str(input_dir / "wavs" / f"{x['id']}.wav")}
+            )
     else:
-        data_files = {d.name: str(d / "*.parquet") for d in subdirs}
+        # Identify subdirectories to treat as splits (e.g. train_clean_100, dev_clean, etc.)
+        subdirs = [d for d in input_dir.iterdir() if d.is_dir()]
+        if not subdirs:
+            # Fallback to the directory itself if no subdirs
+            data_files = {"data": str(input_dir / "*.parquet")}
+        else:
+            data_files = {d.name: str(d / "*.parquet") for d in subdirs}
 
-    dataset = load_dataset("parquet", data_files=data_files)
+        dataset = load_dataset("parquet", data_files=data_files)
 
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -172,7 +189,10 @@ def main():
             for audio_item in batch["audio"]:
                 # Manually decode using torchaudio
                 try:
-                    wav, sr = torchaudio.load(io.BytesIO(audio_item["bytes"]))
+                    if audio_item.get("path") and os.path.exists(audio_item["path"]):
+                        wav, sr = torchaudio.load(audio_item["path"])
+                    else:
+                        wav, sr = torchaudio.load(io.BytesIO(audio_item["bytes"]))
                     tensor = wav.squeeze(0).float()
 
                     # Resample if necessary

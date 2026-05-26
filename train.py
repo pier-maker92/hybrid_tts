@@ -261,6 +261,10 @@ class HybridTTSTrainer(Trainer):
             continuous_sequence=inputs.get("continuous_sequence"),
             audio_padding_mask=inputs.get("audio_padding_mask"),
         )
+        target_ids = ['LJ038-0061', 'LJ029-0066', 'LJ045-0024', 'LJ036-0085', 'LJ046-0086', 'LJ008-0308', 'LJ008-0255', 'LJ049-0149']
+        # Verifica se ogni id nella nostra lista target è presente negli inputs
+        if all(t_id in inputs["ids"] for t_id in target_ids):
+            print("Found target ids")
 
         token_logits = outputs.token_logits
         diffusion_loss = outputs.diffusion_loss or torch.tensor(0)
@@ -272,7 +276,7 @@ class HybridTTSTrainer(Trainer):
         # Handle DDP wrapping
         unwrapped_model = getattr(model, "module", model)
         token_loss = loss_fct(
-            token_logits.view(-1, unwrapped_model.config.discrete_token_vocab_size + 1),
+            token_logits.view(-1, unwrapped_model.unified_vocab_size),
             target_tokens.view(-1),
         )
 
@@ -302,22 +306,22 @@ class HybridTTSTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    def _maybe_log_save_evaluate(self, *args, **kwargs):
-        if (
-            self.control.should_log
-            and self.state.global_step > self._globalstep_last_logged
-        ):
-            if hasattr(self.control, "granular_losses"):
-                extra_logs = {}
-                steps = self.state.global_step - self._globalstep_last_logged
-                for k, v in self.control.granular_losses.items():
-                    val = self._nested_gather(v).mean().item()
-                    extra_logs[k] = round(val / steps, 4)
-                    self.control.granular_losses[k].zero_()
-                self.log(extra_logs)
-            # Do NOT touch tr_loss or _globalstep_last_logged — let super handle them
+    # def _maybe_log_save_evaluate(self, *args, **kwargs):
+    #     if (
+    #         self.control.should_log
+    #         and self.state.global_step > self._globalstep_last_logged
+    #     ):
+    #         if hasattr(self.control, "granular_losses"):
+    #             extra_logs = {}
+    #             steps = self.state.global_step - self._globalstep_last_logged
+    #             for k, v in self.control.granular_losses.items():
+    #                 val = self._nested_gather(v).mean().item()
+    #                 extra_logs[k] = round(val / steps, 4)
+    #                 self.control.granular_losses[k].zero_()
+    #             self.log(extra_logs)
+    #         # Do NOT touch tr_loss or _globalstep_last_logged — let super handle them
 
-        super()._maybe_log_save_evaluate(*args, **kwargs)
+    #     super()._maybe_log_save_evaluate(*args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if state_dict is None:
@@ -381,6 +385,7 @@ def main(cfg: DictConfig):
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
+    training_cfg["group_by_length"] = False
 
     training_args = TrainingArguments(
         remove_unused_columns=False,

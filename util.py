@@ -40,12 +40,15 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.librispeech_align import LibriSpeechAlignDataset
 
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
+    elif dataset_name == "lj_speech":
+        from data.lj_speech import LJSpeechDataset
+        dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
     discrete_only = training_cfg.get("discrete_only", False)
     train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
-    test_dataset = TestDatasetWrapper(dataset, "test", discrete_only=discrete_only)
+    test_dataset = TestDatasetWrapper(dataset, "train", discrete_only=discrete_only) # FIXME workaround for LJSpeech
 
     return train_dataset, test_dataset, dataset_name
 
@@ -62,6 +65,8 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
         vocab_size = len(phoneme_vocab)
     else:
         raise ValueError("Phoneme vocabulary not found. Please build it first.")
+    
+
 
     cfg_dict["prompt_vocab_size"] = vocab_size + 3
     cfg_dict["pad_token_id"] = vocab_size + 2

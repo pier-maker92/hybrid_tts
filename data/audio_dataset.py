@@ -111,14 +111,15 @@ class DataCollator(object):
             # prompt tokens keep their original IDs
             p_id = p_id + [self.start_audio_id]
 
+
             # discrete tokens are shifted by prompt_vocab_size
             shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
 
             # sequence ends with audio_eos_id
-            sequence = p_id + shifted_d_token + [self.audio_eos_id]
+            sequence = p_id + shifted_d_token + [self.end_audio_id]
             # append
             target_tokens.append(
-                torch.tensor(d_token + [self.vq_vocab_size]).long()
+                torch.tensor([-100] * len(p_id[1:]) + shifted_d_token + [self.end_audio_id]).long()
             )  # TODO check on this
             discrete_sequence.append(torch.tensor(sequence).long())
             attention_mask.append(torch.tensor([1] * len(sequence)).bool())
