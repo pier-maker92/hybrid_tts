@@ -23,12 +23,12 @@ class DiTConfig:
 class BackboneConfig:
     model_type: str = "native"
     from_pretrained: Optional[bool] = None
-    num_layers: int
-    num_heads: int
-    hidden_dim: int
-    ffn_dim: int
-    dropout: float
-    max_position_embeddings: int
+    num_layers: Optional[int] = None
+    num_heads: Optional[int] = None
+    hidden_dim: Optional[int] = None
+    ffn_dim: Optional[int] = None
+    dropout: Optional[float] = None
+    max_position_embeddings: Optional[int] = None
 
 
 @dataclass
