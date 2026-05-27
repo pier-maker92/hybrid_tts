@@ -19,66 +19,26 @@ logger = logging.getLogger(__name__)
 
 class HybridTokenizer:
     """
-    Translates raw prompt IDs (as stored in the batch) to human-readable
-    symbols, so that the debug flag can show exactly what enters the backbone.
-
-    Token layout in the prompt_emb LUT (from-scratch training):
-        LUT index 0             → <PAD>  (pad_id, also the collator padding value)
-        LUT index 1 .. N        → phonemes  (raw_id + prompt_offset → LUT index)
-        LUT index N+1           → <start_audio>
-        LUT index N+2           → <end_audio>
-
-    For pretrained backbones the same structure applies but IDs are those of
-    the backbone's tokenizer vocabulary.
+    This is a helper for handling the shifting between prompt tokens and discrete audio tokens
     """
 
     def __init__(
         self,
-        phoneme_vocab: dict,  # symbol → raw phoneme id (0-indexed from dataset)
-        start_audio_id: int,  # direct LUT index for <start_audio>
-        end_audio_id: int,  # direct LUT index for <end_audio>
+        prompt_vocab_size: int,
+        start_audio_id: int,
+        end_audio_id: int,
         pad_id: int,
-        prompt_offset: int = 0,  # raw phoneme ids shifted by this to get LUT index
+        discrete_token_vocab_size: int = 1024,
     ):
-        self.prompt_offset = prompt_offset
+        self.prompt_vocab_size = prompt_vocab_size
         self.start_audio_id = start_audio_id
         self.end_audio_id = end_audio_id
         self.pad_id = pad_id
+        self.discrete_token_vocab_size = discrete_token_vocab_size
 
-        # Build LUT-index → symbol map
-        self.id2sym: Dict[int, str] = {}
-        self.id2sym[pad_id] = "<PAD>"
-        self.id2sym[start_audio_id] = "<start_audio>"
-        self.id2sym[end_audio_id] = "<end_audio>"
-        for sym, raw_id in phoneme_vocab.items():
-            lut_id = raw_id + prompt_offset
-            self.id2sym[lut_id] = sym
-
-    # raw_id here means the value sitting in the batch tensor (before offset)
-    def _raw_to_sym(self, raw_id: int) -> str:
-        lut_id = raw_id + self.prompt_offset
-        return self.id2sym.get(lut_id, f"<unk:{lut_id}>")
-
-    def decode_prompt(self, raw_ids) -> str:
-        """Decode a 1-D sequence of raw prompt IDs."""
-        return " ".join(
-            "<PAD>" if rid == self.pad_id else self._raw_to_sym(rid)
-            for rid in (raw_ids.tolist() if hasattr(raw_ids, "tolist") else raw_ids)
-        )
-
-    def decode_sample(
-        self,
-        prompt_ids: torch.Tensor,  # (L_prompt,)  raw ids
-        valid_prompt_len: int,
-        valid_audio_len: int,
-        L_audio_max: int,
-    ) -> str:
-        prompt_str = self.decode_prompt(prompt_ids[:valid_prompt_len])
-        pad_prompt = valid_prompt_len < len(prompt_ids)
-        return (
-            f"PROMPT_WITH_TAGS({valid_prompt_len}{'*' if pad_prompt else ''}): {prompt_str} "
-            f"| AUDIO_INSERTED({valid_audio_len}/{L_audio_max} frames)"
-        )
+    @property
+    def unified_vocab_size(self) -> int:
+        return self.prompt_vocab_size + self.discrete_token_vocab_size
 
 
 # ---------------------------------------------------------------------------
@@ -180,10 +140,24 @@ class Transformer(nn.Module):
         )
         self.norm = nn.LayerNorm(config.hidden_dim)
 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
     def get_input_embeddings(self):
         return self.embed
 
-    def forward(self, inputs_embeds, attention_mask=None):
+    def get_output_embeddings(self):
+        return self.embed
+
+    def forward(self, inputs_embeds, attention_mask=None, **kwargs):
         B, L, D = inputs_embeds.size()
         positions = torch.arange(L, device=inputs_embeds.device).unsqueeze(0)
         x = inputs_embeds + self.pos_emb(positions)
@@ -216,23 +190,56 @@ class HybridTTS(nn.Module):
     _build_full_sequence finds the <start_audio> and <end_audio> positions, and inserts audio frames between them.
     """
 
-    def __init__(self, config: HybridTTSConfig):
+    def __init__(self, config: HybridTTSConfig, tokenizer: "HybridTokenizer"):
         super().__init__()
         self.config = config
+        self.tokenizer = tokenizer
+
+        self.pad_token_id = tokenizer.pad_id
+        self.start_audio_id = tokenizer.start_audio_id
+        self.end_audio_id = tokenizer.end_audio_id
+        self.discrete_token_vocab_size = tokenizer.discrete_token_vocab_size
+        self.unified_vocab_size = tokenizer.unified_vocab_size
+
+        # Apply tokenizer sizes to sub-configs where previously handled by __post_init__
+
+        # config.token_head_config.vocab_size = (
+        #     self.discrete_token_vocab_size + 1
+        # )  # audio_EOS must be predicted
+        if config.continuous_adapter_config is not None:
+            config.continuous_adapter_config.in_dim = config.continuous_dim
+        if config.diffusion_head_config is not None:
+            config.diffusion_head_config.audio_latent_dim = config.continuous_dim
 
         # ---- Backbone -------------------------------------------------------
         bb_cfg = config.backbone_config
 
-        self.unified_vocab_size = (
-            config.prompt_vocab_size + config.discrete_token_vocab_size 
-        )
+        if bb_cfg.model_type == "native":
+            bb_cfg.vocab_size = self.unified_vocab_size
+            bb_cfg.pad_token_id = self.pad_token_id
 
-        bb_cfg.vocab_size = self.unified_vocab_size
-        bb_cfg.pad_token_id = config.pad_token_id
+            self.backbone = Transformer(bb_cfg)
+            hidden_size = bb_cfg.hidden_dim
+        else:
+            if bb_cfg.from_pretrained:
+                raise NotImplementedError(
+                    "Fine-tuning from_pretrained is not yet implemented. Focus is on training from scratch."
+                )
+            from transformers import AutoConfig, AutoModelForCausalLM
 
-        self.backbone = Transformer(bb_cfg)
+            if bb_cfg.model_type == "qwen-0.5b":
+                hf_config = AutoConfig.from_pretrained("Qwen/Qwen2-0.5B")
+            elif bb_cfg.model_type == "llama-1b":
+                hf_config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")
+            else:
+                raise ValueError(f"Unknown model_type: {bb_cfg.model_type}")
 
-        hidden_size = bb_cfg.hidden_dim
+            hf_config.vocab_size = self.unified_vocab_size
+            hf_config.pad_token_id = self.pad_token_id
+
+            self.backbone = AutoModelForCausalLM.from_config(hf_config)
+            hidden_size = hf_config.hidden_size
+
         self.config.apply_backbone_dims(hidden_size)
 
         # ---- Continuous adapter (VAE latents → hidden_size) ------------------
@@ -246,16 +253,15 @@ class HybridTTS(nn.Module):
         self.norm_continuous = nn.LayerNorm(hidden_size)
 
         # ---- Output heads ----------------------------------------------------
-        self.diffusion_head = DiT(config.diffusion_head_config)
-        self.token_head = nn.Linear(
-            hidden_size,
-            self.unified_vocab_size,
-            bias=False,
-        )
-
-        # ---- Optional tokenizer for debug decoding --------------------------
-        # Attach via model.tokenizer = HybridTokenizer(...) from train.py
-        self.tokenizer: Optional[HybridTokenizer] = None
+        if config.diffusion_head_config is not None:
+            self.diffusion_head = DiT(config.diffusion_head_config)
+        else:
+            self.diffusion_head = None
+        # self.token_head = nn.Linear(
+        #     hidden_size,
+        #     self.unified_vocab_size,
+        #     bias=False,
+        # )
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -265,10 +271,8 @@ class HybridTTS(nn.Module):
         """
         Extract audio start and end position from discrete sequence.
         """
-        start_indices = (
-            (discrete_sequence == self.config.start_audio_id).long().argmax(dim=1)
-        )
-        end_indices = (discrete_sequence == self.config.end_audio_id).long().argmax(dim=1)
+        start_indices = (discrete_sequence == self.start_audio_id).long().argmax(dim=1)
+        end_indices = (discrete_sequence == self.end_audio_id).long().argmax(dim=1)
         return start_indices, end_indices
 
     def _add_continuous_token(
@@ -312,7 +316,7 @@ class HybridTTS(nn.Module):
         audio_hidden_states = []
         audio_masks = []
         pad_embed = self.backbone.get_input_embeddings()(
-            torch.tensor(self.config.pad_token_id).long().to(full_hidden_states.device)
+            torch.tensor(self.pad_token_id).long().to(full_hidden_states.device)
         )
         for h, s, e in zip(full_hidden_states, start_indices, end_indices):
             audio_hidden_states.append(h[s:e])
@@ -407,20 +411,32 @@ class HybridTTS(nn.Module):
                 attention_mask=attention_mask,
             )
 
-        last_hidden_state = self.backbone(
-            inputs_embeds=input_embs,
-            attention_mask=attention_mask,
+        if self.config.backbone_config.model_type == "native":
+            last_hidden_state = self.backbone(
+                inputs_embeds=input_embs,
+                attention_mask=attention_mask,
+            )
+        else:
+            outputs = self.backbone(
+                inputs_embeds=input_embs,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden_state = outputs.hidden_states[-1]
+        audio_hidden_states = self._extract_audio_hidden_states(
+            last_hidden_state,
+            start_idx,
+            end_idx,
         )
 
         # token logits
-        token_logits = self.token_head(last_hidden_state[:, :-1])
+        target_embed_weight = self.backbone.get_output_embeddings().weight[
+            self.end_audio_id :
+        ]
+        token_logits = F.linear(audio_hidden_states, target_embed_weight)
         # diffuion loss
-        if continuous_sequence is not None:
-            audio_hidden_states = self._extract_audio_hidden_states(
-                last_hidden_state,
-                start_idx,
-                end_idx,
-            )
+        if continuous_sequence is not None and self.diffusion_head is not None:
             diffusion_loss = self.diffusion_head(
                 target=continuous_sequence,
                 target_padding_mask=audio_padding_mask,
@@ -435,7 +451,6 @@ class HybridTTS(nn.Module):
             token_logits=token_logits,
             diffusion_loss=diffusion_loss,
             continuous_ratio=None,
-            target_tokens=None,
         )
 
     # -------------------------------------------------------------------------
@@ -449,13 +464,13 @@ class HybridTTS(nn.Module):
         if temperature < 0:
             raise ValueError("temperature must be > 0")
         elif temperature == 0:
-            return torch.argmax(token_logits, dim=-1) + self.config.prompt_vocab_size
+            return torch.argmax(token_logits, dim=-1) + self.prompt_vocab_size
         # scale logits
         scaled_logits = token_logits / temperature
         # categorical sampling
         dist = torch.distributions.Categorical(logits=scaled_logits)
         # sample ids
-        return dist.sample() + self.config.prompt_vocab_size
+        return dist.sample() + self.prompt_vocab_size
 
     @torch.no_grad()
     def sample(
@@ -483,27 +498,34 @@ class HybridTTS(nn.Module):
 
         for step in tqdm(range(max_steps)):
 
-            last_hidden_state = self.backbone(
-                inputs_embeds=input_embs,
-                attention_mask=attention_mask,
-            )[
-                :, -1:
-            ]  # (B, 1, H)
+            if self.config.backbone_config.model_type == "native":
+                last_hidden_state = self.backbone(
+                    inputs_embeds=input_embs,
+                    attention_mask=attention_mask,
+                )[
+                    :, -1:
+                ]  # (B, 1, H)
+            else:
+                outputs = self.backbone(
+                    inputs_embeds=input_embs,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                last_hidden_state = outputs.hidden_states[-1][:, -1:]  # (B, 1, H)
 
-            token_logits = self.token_head(last_hidden_state.squeeze(1))
+            target_embed_weight = self.backbone.get_input_embeddings().weight[
+                self.end_audio_id :
+            ]
+            token_logits = F.linear(last_hidden_state.squeeze(1), target_embed_weight)
             token_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
 
-            if (
-                token_id
-                == self.config.discrete_token_vocab_size + self.config.prompt_vocab_size
-            ):
+            if token_id == self.unified_vocab_size:
                 break
 
-            all_discrete_tokens.append(
-                token_id.unsqueeze(-1) - self.config.prompt_vocab_size
-            )
+            all_discrete_tokens.append(token_id.unsqueeze(-1) - self.prompt_vocab_size)
 
-            if discrete_only:
+            if discrete_only or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
                 generated_continuous_tokens = self.diffusion_head.generate(

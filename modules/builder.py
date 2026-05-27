@@ -1,12 +1,11 @@
 import os
 import json
 from typing import Dict, Any
-from .hybrid_model import HybridTTS
+from .hybrid_model import HybridTTS, HybridTokenizer
 from .configs import (
     HybridTTSConfig,
     BackboneConfig,
     AdapterConfig,
-    TokenHeadConfig,
     DiTConfig,
 )
 
@@ -30,7 +29,7 @@ def load_codebook_config(vae_checkpoint: str):
     )
 
 
-def build_model(cfg_dict: Dict[str, Any]) -> HybridTTS:
+def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridTTS:
     """Builds a HybridTTS model from a configuration dictionary."""
 
     backbone_cfg = cfg_dict.get("backbone_config")
@@ -63,43 +62,32 @@ def build_model(cfg_dict: Dict[str, Any]) -> HybridTTS:
         raise ValueError("VAE checkpoint is required to build model.")
     continuous_dim, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
 
-    backbone_config = (
-        BackboneConfig(**backbone_cfg) if backbone_cfg is not None else BackboneConfig()
-    )
-    diffusion_head_config = (
-        DiTConfig(**diffusion_head_cfg)
-        if diffusion_head_cfg is not None
-        else DiTConfig()
-    )
+    backbone_config = BackboneConfig(**backbone_cfg)
+
+    diffusion_head_config = None
+    if diffusion_head_cfg is not None:
+        diffusion_head_config = DiTConfig(**diffusion_head_cfg)
 
     continuous_adapter_config = None
     if adapter_cfg is not None:
         continuous_adapter_config = AdapterConfig(**adapter_cfg)
 
-    token_head_config = (
-        TokenHeadConfig(**token_head_cfg)
-        if token_head_cfg is not None
-        else TokenHeadConfig()
-    )
-
     training_cfg = cfg_dict.get("training", {})
-    
+
     hybrid_config = HybridTTSConfig(
         backbone_config=backbone_config,
         diffusion_head_config=diffusion_head_config,
         continuous_adapter_config=continuous_adapter_config,
-        token_head_config=token_head_config,
-        prompt_vocab_size=cfg_dict.get("prompt_vocab_size"),
-        discrete_token_vocab_size=discrete_token_vocab_size,
+        prompt_vocab_size=tokenizer.prompt_vocab_size,
+        discrete_token_vocab_size=tokenizer.discrete_token_vocab_size,
         continuous_dim=continuous_dim,
-        pad_token_id=cfg_dict.get("pad_token_id"),
-        prompt_offset=cfg_dict.get("prompt_offset"),
-        start_audio_id=cfg_dict.get("start_audio_id"),
-        end_audio_id=cfg_dict.get("end_audio_id"),
+        pad_token_id=tokenizer.pad_id,
+        start_audio_id=tokenizer.start_audio_id,
+        end_audio_id=tokenizer.end_audio_id,
         debug=cfg_dict.get("debug", False),
         uncond_prob=training_cfg.get("uncond_prob", 0.0),
         no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
         discrete_only=training_cfg.get("discrete_only", False),
     )
 
-    return HybridTTS(config=hybrid_config)
+    return HybridTTS(config=hybrid_config, tokenizer=tokenizer)

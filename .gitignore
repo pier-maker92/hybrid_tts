@@ -159,3 +159,5 @@ data/*.json
 outputs/
 
 *.pyc
+
+research/

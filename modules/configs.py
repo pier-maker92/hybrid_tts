@@ -19,16 +19,16 @@ class DiTConfig:
     use_mlp_sampler: bool = False
 
 
-@dataclass
+@dataclass(kw_only=True)
 class BackboneConfig:
-    num_layers: int = 6
-    num_heads: int = 8
-    hidden_dim: int = 512
-    ffn_dim: int = 2048
-    dropout: float = 0.1
-    max_position_embeddings: int = 8192
-    vocab_size: int = 256  # Phonemes/Characters
-    pad_token_id: int = 0
+    model_type: str = "native"
+    from_pretrained: Optional[bool] = None
+    num_layers: int
+    num_heads: int
+    hidden_dim: int
+    ffn_dim: int
+    dropout: float
+    max_position_embeddings: int
 
 
 @dataclass
@@ -39,20 +39,13 @@ class AdapterConfig:
     num_layers: int = 2
 
 
-@dataclass
-class TokenHeadConfig:
-    in_dim: int = 512
-    vocab_size: int = 1024  # VAE discrete token vocab size
-
-
 @dataclass(kw_only=True)
 class HybridTTSConfig:
     backbone_config: BackboneConfig = field(default_factory=BackboneConfig)
-    diffusion_head_config: DiTConfig = field(default_factory=DiTConfig)
+    diffusion_head_config: Optional[DiTConfig] = None
     continuous_adapter_config: Optional[AdapterConfig] = field(
         default_factory=AdapterConfig
     )
-    token_head_config: TokenHeadConfig = field(default_factory=TokenHeadConfig)
 
     # Dimensions for Adaptive Norm & Embedding
     prompt_vocab_size: int
@@ -61,32 +54,21 @@ class HybridTTSConfig:
     start_audio_id: int
     end_audio_id: int
     pad_token_id: int
-    prompt_offset: int
     debug: bool = False
     uncond_prob: float = 0.0
     no_augment_ratio: float = 0.0
     discrete_only: bool = False
     backbone_hidden_size: Optional[int] = None
 
-    def __post_init__(self):
-        # Sync VAE/tokenizer-derived dims (known before backbone load).
-        self.backbone_config.vocab_size = self.prompt_vocab_size
-        self.token_head_config.vocab_size = self.discrete_token_vocab_size
-
-        if self.continuous_adapter_config is not None:
-            self.continuous_adapter_config.in_dim = self.continuous_dim
-
-        self.diffusion_head_config.audio_latent_dim = self.continuous_dim
-
     def apply_backbone_dims(self, hidden_size: int) -> None:
         """Propagate HF backbone hidden size into sub-configs after model load."""
         self.backbone_hidden_size = hidden_size
-        self.token_head_config.in_dim = hidden_size
 
         if self.continuous_adapter_config is not None:
             self.continuous_adapter_config.out_dim = hidden_size
 
-        self.diffusion_head_config.backbone_dim = hidden_size
+        if self.diffusion_head_config is not None:
+            self.diffusion_head_config.backbone_dim = hidden_size
 
     @property
     def hidden_size(self) -> int:

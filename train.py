@@ -61,10 +61,16 @@ class ShuffleDatasetCallback(TrainerCallback):
         **kwargs,
     ):
         train_dataloader = kwargs.get("train_dataloader")
-        if train_dataloader is not None and hasattr(train_dataloader.dataset, "dataset"):
+        if train_dataloader is not None and hasattr(
+            train_dataloader.dataset, "dataset"
+        ):
             epoch = int(state.epoch) if state.epoch is not None else 0
-            train_dataloader.dataset.dataset = train_dataloader.dataset.dataset.shuffle(seed=epoch)
-            logger.info(f"Explicitly shuffled underlying HuggingFace dataset for epoch {epoch}.")
+            train_dataloader.dataset.dataset = train_dataloader.dataset.dataset.shuffle(
+                seed=epoch
+            )
+            logger.info(
+                f"Explicitly shuffled underlying HuggingFace dataset for epoch {epoch}."
+            )
 
 
 def load_vae(checkpoint_dir: str, device: torch.device):
@@ -117,7 +123,6 @@ class EvaluationCallback(TrainerCallback):
         dataset_name,
         eval_dataset,
         eval_device,
-        pad_id,
         num_samples=100,
         batch_size=1,
         **kwargs,
@@ -128,8 +133,6 @@ class EvaluationCallback(TrainerCallback):
         self.dataset_name = dataset_name
         self.num_samples = num_samples
         self.eval_device = eval_device
-        self.start_audio_id = kwargs.get("start_audio_id")
-        self.end_audio_id = kwargs.get("end_audio_id")
         # Build a dedicated DataLoader limited to num_samples
         if num_samples and num_samples > 0:
             indices = list(range(min(num_samples, len(eval_dataset))))
@@ -140,13 +143,7 @@ class EvaluationCallback(TrainerCallback):
             subset,
             batch_size=batch_size,
             shuffle=False,
-            collate_fn=DataCollator(
-                pad_id=pad_id,
-                start_audio_id=self.start_audio_id,
-                end_audio_id=self.end_audio_id,
-                vq_vocab_size=kwargs.get("vq_vocab_size"),
-                prompt_vocab_size=kwargs.get("prompt_vocab_size"),
-            ),
+            collate_fn=DataCollator(tokenizer=kwargs.get("tokenizer")),
         )
         logger.info(
             f"EvaluationCallback: will evaluate on {len(self.eval_dataloader.dataset)} samples (device={self.eval_device})."
@@ -276,13 +273,13 @@ class HybridTTSTrainer(Trainer):
             continuous_sequence=inputs.get("continuous_sequence"),
             audio_padding_mask=inputs.get("audio_padding_mask"),
         )
-        target_ids = ['LJ038-0061', 'LJ029-0066', 'LJ045-0024', 'LJ036-0085', 'LJ046-0086', 'LJ008-0308', 'LJ008-0255', 'LJ049-0149']
-        # Verifica se ogni id nella nostra lista target è presente negli inputs
-        if all(t_id in inputs["ids"] for t_id in target_ids):
-            print("Found target ids")
 
         token_logits = outputs.token_logits
-        diffusion_loss = outputs.diffusion_loss or torch.tensor(0)
+        diffusion_loss = (
+            outputs.diffusion_loss
+            if outputs.diffusion_loss is not None
+            else torch.tensor(0.0, device=token_logits.device)
+        )
         target_tokens = inputs.get("target_tokens")
 
         # Token Loss
@@ -291,7 +288,9 @@ class HybridTTSTrainer(Trainer):
         # Handle DDP wrapping
         unwrapped_model = getattr(model, "module", model)
         token_loss = loss_fct(
-            token_logits.view(-1, unwrapped_model.unified_vocab_size),
+            token_logits.view(
+                -1, unwrapped_model.discrete_token_vocab_size + 1
+            ),  # discrete_token_vocab_size + audio_EOS
             target_tokens.view(-1),
         )
 
@@ -386,7 +385,7 @@ def main(cfg: DictConfig):
     tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
     logger.info("Creating HybridTTS model...")
-    model = build_model(cfg_dict)
+    model = build_model(cfg_dict, tokenizer=tok)
 
     # Attach HybridTokenizer so that debug mode can decode input sequences
     model.tokenizer = tok
@@ -396,11 +395,13 @@ def main(cfg: DictConfig):
     # Pop custom config keys so they don't get passed to HuggingFace TrainingArguments
     _ = training_cfg.pop("uncond_prob", 0.0)
     _ = training_cfg.pop("no_augment_ratio", 0.0)
-    discrete_only_flag = training_cfg.pop("discrete_only", False)
+    _ = training_cfg.pop("discrete_only", False)
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
-    training_cfg["group_by_length"] = training_cfg.get("group_by_length", False)
+    training_cfg["group_by_length"] = (
+        False  # training_cfg.get("group_by_length", False)
+    )
 
     training_args = TrainingArguments(
         remove_unused_columns=False,
@@ -408,13 +409,7 @@ def main(cfg: DictConfig):
         **training_cfg,
     )
 
-    data_collator = DataCollator(
-        pad_id=tok.pad_id,
-        start_audio_id=tok.start_audio_id - tok.prompt_offset,
-        end_audio_id=tok.end_audio_id - tok.prompt_offset,
-        vq_vocab_size=model.config.discrete_token_vocab_size,
-        prompt_vocab_size=model.config.prompt_vocab_size,
-    )
+    data_collator = DataCollator(tokenizer=tok)
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,
@@ -442,11 +437,7 @@ def main(cfg: DictConfig):
                 eval_device=accelerator.device,
                 num_samples=eval_num_samples,
                 batch_size=training_args.per_device_eval_batch_size,
-                pad_id=tok.pad_id,
-                start_audio_id=tok.start_audio_id - tok.prompt_offset,
-                end_audio_id=tok.end_audio_id - tok.prompt_offset,
-                vq_vocab_size=model.config.discrete_token_vocab_size,
-                prompt_vocab_size=model.config.prompt_vocab_size,
+                tokenizer=tok,
             )
         )
         logger.info(

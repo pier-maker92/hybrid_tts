@@ -42,13 +42,16 @@ def build_dataset(training_cfg: Dict[str, Any]):
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
     elif dataset_name == "lj_speech":
         from data.lj_speech import LJSpeechDataset
+
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
     discrete_only = training_cfg.get("discrete_only", False)
     train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
-    test_dataset = TestDatasetWrapper(dataset, "train", discrete_only=discrete_only) # FIXME workaround for LJSpeech
+    test_dataset = TestDatasetWrapper(
+        dataset, "train", discrete_only=discrete_only
+    )  # FIXME workaround for LJSpeech
 
     return train_dataset, test_dataset, dataset_name
 
@@ -65,19 +68,25 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
         vocab_size = len(phoneme_vocab)
     else:
         raise ValueError("Phoneme vocabulary not found. Please build it first.")
-    
 
+    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    if not vae_checkpoint or not os.path.exists(vae_checkpoint):
+        raise ValueError(
+            "vae_checkpoint is required and must exist to load discrete_token_vocab_size"
+        )
+    from modules.builder import load_codebook_config
 
-    cfg_dict["prompt_vocab_size"] = vocab_size + 3
-    cfg_dict["pad_token_id"] = vocab_size + 2
-    cfg_dict["start_audio_id"] = vocab_size + 1
-    cfg_dict["end_audio_id"] = vocab_size + 0
-    cfg_dict["prompt_offset"] = 0
+    _, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+    end_audio_id = vocab_size + 2
+    pad_token_id = vocab_size + 1
+    start_audio_id = vocab_size + 0
+
+    prompt_vocab_size = vocab_size + 3
 
     return HybridTokenizer(
-        phoneme_vocab=phoneme_vocab,
-        start_audio_id=cfg_dict["start_audio_id"],
-        end_audio_id=cfg_dict["end_audio_id"],
-        pad_id=cfg_dict["pad_token_id"],
-        prompt_offset=cfg_dict["prompt_offset"],
+        prompt_vocab_size=prompt_vocab_size,
+        start_audio_id=start_audio_id,
+        end_audio_id=end_audio_id,
+        pad_id=pad_token_id,
+        discrete_token_vocab_size=discrete_token_vocab_size,
     )

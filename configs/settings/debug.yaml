@@ -4,7 +4,7 @@ training:
   output_dir: checkpoints/exps/debug
 
   per_device_train_batch_size: 2
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8
   logging_steps: 1
   # report
   report_to: none
@@ -27,20 +27,21 @@ training:
   uncond_prob: 0.0
   no_augment_ratio: 0.1
   discrete_only: true
+  # use_cpu: false
 
 backbone:
-  num_layers: 8
-  num_heads: 16
-  hidden_dim: 1024
-  ffn_dim: 4096
+  model_type: "qwen-0.5b"
+  from_pretrained: false
+  num_layers: 4
+  num_heads: 8
+  hidden_dim: 512
+  ffn_dim: 2048
   dropout: 0.1
   max_position_embeddings: 8192
-  vocab_size: 256
-  pad_token_id: 0
 
 diffusion_head: null
 continuous_adapter: null
 
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set7"
+vae_checkpoint: "/Users/software/Research/MelCausalVAE/checkpoints/exps/set10-12500"
 vocoder_checkpoint: "vocos"
 debug: false

@@ -77,19 +77,17 @@ class TrainDatasetWrapper(SimpleAudioDataset):
         return data_dict
 
 
-@dataclass
 class DataCollator(object):
     """Collate examples for supervised fine-tuning."""
 
-    def __init__(
-        self, pad_id, start_audio_id, end_audio_id, vq_vocab_size, prompt_vocab_size
-    ):
-        self.pad_id = pad_id
-        self.start_audio_id = start_audio_id
-        self.end_audio_id = end_audio_id
-        self.vq_vocab_size = vq_vocab_size
-        self.prompt_vocab_size = prompt_vocab_size
-        self.audio_eos_id = prompt_vocab_size + vq_vocab_size
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_id = tokenizer.pad_id
+        self.start_audio_id = tokenizer.start_audio_id
+        self.end_audio_id = tokenizer.end_audio_id
+        self.vq_vocab_size = tokenizer.discrete_token_vocab_size
+        self.prompt_vocab_size = tokenizer.prompt_vocab_size
+        self.audio_eos_id = self.prompt_vocab_size + self.vq_vocab_size
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
@@ -112,16 +110,14 @@ class DataCollator(object):
             # prompt tokens keep their original IDs
             p_id = p_id + [self.start_audio_id]
 
-
             # discrete tokens are shifted by prompt_vocab_size
             shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
 
             # sequence ends with audio_eos_id
             sequence = p_id + shifted_d_token + [self.end_audio_id]
-            # append
             target_tokens.append(
-                torch.tensor([-100] * len(p_id[1:]) + shifted_d_token + [self.end_audio_id]).long()
-            )  # TODO check on this
+                torch.tensor([d + 1 for d in d_token] + [0]).long()
+            )  # Targets are the vq tokens starting at 1. 0 will be the end_audio_id in the decoder.
             discrete_sequence.append(torch.tensor(sequence).long())
             attention_mask.append(torch.tensor([1] * len(sequence)).bool())
             # continuous tail
@@ -215,8 +211,14 @@ class TestDatasetWrapper(SimpleAudioDataset):
 
         # LengthGroupedSampler looks for a list of tokens in the model input name (defaults to input_ids)
         # to calculate sequence lengths when precomputed lengths are not passed.
-        discrete_len = len(data_dict["discrete_tokens"]) if data_dict["discrete_tokens"] is not None else 0
-        phoneme_len = len(data_dict["phoneme_ids"]) if data_dict["phoneme_ids"] is not None else 0
+        discrete_len = (
+            len(data_dict["discrete_tokens"])
+            if data_dict["discrete_tokens"] is not None
+            else 0
+        )
+        phoneme_len = (
+            len(data_dict["phoneme_ids"]) if data_dict["phoneme_ids"] is not None else 0
+        )
         # Dummy input_ids list with the actual sequence length (phoneme_ids + shifted_discrete + end_audio_id)
         data_dict["input_ids"] = [0] * (phoneme_len + discrete_len + 1)
         return data_dict

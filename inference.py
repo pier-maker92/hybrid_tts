@@ -23,6 +23,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder import build_model as build_hybrid_model
 from modules.submodules.MelCausalVAE.modules.builder import build_model as build_vae
+from util import build_tokenizer
 
 
 def load_hybrid_config(
@@ -116,35 +117,10 @@ def load_hybrid_model(
     checkpoint_dir: str,
     device: torch.device,
     dtype: torch.dtype,
+    tokenizer,
 ) -> torch.nn.Module:
     """Builds HybridTTS and loads its weights from safetensors or pt file."""
-    # Read vocab size to dynamically set config parameters if needed
-    vocab_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
-    )
-    if os.path.exists(vocab_path):
-        with open(vocab_path, "r") as f:
-            phoneme_vocab = json.load(f)
-        vocab_size = len(phoneme_vocab)
-    else:
-        vocab_size = 256
-
-    backbone_cfg = cfg_dict.get("backbone_config")
-    if backbone_cfg is None:
-        backbone_cfg = cfg_dict.get("backbone")
-    is_pretrained = backbone_cfg.get("pretrained")
-
-    if not is_pretrained:
-        cfg_dict["prompt_vocab_size"] = vocab_size + 3  # Phonemes + Special Tokens
-        cfg_dict["prompt_offset"] = 0
-        cfg_dict["pad_token_id"] = vocab_size
-        cfg_dict["start_audio_id"] = vocab_size + 1
-        cfg_dict["end_audio_id"] = vocab_size + 2
-        logger.info(
-            f"Configured scratch HybridTTS: prompt_vocab_size={cfg_dict['prompt_vocab_size']}, start_audio_id={cfg_dict['start_audio_id']}"
-        )
-
-    model = build_hybrid_model(cfg_dict)
+    model = build_hybrid_model(cfg_dict, tokenizer=tokenizer)
 
     # Load model weights
     if os.path.isdir(checkpoint_dir):
@@ -642,10 +618,13 @@ def main():
     with open(vocab_path, "r") as f:
         phoneme_vocab = json.load(f)
 
-    # Load models
+    # Build tokenizer first as the single source of truth
+    logger.info("Building tokenizer...")
+    tok = build_tokenizer(cfg_dict, pretrinaed=False)
+    
     logger.info("Loading models...")
     cfg_dict["vae_checkpoint"] = args.vae_checkpoint
-    hybrid_model = load_hybrid_model(cfg_dict, args.hybrid_checkpoint, device, dtype)
+    hybrid_model = load_hybrid_model(cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok)
     vae = load_vae(args.vae_checkpoint, device, dtype)
     if vae is None:
         logger.error("Could not load VAE model.")
@@ -674,8 +653,8 @@ def main():
         sys.exit(1)
 
     # Append <start_audio> and <end_audio> explicitly
-    start_audio_id = cfg_dict["start_audio_id"] - cfg_dict["prompt_offset"]
-    end_audio_id = cfg_dict["end_audio_id"] - cfg_dict["prompt_offset"]
+    start_audio_id = tok.start_audio_id - tok.prompt_offset
+    end_audio_id = tok.end_audio_id - tok.prompt_offset
     prompt_ids.extend([start_audio_id, end_audio_id])
 
     # Calculate target length based on prompt length if default max_len is used
