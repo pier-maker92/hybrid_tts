@@ -52,6 +52,21 @@ class AddGranularLossesToTrainerState(TrainerCallback):
         return control
 
 
+class ShuffleDatasetCallback(TrainerCallback):
+    def on_epoch_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        train_dataloader = kwargs.get("train_dataloader")
+        if train_dataloader is not None and hasattr(train_dataloader.dataset, "dataset"):
+            epoch = int(state.epoch) if state.epoch is not None else 0
+            train_dataloader.dataset.dataset = train_dataloader.dataset.dataset.shuffle(seed=epoch)
+            logger.info(f"Explicitly shuffled underlying HuggingFace dataset for epoch {epoch}.")
+
+
 def load_vae(checkpoint_dir: str, device: torch.device):
     try:
         from modules.submodules.MelCausalVAE.modules.builder import (
@@ -385,7 +400,7 @@ def main(cfg: DictConfig):
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
-    training_cfg["group_by_length"] = False
+    training_cfg["group_by_length"] = training_cfg.get("group_by_length", False)
 
     training_args = TrainingArguments(
         remove_unused_columns=False,
@@ -437,6 +452,8 @@ def main(cfg: DictConfig):
         logger.info(
             "EvaluationCallback registered (VAE/Vocoder will be loaded lazily at eval time)."
         )
+
+    trainer.add_callback(ShuffleDatasetCallback())
 
     logger.info("Starting training...")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)

@@ -223,9 +223,8 @@ class HybridTTS(nn.Module):
         # ---- Backbone -------------------------------------------------------
         bb_cfg = config.backbone_config
 
-        # Unified vocabulary: prompt tokens + discrete audio tokens + 1 for audio EOS
         self.unified_vocab_size = (
-            config.prompt_vocab_size + config.discrete_token_vocab_size #+ 1
+            config.prompt_vocab_size + config.discrete_token_vocab_size 
         )
 
         bb_cfg.vocab_size = self.unified_vocab_size
@@ -269,12 +268,7 @@ class HybridTTS(nn.Module):
         start_indices = (
             (discrete_sequence == self.config.start_audio_id).long().argmax(dim=1)
         )
-        # Sequence ends with AUDIO_EOS
-        audio_eos_id = (
-            self.config.prompt_vocab_size + self.config.discrete_token_vocab_size
-        )
-        #audio_eos_id = self.config.prompt_vocab_size 
-        end_indices = (discrete_sequence == audio_eos_id).long().argmax(dim=1)
+        end_indices = (discrete_sequence == self.config.end_audio_id).long().argmax(dim=1)
         return start_indices, end_indices
 
     def _add_continuous_token(

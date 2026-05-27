@@ -73,6 +73,7 @@ class TrainDatasetWrapper(SimpleAudioDataset):
 
         data_dict["ids"] = data.get("id")
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
+
         return data_dict
 
 
@@ -211,6 +212,13 @@ class TestDatasetWrapper(SimpleAudioDataset):
         self._process_transcription(data_dict, transcription)
 
         data_dict["language"] = data.get("language", "en")
+
+        # LengthGroupedSampler looks for a list of tokens in the model input name (defaults to input_ids)
+        # to calculate sequence lengths when precomputed lengths are not passed.
+        discrete_len = len(data_dict["discrete_tokens"]) if data_dict["discrete_tokens"] is not None else 0
+        phoneme_len = len(data_dict["phoneme_ids"]) if data_dict["phoneme_ids"] is not None else 0
+        # Dummy input_ids list with the actual sequence length (phoneme_ids + shifted_discrete + end_audio_id)
+        data_dict["input_ids"] = [0] * (phoneme_len + discrete_len + 1)
         return data_dict
 
     def _process_transcription(self, data_dict, transcription):
