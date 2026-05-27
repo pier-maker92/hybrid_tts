@@ -21,13 +21,13 @@ class DiTConfig:
 
 @dataclass(kw_only=True)
 class BackboneConfig:
-    model_type: str = "native"
-    from_pretrained: Optional[bool] = None
-    num_layers: Optional[int] = None
-    num_heads: Optional[int] = None
-    hidden_dim: Optional[int] = None
+    model_type: str
     ffn_dim: Optional[int] = None
     dropout: Optional[float] = None
+    num_heads: Optional[int] = None
+    hidden_dim: Optional[int] = None
+    num_layers: Optional[int] = None
+    from_pretrained: Optional[bool] = None
     max_position_embeddings: Optional[int] = None
 
 
@@ -48,12 +48,13 @@ class HybridTTSConfig:
     )
 
     # Dimensions for Adaptive Norm & Embedding
-    prompt_vocab_size: int
-    discrete_token_vocab_size: int
-    continuous_dim: int
-    start_audio_id: int
-    end_audio_id: int
     pad_token_id: int
+    end_audio_id: int
+    start_audio_id: int
+    continuous_dim: int
+    prompt_vocab_size: int
+    shift_audio_offset: int
+    discrete_token_vocab_size: int
     debug: bool = False
     uncond_prob: float = 0.0
     no_augment_ratio: float = 0.0

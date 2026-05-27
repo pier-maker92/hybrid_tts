@@ -40,6 +40,13 @@ class HybridTokenizer:
     def unified_vocab_size(self) -> int:
         return self.prompt_vocab_size + self.discrete_token_vocab_size
 
+    def save_pretrained(self, save_directory: str, **kwargs):
+        """
+        Dummy save_pretrained to avoid AttributeError when HF Trainer tries to save it.
+        The tokenizer parameters are currently instantiated via config in build_tokenizer.
+        """
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Helper modules
@@ -194,22 +201,21 @@ class HybridTTS(nn.Module):
         super().__init__()
         self.config = config
         self.tokenizer = tokenizer
-
         self.pad_token_id = tokenizer.pad_id
-        self.start_audio_id = tokenizer.start_audio_id
+        self.discrete_only = config.discrete_only
         self.end_audio_id = tokenizer.end_audio_id
-        self.discrete_token_vocab_size = tokenizer.discrete_token_vocab_size
+        self.start_audio_id = tokenizer.start_audio_id
+        self.shift_audio_offset = config.shift_audio_offset
         self.unified_vocab_size = tokenizer.unified_vocab_size
-
-        # Apply tokenizer sizes to sub-configs where previously handled by __post_init__
-
-        # config.token_head_config.vocab_size = (
-        #     self.discrete_token_vocab_size + 1
-        # )  # audio_EOS must be predicted
+        self.discrete_token_vocab_size = tokenizer.discrete_token_vocab_size
         if config.continuous_adapter_config is not None:
             config.continuous_adapter_config.in_dim = config.continuous_dim
         if config.diffusion_head_config is not None:
             config.diffusion_head_config.audio_latent_dim = config.continuous_dim
+
+        # check on the shift_audio_offset
+        if self.shift_audio_offset > 1:
+            raise NotImplementedError("shift_audio_offset > 1 is not implemented yet")
 
         # ---- Backbone -------------------------------------------------------
         bb_cfg = config.backbone_config
@@ -245,7 +251,7 @@ class HybridTTS(nn.Module):
         # ---- Continuous adapter (VAE latents → hidden_size) ------------------
         if config.continuous_adapter_config is not None:
             self.continuous_adapter = MLPAdapter(config.continuous_adapter_config)
-        else:
+        elif not self.discrete_only:
             self.continuous_adapter = nn.Linear(config.continuous_dim, hidden_size)
 
         # ---- Normalisations --------------------------------------------------
@@ -287,7 +293,7 @@ class HybridTTS(nn.Module):
         Insert audio embeddings between <start_audio> and <end_audio> in the prompt.
         """
         B, L_audio, hidden_dim = continuous_sequence.shape
-        index_3d = (start_positions + 1).unsqueeze(-1)
+        index_3d = (start_positions + 1 + self.shift_audio_offset).unsqueeze(-1)
         offset = torch.arange(L_audio, device=continuous_sequence.device).unsqueeze(0)
         audio_positions = index_3d + offset
         continuous_sequence = continuous_sequence * (~audio_padding_mask).unsqueeze(-1)
@@ -319,8 +325,12 @@ class HybridTTS(nn.Module):
             torch.tensor(self.pad_token_id).long().to(full_hidden_states.device)
         )
         for h, s, e in zip(full_hidden_states, start_indices, end_indices):
-            audio_hidden_states.append(h[s:e])
-            audio_masks.append(torch.ones(e - s, dtype=torch.bool, device=h.device))
+            audio_hidden_states.append(h[s : e + self.shift_audio_offset])
+            audio_masks.append(
+                torch.ones(
+                    e - s + self.shift_audio_offset, dtype=torch.bool, device=h.device
+                )
+            )
 
         audio_hidden_states = pad_sequence(
             audio_hidden_states,
@@ -434,14 +444,20 @@ class HybridTTS(nn.Module):
         target_embed_weight = self.backbone.get_output_embeddings().weight[
             self.end_audio_id :
         ]
-        token_logits = F.linear(audio_hidden_states, target_embed_weight)
+
+        if self.shift_audio_offset:
+            token_logits = F.linear(
+                audio_hidden_states[:, : -self.shift_audio_offset], target_embed_weight
+            )
+        else:
+            token_logits = F.linear(audio_hidden_states, target_embed_weight)
         # diffuion loss
         if continuous_sequence is not None and self.diffusion_head is not None:
             diffusion_loss = self.diffusion_head(
                 target=continuous_sequence,
                 target_padding_mask=audio_padding_mask,
                 context_vector=audio_hidden_states[
-                    :, :-1
+                    :, self.shift_audio_offset : -1
                 ],  # we stop at last audio frame
             ).loss
         else:

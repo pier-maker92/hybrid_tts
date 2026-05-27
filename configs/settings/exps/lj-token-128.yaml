@@ -1,15 +1,15 @@
 # @package _global_
 training:
-  dataset_name: lj_speech
-  output_dir: checkpoints/exps/lj-predrop-128
-  per_device_train_batch_size: 8
-  gradient_accumulation_steps: 2
+  dataset_name: lj_speech_10_128
+  output_dir: checkpoints/exps/lj-token_only-128
+  per_device_train_batch_size: 12
+  gradient_accumulation_steps: 1
   logging_steps: 1
   save_total_limit: 2
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj-predrop-128
+  wandb_run_name: lj-token_only-128
   run_id: ""
   bf16: true
   # eval
@@ -30,14 +30,9 @@ training:
   group_by_length: false
 
 backbone:
-  num_layers: 8
-  num_heads: 16
-  hidden_dim: 1024
-  ffn_dim: 4096
-  dropout: 0.1
-  max_position_embeddings: 8192
-  vocab_size: 256
-  pad_token_id: 0
+  model_type: "qwen-0.5b"
+  from_pretrained: false
+  shift_audio_offset: 0
 
 diffusion_head: null
 continuous_adapter: null

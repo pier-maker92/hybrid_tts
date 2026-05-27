@@ -62,17 +62,19 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         raise ValueError("VAE checkpoint is required to build model.")
     continuous_dim, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
 
+    shift_audio_offset = backbone_cfg.pop("shift_audio_offset")
     backbone_config = BackboneConfig(**backbone_cfg)
 
+    training_cfg = cfg_dict.get("training")
+    discrete_only = training_cfg.get("discrete_only")
+
     diffusion_head_config = None
-    if diffusion_head_cfg is not None:
+    if diffusion_head_cfg is not None and not discrete_only:
         diffusion_head_config = DiTConfig(**diffusion_head_cfg)
 
     continuous_adapter_config = None
-    if adapter_cfg is not None:
+    if adapter_cfg is not None and not discrete_only:
         continuous_adapter_config = AdapterConfig(**adapter_cfg)
-
-    training_cfg = cfg_dict.get("training", {})
 
     hybrid_config = HybridTTSConfig(
         backbone_config=backbone_config,
@@ -87,7 +89,8 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         debug=cfg_dict.get("debug", False),
         uncond_prob=training_cfg.get("uncond_prob", 0.0),
         no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
-        discrete_only=training_cfg.get("discrete_only", False),
+        discrete_only=discrete_only,
+        shift_audio_offset=shift_audio_offset,
     )
 
     return HybridTTS(config=hybrid_config, tokenizer=tokenizer)

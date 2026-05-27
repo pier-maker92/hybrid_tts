@@ -40,8 +40,12 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.librispeech_align import LibriSpeechAlignDataset
 
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
-    elif dataset_name == "lj_speech":
-        from data.lj_speech import LJSpeechDataset
+    elif dataset_name == "lj_speech_10_128":
+        from data.lj_speech_128 import LJSpeechDataset
+
+        dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
+    elif dataset_name == "lj_speech_10_512":
+        from data.lj_speech_512 import LJSpeechDataset
 
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
     else:

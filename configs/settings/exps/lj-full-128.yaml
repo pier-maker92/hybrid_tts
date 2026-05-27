@@ -1,15 +1,15 @@
 # @package _global_
 training:
-  dataset_name: lj_speech_512
-  output_dir: checkpoints/exps/debug-lj_speech_512-token_and_features-shift
-
-  per_device_train_batch_size: 8
-  gradient_accumulation_steps: 2
+  dataset_name: lj_speech_10_128
+  output_dir: checkpoints/exps/lj-token_and_feat-128
+  per_device_train_batch_size: 12
+  gradient_accumulation_steps: 1
   logging_steps: 1
+  save_total_limit: 2
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: debug-lj_speech_512-token_and_features-shift
+  wandb_run_name: lj-token_and_feat-128
   run_id: ""
   bf16: true
   # eval
@@ -19,7 +19,7 @@ training:
   eval_num_samples: 4
   num_train_epochs: 100
   # lr
-  learning_rate: 7e-5
+  learning_rate: 3e-4
   min_learning_rate: 1e-5
   lr_scheduler_type: "cosine"   
   warmup_ratio: 0.05         
@@ -27,29 +27,23 @@ training:
   uncond_prob: 0.0
   no_augment_ratio: 0.1
   discrete_only: false
-  # use_cpu: false
+  group_by_length: false
 
 backbone:
   model_type: "qwen-0.5b"
   from_pretrained: false
-  shift_audio_offset: 1
-  # num_layers: 4
-  # num_heads: 8
-  # hidden_dim: 512
-  # ffn_dim: 2048
-  # dropout: 0.1
-  # max_position_embeddings: 8192
+  shift_audio_offset: 0
 
-diffusion_head:
+diffusion_head: 
   net_dim: 512
   net_depth: 6
   uncond_prob: 0.0
   use_mlp_sampler: true
 
-continuous_adapter:
+continuous_adapter: 
   hidden_dim: 256
-  num_layers: 2   # Crea 2 strati nascosti + strato di output
+  num_layers: 2
 
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set10_512"
+vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set10_128/checkpoint-32500"
 vocoder_checkpoint: "vocos"
 debug: false

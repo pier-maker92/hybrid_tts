@@ -198,7 +198,6 @@ class HybridTTSTrainer(Trainer):
         granular_losses = [
             "token_loss",
             "diffusion_loss",
-            "total_loss",
             "continuous_ratio",
         ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
@@ -301,7 +300,6 @@ class HybridTTSTrainer(Trainer):
             flat_metrics = {
                 "token_loss": token_loss.detach(),
                 "diffusion_loss": diffusion_loss.detach(),
-                "total_loss": total_loss.detach(),
                 "continuous_ratio": (
                     outputs.continuous_ratio.detach()
                     if outputs.continuous_ratio is not None
@@ -320,22 +318,29 @@ class HybridTTSTrainer(Trainer):
 
         return (total_loss, outputs) if return_outputs else total_loss
 
-    # def _maybe_log_save_evaluate(self, *args, **kwargs):
-    #     if (
-    #         self.control.should_log
-    #         and self.state.global_step > self._globalstep_last_logged
-    #     ):
-    #         if hasattr(self.control, "granular_losses"):
-    #             extra_logs = {}
-    #             steps = self.state.global_step - self._globalstep_last_logged
-    #             for k, v in self.control.granular_losses.items():
-    #                 val = self._nested_gather(v).mean().item()
-    #                 extra_logs[k] = round(val / steps, 4)
-    #                 self.control.granular_losses[k].zero_()
-    #             self.log(extra_logs)
-    #         # Do NOT touch tr_loss or _globalstep_last_logged — let super handle them
+    def _maybe_log_save_evaluate(self, *args, **kwargs):
+        last_logged = getattr(self, "_globalstep_last_logged", 0)
+        should_log = self.control.should_log and self.state.global_step > last_logged
 
-    #     super()._maybe_log_save_evaluate(*args, **kwargs)
+        if should_log and hasattr(self.control, "granular_losses"):
+            steps = self.state.global_step - last_logged
+            logs_to_add = {}
+            for key, tensor_val in self.control.granular_losses.items():
+                logs_to_add[key] = round(tensor_val.item() / steps, 4)
+                tensor_val.zero_()
+
+            original_log = self.log
+            def patched_log(logs, *log_args, **log_kwargs):
+                logs.update(logs_to_add)
+                original_log(logs, *log_args, **log_kwargs)
+
+            self.log = patched_log
+            try:
+                super()._maybe_log_save_evaluate(*args, **kwargs)
+            finally:
+                del self.log
+        else:
+            super()._maybe_log_save_evaluate(*args, **kwargs)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if state_dict is None:

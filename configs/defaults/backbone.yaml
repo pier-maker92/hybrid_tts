@@ -6,3 +6,4 @@ backbone:
   dropout: 0.1
   max_position_embeddings: 8192
   from_pretrained: false
+  shift_audio_offset: 0
