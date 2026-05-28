@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Script updated to use the built-in sample method
 import os
 import sys
 import json
@@ -149,278 +150,6 @@ def load_hybrid_model(
     model.to(device=device, dtype=dtype)
     logger.info(f"Successfully loaded HybridTTS model from {checkpoint_file}")
     return model
-
-
-def sample_next_token(
-    logits: torch.Tensor, temperature: float = 1.0, top_k: int = 50, top_p: float = 0.95
-) -> int:
-    """Samples next token from logits with temperature, top_k, and nucleus (top_p) filtering."""
-    if temperature == 0.0:
-        return torch.argmax(logits).item()
-
-    logits = logits / temperature
-
-    # Top-K filtering
-    if top_k > 0:
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-        logits[indices_to_remove] = -float("Inf")
-
-    # Top-P (Nucleus) filtering
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-
-        # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
-
-        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-        logits[indices_to_remove] = -float("Inf")
-
-    probs = torch.softmax(logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1).item()
-    return next_token
-
-
-@torch.no_grad()
-def generate_discrete_tokens(
-    model: torch.nn.Module,
-    prompt_ids: List[int],
-    max_len: int = 500,
-    temperature: float = 1.0,
-    top_k: int = 50,
-    top_p: float = 0.95,
-) -> List[int]:
-    """Generates discrete tokens autoregressively from phoneme prompt_ids."""
-    model.eval()
-    device = model.device
-
-    # Convert list of prompt ids to tensor of shape [1, L_prompt]
-    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-
-    # We will generate discrete tokens autoregressively.
-    # Start with a dummy token at index 0.
-    generated_tokens = [0]
-
-    logger.info("Starting autoregressive generation of discrete audio tokens...")
-
-    for step in range(max_len):
-        t = len(generated_tokens)
-        discrete_input = torch.tensor(
-            [generated_tokens], dtype=torch.long, device=device
-        )
-
-        # continuous input: shape [1, t, continuous_dim] filled with zeros
-        continuous_input = torch.zeros(
-            (1, t, model.config.continuous_dim), dtype=model.dtype, device=device
-        )
-
-        # Run forward pass of HybridTTS
-        outputs = model(
-            prompt_ids=prompt_tensor,
-            discrete_tokens=discrete_input,
-            continuous_tokens=continuous_input,
-        )
-
-        # logits shape: [1, t, discrete_token_vocab_size]
-        # We need the last logit (corresponding to the dummy token) to predict the next token
-        logits = outputs.token_logits[0, -1, :]
-
-        # Sample next token
-        next_token = sample_next_token(
-            logits, temperature=temperature, top_k=top_k, top_p=top_p
-        )
-
-        # Replace the dummy token at index t-1 with the actual sampled token
-        generated_tokens[-1] = next_token
-
-        # Otherwise, append a dummy token for the next step
-        generated_tokens.append(0)
-
-    # If we exited without hitting the end token, remove the trailing dummy token
-    if generated_tokens[-1] == 0:
-        generated_tokens = generated_tokens[:-1]
-
-    logger.info(f"Generated {len(generated_tokens)} discrete tokens.")
-    return generated_tokens
-
-
-@torch.no_grad()
-def get_audio_hidden_states(
-    model: torch.nn.Module, prompt_ids: List[int], discrete_tokens: List[int]
-) -> torch.Tensor:
-    """Runs a forward-like backbone pass to extract the hidden states corresponding to audio tokens."""
-    device = model.device
-    model_dtype = model.dtype
-    bb_dtype = next(model.backbone.parameters()).dtype
-
-    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    discrete_tensor = torch.tensor([discrete_tokens], dtype=torch.long, device=device)
-
-    L_audio = discrete_tensor.shape[1]
-
-    # continuous_tokens: zeros of shape [1, L_audio, continuous_dim]
-    continuous_tokens = torch.zeros(
-        (1, L_audio, model.config.continuous_dim), dtype=model_dtype, device=device
-    )
-    padding_mask = torch.zeros((1, L_audio), dtype=torch.bool, device=device)
-
-    # Emulate the model's forward path to retrieve backbone hidden states
-    p_emb = model.prompt_emb(prompt_tensor + model.config.prompt_offset)
-    d_emb = model.discrete_emb(discrete_tensor)
-    norm_c = model.continuous_norm(continuous_tokens, padding_mask=padding_mask)
-    c_emb = model.continuous_adapter(norm_c)
-
-    d_emb = model.norm_discrete(d_emb)
-    c_emb = model.norm_continuous(c_emb)
-    audio_emb = d_emb + c_emb
-
-    lut_ids = prompt_tensor + model.config.prompt_offset
-    start_idx = (lut_ids == model.config.start_audio_id).long().argmax(dim=1).item()
-    end_idx = (lut_ids == model.config.end_audio_id).long().argmax(dim=1).item()
-
-    prefix_emb = p_emb[:, :start_idx + 1, :]
-    end_emb = p_emb[:, end_idx:end_idx+1, :]
-
-    inputs_embeds = torch.cat([prefix_emb, audio_emb, end_emb], dim=1)
-
-    prefix_attn = torch.ones((1, start_idx + 1), dtype=torch.long, device=device)
-    audio_attn = (~padding_mask).long()
-    end_attn = torch.ones((1, 1), dtype=torch.long, device=device)
-    attention_mask = torch.cat([prefix_attn, audio_attn, end_attn], dim=1)
-
-    outputs_bb = model.backbone(
-        inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask
-    )
-    full_hidden_states = outputs_bb.last_hidden_state
-
-    # Hidden states corresponding to start_audio up to the last audio token (length L_audio)
-    audio_hidden_states = full_hidden_states[:, start_idx : start_idx + L_audio, :]
-    return audio_hidden_states
-
-
-@torch.no_grad()
-def get_last_hidden_joint(
-    model: torch.nn.Module,
-    prompt_tensor: torch.Tensor,
-    committed_tokens: List[int],
-    committed_continuous: List[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Returns the hidden state of the last token in the sequence:
-      [Prompt | START | <END>]                          <- step 0 (START output)
-      [Prompt | START | (a_0,c_0) | ... | <END>]        <- step t (last audio token output)
-    """
-    device = model.device
-    bb_dtype = next(model.backbone.parameters()).dtype
-
-    lut_ids = prompt_tensor + model.config.prompt_offset
-    start_idx = (lut_ids == model.config.start_audio_id).long().argmax(dim=1).item()
-    end_idx = (lut_ids == model.config.end_audio_id).long().argmax(dim=1).item()
-
-    p_emb = model.prompt_emb(lut_ids)
-
-    prefix_emb = p_emb[:, :start_idx + 1, :]
-    end_emb = p_emb[:, end_idx:end_idx+1, :]
-
-    prefix_attn = torch.ones((1, start_idx + 1), dtype=torch.long, device=device)
-    end_attn = torch.ones((1, 1), dtype=torch.long, device=device)
-
-    if len(committed_tokens) == 0:
-        inputs_embeds = torch.cat([prefix_emb, end_emb], dim=1)
-        attention_mask = torch.cat([prefix_attn, end_attn], dim=1)
-        # We want the hidden state of START, which is at position start_idx (since length is start_idx + 1 before end_emb)
-        target_pos = start_idx
-    else:
-        discrete_tensor = torch.tensor([committed_tokens], dtype=torch.long, device=device)
-        continuous_tensor = torch.stack(committed_continuous, dim=0).unsqueeze(0)  # [1, t, dim]
-
-        d_emb = model.discrete_emb(discrete_tensor)
-        c_emb = model.continuous_adapter(continuous_tensor)
-
-        d_emb = model.norm_discrete(d_emb)
-        c_emb = model.norm_continuous(c_emb)
-        audio_emb = d_emb + c_emb
-
-        inputs_embeds = torch.cat([prefix_emb, audio_emb, end_emb], dim=1)
-        audio_attn = torch.ones((1, len(committed_tokens)), dtype=torch.long, device=device)
-        attention_mask = torch.cat([prefix_attn, audio_attn, end_attn], dim=1)
-        # We want the hidden state of the last audio token, which is at start_idx + len(committed_tokens)
-        target_pos = start_idx + len(committed_tokens)
-
-    outputs_bb = model.backbone(inputs_embeds=inputs_embeds.to(bb_dtype), attention_mask=attention_mask)
-    last_hidden = outputs_bb.last_hidden_state[:, target_pos:target_pos+1, :]
-    return last_hidden
-
-
-@torch.no_grad()
-def generate_joint_tokens(
-    model: torch.nn.Module,
-    prompt_ids: List[int],
-    max_len: int = 500,
-    temperature: float = 1.0,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    num_steps: int = 16,
-    diffusion_temperature: float = 1.0,
-    guidance_scale: float = 1.0,
-) -> tuple[List[int], torch.Tensor]:
-    """Generates discrete tokens and continuous latents jointly step-by-step.
-
-    At each step t:
-      1. Backbone sees [Prompt | START | committed_audio_0..t-1].
-      2. The hidden state of the LAST token is used as context.
-         - At t=0 this is START's output (identical to training).
-         - At t>0 this is the last committed audio token's output.
-      3. Diffusion head generates c_t from that context.
-      4. Token head samples a_t from that context.
-      5. (a_t, c_t) are appended to the committed lists.
-    No dummy tokens are ever fed into the backbone.
-    """
-    model.eval()
-    device      = model.device
-    model_dtype = model.dtype
-
-    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-
-    committed_tokens:     List[int]           = []   # discrete tokens committed so far
-    committed_continuous: List[torch.Tensor]  = []   # [dim] tensors, normalized, committed so far
-
-    logger.info("Starting joint (autoregressive + diffusion) generation of audio...")
-
-    step_padding_mask = torch.zeros((1, 1), dtype=torch.bool, device=device)
-
-    for step in tqdm(range(max_len)):
-        # 1. Get the hidden state of the last token in the current sequence
-        last_hidden = get_last_hidden_joint(
-            model, prompt_tensor, committed_tokens, committed_continuous
-        )
-
-        # 2. Generate continuous latent c_t (in normalized space, matching training targets)
-        latents_output = model.diffusion_head.generate(
-            num_steps=num_steps,
-            context_vector=last_hidden,
-            temperature=diffusion_temperature,
-            guidance_scale=guidance_scale,
-            padding_mask=step_padding_mask,
-        )
-        c_t = latents_output.audio_features[0, 0, :]   # [dim]
-
-        # 3. Sample discrete token a_t
-        logits     = model.token_head(last_hidden)[0, 0, :]   # [vocab_size]
-        next_token = sample_next_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
-
-        # 4. Commit both
-        committed_tokens.append(next_token)
-        committed_continuous.append(c_t.to(model_dtype))
-
-    logger.info(f"Jointly generated {len(committed_tokens)} tokens.")
-
-    # Stack continuous latents → [1, L, dim]
-    z = torch.stack(committed_continuous, dim=0).unsqueeze(0)
-    return committed_tokens, z
 
 
 def clean_text_and_phonemize(text: str, vocab: Dict[str, int]) -> List[int]:
@@ -620,11 +349,13 @@ def main():
 
     # Build tokenizer first as the single source of truth
     logger.info("Building tokenizer...")
-    tok = build_tokenizer(cfg_dict, pretrinaed=False)
-    
-    logger.info("Loading models...")
     cfg_dict["vae_checkpoint"] = args.vae_checkpoint
-    hybrid_model = load_hybrid_model(cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok)
+    tok = build_tokenizer(cfg_dict, pretrinaed=False)
+
+    logger.info("Loading models...")
+    hybrid_model = load_hybrid_model(
+        cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok
+    )
     vae = load_vae(args.vae_checkpoint, device, dtype)
     if vae is None:
         logger.error("Could not load VAE model.")
@@ -652,136 +383,80 @@ def main():
         logger.error("Empty phoneme input. Nothing to synthesize.")
         sys.exit(1)
 
-    # Append <start_audio> and <end_audio> explicitly
-    start_audio_id = tok.start_audio_id - tok.prompt_offset
-    end_audio_id = tok.end_audio_id - tok.prompt_offset
-    prompt_ids.extend([start_audio_id, end_audio_id])
+    # Map prompt_ids to unified vocab and append <start_audio>
+
+    prompt_ids.append(tok.start_audio_id)
 
     # Calculate target length based on prompt length if default max_len is used
     if args.max_len == 500:
         target_len = int(len(prompt_ids) * args.ratio)
-        logger.info(f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})")
+        logger.info(
+            f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})"
+        )
     else:
         target_len = args.max_len
         logger.info(f"Using explicitly specified max_len: {target_len} frames")
 
     with torch.no_grad():
-        if not args.token_first:
-            # Main joint inference mechanism: discrete tokens and continuous latents generated step-by-step
-            discrete_tokens, z = generate_joint_tokens(
-                hybrid_model,
-                prompt_ids,
-                max_len=target_len,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                num_steps=args.num_steps,
-                diffusion_temperature=args.diffusion_temperature,
-                guidance_scale=args.guidance_scale,
-            )
+        logger.info("Running built-in sample function...")
+        discrete_sequence = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(
+            discrete_sequence, dtype=torch.bool, device=device
+        )
 
-            # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
-            logger.info("Decoding continuous features using VAE...")
-            # For a single sequence, padding mask is all False
-            padding_mask = torch.zeros(z.shape[:2], dtype=torch.bool, device=device)
-            # Denormalize continuous latents only before VAE decoder
-            z_denorm = hybrid_model.continuous_norm.denormalize(z)
+        batch = {
+            "discrete_sequence": discrete_sequence,
+            "attention_mask": attention_mask,
+        }
 
-            # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
-            audio_tokens = list(discrete_tokens)
-            
-            tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
-            vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
-            
-            if args.decode_only_token:
-                logger.info("Using only generated quantized tokens (continuous features zeroed out).")
-                z_denorm = torch.zeros_like(z_denorm)
+        sample_out = hybrid_model.sample(
+            batch=batch,
+            max_steps=target_len,
+            temperature=args.temperature,
+            num_steps=args.num_steps,
+            diffusion_temperature=args.diffusion_temperature,
+            guidance_scale=args.guidance_scale,
+        )
 
-            z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
+        final_discrete = sample_out["discrete_tokens"]
+        z_denorm = sample_out["continuous_tokens"]
 
-            reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=16,
-                temperature=0.2,
-                guidance_scale=1.4,
-                z=z_vae,
-                padding_mask=padding_mask,
+        audio_tokens = final_discrete.squeeze(-1).squeeze(0).tolist()
+
+        logger.info("Decoding continuous features using VAE...")
+        if z_denorm is not None:
+            padding_mask = torch.zeros(
+                z_denorm.shape[:2], dtype=torch.bool, device=device
             )
         else:
-            # Ablation mode: generate all discrete tokens first, and then run diffusion once on the sequence
+            padding_mask = torch.zeros(
+                (1, len(audio_tokens)), dtype=torch.bool, device=device
+            )
+
+        tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
+        vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
+        vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
+
+        if args.decode_only_token or z_denorm is None:
             logger.info(
-                "Running in ablation mode (--token_first): generating all discrete tokens first..."
+                "Using only generated quantized tokens (continuous features zeroed out)."
             )
-            # Step 1: Generate discrete tokens autoregressively
-            discrete_tokens = generate_discrete_tokens(
-                hybrid_model,
-                prompt_ids,
-                max_len=target_len,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
+            z_denorm = torch.zeros(
+                (1, len(audio_tokens), hybrid_model.config.continuous_dim),
+                dtype=dtype,
+                device=device,
             )
 
-            if not discrete_tokens:
-                logger.error("Failed to generate discrete tokens.")
-                sys.exit(1)
+        z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
 
-            if not args.decode_only_token:
-                # Step 2: Get hidden states for the complete audio sequence from backbone
-                logger.info("Extracting audio hidden states from backbone...")
-                audio_hidden_states = get_audio_hidden_states(
-                    hybrid_model, prompt_ids, discrete_tokens
-                )
-
-                # Step 3: Run the diffusion head to generate continuous features (latents)
-                logger.info(
-                    f"Running diffusion head (steps={args.num_steps}, guidance={args.guidance_scale})..."
-                )
-                padding_mask = torch.zeros(
-                    (1, audio_hidden_states.shape[1]), dtype=torch.bool, device=device
-                )
-                latents_output = hybrid_model.diffusion_head.generate(
-                    num_steps=args.num_steps,
-                    context_vector=audio_hidden_states,
-                    temperature=args.diffusion_temperature,
-                    guidance_scale=args.guidance_scale,
-                    padding_mask=padding_mask,
-                )
-                z = latents_output.audio_features
-
-                # Step 4: Run VAE decoder to reconstruct Mel Spectrogram
-                logger.info("Decoding continuous features using VAE...")
-                # Denormalize continuous latents only before VAE decoder
-                z_denorm = hybrid_model.continuous_norm.denormalize(z)
-                vae_padding_mask = latents_output.padding_mask
-            else:
-                logger.info("Skipping backbone extraction and diffusion head (decode_only_token is active).")
-                # Create a zero tensor for z_denorm with shape [1, L_audio, continuous_dim]
-                z_denorm = torch.zeros(
-                    (1, len(discrete_tokens), hybrid_model.config.continuous_dim),
-                    dtype=dtype,
-                    device=device,
-                )
-                vae_padding_mask = torch.zeros(
-                    (1, len(discrete_tokens)), dtype=torch.bool, device=device
-                )
-
-            # Look up VQ codebook embeddings for discrete tokens and concatenate to form full 64-dimensional latent
-            audio_tokens = list(discrete_tokens)
-            
-            tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-            vq_emb = vae.encoder.vq.codebook(tokens_tensor)  # [L, 32]
-            vq_emb = vq_emb.unsqueeze(0)  # [1, L, 32]
-            
-            z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
-
-            reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=args.num_steps,
-                temperature=args.diffusion_temperature,
-                guidance_scale=args.guidance_scale,
-                z=z_vae,
-                padding_mask=vae_padding_mask,
-            )
+        # Using hardcoded parameters for VAE sample as before
+        reconstructed_mel, reconstructed_padding_mask = vae.sample(
+            num_steps=16,
+            temperature=0.2,
+            guidance_scale=1.4,
+            z=z_vae,
+            padding_mask=padding_mask,
+        )
 
         # Step 5: Synthesize waveform using Vocoder
         logger.info("Synthesizing waveform using Vocoder...")

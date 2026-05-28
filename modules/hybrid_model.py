@@ -480,13 +480,13 @@ class HybridTTS(nn.Module):
         if temperature < 0:
             raise ValueError("temperature must be > 0")
         elif temperature == 0:
-            return torch.argmax(token_logits, dim=-1) + self.prompt_vocab_size
+            return torch.argmax(token_logits, dim=-1)
         # scale logits
         scaled_logits = token_logits / temperature
         # categorical sampling
         dist = torch.distributions.Categorical(logits=scaled_logits)
         # sample ids
-        return dist.sample() + self.prompt_vocab_size
+        return dist.sample()
 
     @torch.no_grad()
     def sample(
@@ -507,10 +507,11 @@ class HybridTTS(nn.Module):
         all_discrete_tokens = []
 
         max_steps = kwargs.get("max_steps", 250)
-        embed_layer = self.backbone.get_input_embeddings()
         input_embs = embed_layer(discrete_sequence)
 
         discrete_only = getattr(self.config, "discrete_only", False)
+
+        past_key_values = None
 
         for step in tqdm(range(max_steps)):
 
@@ -527,19 +528,24 @@ class HybridTTS(nn.Module):
                     attention_mask=attention_mask,
                     output_hidden_states=True,
                     return_dict=True,
+                    past_key_values=past_key_values,
+                    use_cache=True,
                 )
                 last_hidden_state = outputs.hidden_states[-1][:, -1:]  # (B, 1, H)
+                past_key_values = outputs.past_key_values
 
-            target_embed_weight = self.backbone.get_input_embeddings().weight[
+            target_embed_weight = self.backbone.get_output_embeddings().weight[
                 self.end_audio_id :
             ]
             token_logits = F.linear(last_hidden_state.squeeze(1), target_embed_weight)
-            token_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
+            sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
 
-            if token_id == self.unified_vocab_size:
+            if (sampled_id == 0).all():
                 break
 
-            all_discrete_tokens.append(token_id.unsqueeze(-1) - self.prompt_vocab_size)
+            token_id = sampled_id - 1 + self.tokenizer.prompt_vocab_size
+
+            all_discrete_tokens.append((sampled_id - 1).unsqueeze(-1))
 
             if discrete_only or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
@@ -548,19 +554,24 @@ class HybridTTS(nn.Module):
                     num_steps=kwargs.get("num_steps"),
                     context_vector=last_hidden_state,
                     temperature=kwargs.get("diffusion_temperature"),
+                    guidance_scale=kwargs.get("guidance_scale"),
                 ).audio_features
 
                 all_continuous_tokens.append(generated_continuous_tokens)
 
-                next_token = embed_layer(token_id) + self.norm_continuous(
+                next_token = embed_layer(token_id).unsqueeze(1) + self.norm_continuous(
                     self.continuous_adapter(generated_continuous_tokens)
                 )
 
-            input_embs = torch.cat([input_embs, next_token], dim=1)
+            if self.config.backbone_config.model_type == "native":
+                input_embs = torch.cat([input_embs, next_token], dim=1)
+            else:
+                input_embs = next_token
+
             attention_mask = torch.cat(
                 [
                     attention_mask,
-                    torch.ones_like(token_id, dtype=torch.bool).unsqueeze(-1),
+                    torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
                 ],
                 dim=1,
             )
