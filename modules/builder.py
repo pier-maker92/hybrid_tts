@@ -87,8 +87,8 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         start_audio_id=tokenizer.start_audio_id,
         end_audio_id=tokenizer.end_audio_id,
         debug=cfg_dict.get("debug", False),
-        uncond_prob=training_cfg.get("uncond_prob", 0.0),
-        no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
+        uncond_prob=training_cfg.get("uncond_prob"),
+        no_augment_ratio=training_cfg.get("no_augment_ratio"),
         discrete_only=discrete_only,
         shift_audio_offset=shift_audio_offset,
     )

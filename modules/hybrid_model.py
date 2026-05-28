@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HybridTokenizer — decodes what goes into the transformer
+# HybridTokenizer
 # ---------------------------------------------------------------------------
 
 
@@ -272,6 +272,7 @@ class HybridTTS(nn.Module):
         self.config = config
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_id
+        self.uncond_prob = config.uncond_prob
         self.discrete_only = config.discrete_only
         self.end_audio_id = tokenizer.end_audio_id
         self.start_audio_id = tokenizer.start_audio_id
@@ -323,6 +324,7 @@ class HybridTTS(nn.Module):
             self.diffusion_head = DiT(config.diffusion_head_config)
         else:
             self.diffusion_head = None
+        # NOTE we use tie embeddings instead of a separate head
         # self.token_head = nn.Linear(
         #     hidden_size,
         #     self.unified_vocab_size,
@@ -423,7 +425,7 @@ class HybridTTS(nn.Module):
             * target_std
         )
 
-        if getattr(self.config, "no_augment_ratio", 0.0) > 0.0:
+        if getattr(self.config, "no_augment_ratio") > 0.0:
             # Randomly select a portion of the batch to NOT be augmented (std=0)
             B = continuous_tokens.shape[0]
             keep_mask = (
@@ -438,6 +440,38 @@ class HybridTTS(nn.Module):
             padding_mask.unsqueeze(-1), 0.0
         )
         return corrupted_continuous_tokens
+
+    def uncondition(
+        self, discrete_sequence: torch.LongTensor, attention_mask: torch.BoolTensor
+    ):
+        start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
+        # --- Unconditional training: drop prompts randomly ---
+        if self.training and getattr(self, "uncond_prob") > 0.0:
+            B, L = discrete_sequence.shape
+            drop_mask = (
+                torch.rand(B, device=discrete_sequence.device) < self.uncond_prob
+            )
+
+            if drop_mask.any():
+                new_discrete = discrete_sequence.clone()
+                new_attention = attention_mask.clone()
+
+                for b in range(B):
+                    if drop_mask[b]:
+                        s_idx = start_idx[b].item()
+                        if s_idx > 0:
+                            keep_len = L - s_idx
+                            # Shift tokens and attention mask to the left
+                            new_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
+                            new_discrete[b, keep_len:] = self.pad_token_id
+
+                            new_attention[b, :keep_len] = attention_mask[b, s_idx:]
+                            new_attention[b, keep_len:] = False
+
+                discrete_sequence = new_discrete
+                attention_mask = new_attention
+
+            return discrete_sequence, attention_mask
 
     # -------------------------------------------------------------------------
     # Forward
@@ -460,6 +494,9 @@ class HybridTTS(nn.Module):
             continuous_sequence: (B, L_audio, C) continuous tokens
             audio_padding_mask: (B, L_audio) False = valid, True = pad
         """
+        discrete_sequence, attention_mask = self.uncondition(
+            discrete_sequence, attention_mask
+        )
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         embed_layer = self.backbone.get_input_embeddings()
         input_embs = embed_layer(discrete_sequence)
@@ -481,19 +518,11 @@ class HybridTTS(nn.Module):
                 attention_mask=attention_mask,
             )
 
-        if self.config.backbone_config.model_type == "native":
-            last_hidden_state = self.backbone(
-                inputs_embeds=input_embs,
-                attention_mask=attention_mask,
-            )
-        else:
-            outputs = self.backbone(
-                inputs_embeds=input_embs,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            last_hidden_state = outputs.hidden_states[-1]
+        last_hidden_state = self.backbone(
+            inputs_embeds=input_embs,
+            attention_mask=attention_mask,
+        )
+
         audio_hidden_states = self._extract_audio_hidden_states(
             last_hidden_state,
             start_idx,
@@ -523,11 +552,7 @@ class HybridTTS(nn.Module):
         else:
             diffusion_loss = None
 
-        return HybridTTSOutput(
-            token_logits=token_logits,
-            diffusion_loss=diffusion_loss,
-            continuous_ratio=None,
-        )
+        return HybridTTSOutput(token_logits=token_logits, diffusion_loss=diffusion_loss)
 
     # -------------------------------------------------------------------------
     # Evaluation / inference helper
@@ -567,7 +592,31 @@ class HybridTTS(nn.Module):
         all_discrete_tokens = []
 
         max_steps = kwargs.get("max_steps", 250)
-        input_embs = embed_layer(discrete_sequence)
+
+        do_cfg = kwargs.get("guidance_scale", 1.0) > 1.0
+        B_orig, L = discrete_sequence.shape
+
+        if do_cfg:
+            start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
+            uncond_discrete = discrete_sequence.clone()
+            uncond_mask = attention_mask.clone()
+
+            for b in range(B_orig):
+                s_idx = start_idx[b].item()
+                if s_idx > 0:
+                    keep_len = L - s_idx
+                    uncond_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
+                    uncond_discrete[b, keep_len:] = self.pad_token_id
+
+                    uncond_mask[b, :keep_len] = attention_mask[b, s_idx:]
+                    uncond_mask[b, keep_len:] = False
+
+            uncond_embs = embed_layer(uncond_discrete)
+            input_embs = embed_layer(discrete_sequence)
+            input_embs = torch.cat([input_embs, uncond_embs], dim=0)
+            attention_mask = torch.cat([attention_mask, uncond_mask], dim=0)
+        else:
+            input_embs = embed_layer(discrete_sequence)
 
         discrete_only = getattr(self.config, "discrete_only", False)
 
@@ -585,7 +634,30 @@ class HybridTTS(nn.Module):
             target_embed_weight = self.backbone.get_output_embeddings().weight[
                 self.end_audio_id :
             ]
-            token_logits = F.linear(last_hidden_state.squeeze(1), target_embed_weight)
+
+            if do_cfg:
+                cond_hidden = last_hidden_state[:B_orig]
+                uncond_hidden = last_hidden_state[B_orig:]
+
+                token_logits_cond = F.linear(
+                    cond_hidden.squeeze(1), target_embed_weight
+                )
+                token_logits_uncond = F.linear(
+                    uncond_hidden.squeeze(1), target_embed_weight
+                )
+
+                cfg_scale = kwargs.get("guidance_scale")
+                token_logits = token_logits_uncond + cfg_scale * (
+                    token_logits_cond - token_logits_uncond
+                )
+
+                diffusion_context = (cond_hidden, uncond_hidden)
+            else:
+                token_logits = F.linear(
+                    last_hidden_state.squeeze(1), target_embed_weight
+                )
+                diffusion_context = last_hidden_state
+
             sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
 
             if (sampled_id == 0).all():
@@ -600,15 +672,37 @@ class HybridTTS(nn.Module):
             else:
                 generated_continuous_tokens = self.diffusion_head.generate(
                     num_steps=kwargs.get("num_steps"),
-                    context_vector=last_hidden_state,
+                    context_vector=diffusion_context,
                     temperature=kwargs.get("diffusion_temperature"),
                     guidance_scale=kwargs.get("guidance_scale"),
                 ).audio_features
 
                 all_continuous_tokens.append(generated_continuous_tokens)
-
-                next_token = embed_layer(token_id).unsqueeze(1) + self.norm_continuous(
+                generated_continuous_tokens = self.norm_continuous(
                     self.continuous_adapter(generated_continuous_tokens)
+                ).detach()
+
+                # generated_continuous_tokens = (
+                #     generated_continuous_tokens
+                #     + torch.randn_like(generated_continuous_tokens) * 0.0
+                # )
+
+                next_token = (
+                    embed_layer(token_id).unsqueeze(1) + generated_continuous_tokens
+                )
+
+            if do_cfg:
+                next_token = next_token.repeat(2, 1, 1)
+                sampled_mask = torch.cat(
+                    [
+                        torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
+                        torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
+                    ],
+                    dim=0,
+                )
+            else:
+                sampled_mask = torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(
+                    -1
                 )
 
             if self.config.backbone_config.model_type == "native":
@@ -619,7 +713,7 @@ class HybridTTS(nn.Module):
             attention_mask = torch.cat(
                 [
                     attention_mask,
-                    torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
+                    sampled_mask,
                 ],
                 dim=1,
             )

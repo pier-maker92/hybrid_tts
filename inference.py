@@ -219,6 +219,7 @@ def main():
         help="Temperature for the CFM diffusion head (default: 0.2)",
     )
     parser.add_argument(
+        "-dg",
         "--guidance_scale",
         type=float,
         default=1.0,

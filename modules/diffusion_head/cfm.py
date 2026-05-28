@@ -220,7 +220,7 @@ class DiT(torch.nn.Module):
     def generate(
         self,
         num_steps: int,
-        context_vector: torch.FloatTensor,
+        context_vector,
         temperature: float = 1.0,
         guidance_scale: float = 1.0,
         generator: Optional[torch.Generator] = None,
@@ -228,18 +228,37 @@ class DiT(torch.nn.Module):
         **kwargs,
     ):
         cfg_scale = guidance_scale
+        
+        if isinstance(context_vector, tuple):
+            cond_context, uncond_context = context_vector
+        else:
+            cond_context = context_vector
+            uncond_context = None
+
         # ---- context vector z ----
-        context_vector, y0, upsampled_padding_mask = self.handle_context_vector(
-            context_vector,
+        cond_context, y0, upsampled_padding_mask = self.handle_context_vector(
+            cond_context,
             temperature=temperature,
             generator=generator,
             padding_mask=padding_mask,
         )
-        B, T = context_vector.shape[:2]
+        
+        if uncond_context is not None:
+            uncond_context, _, _ = self.handle_context_vector(
+                uncond_context,
+                temperature=temperature,
+                generator=generator,
+                padding_mask=padding_mask,
+            )
+            context_vector = (cond_context, uncond_context)
+        else:
+            context_vector = cond_context
+
+        B, T = cond_context.shape[:2]
 
         # ---- time span ----
         t_span = torch.linspace(
-            0, 1, num_steps, device=context_vector.device, dtype=context_vector.dtype
+            0, 1, num_steps, device=cond_context.device, dtype=cond_context.dtype
         )
 
         # ---- ODE ----
@@ -272,14 +291,21 @@ class DiT(torch.nn.Module):
         times: torch.FloatTensor,
         state: torch.FloatTensor,
         cfg_scale: float,
-        context_vector: torch.FloatTensor,
+        context_vector,
         attention_mask: Optional[torch.BoolTensor] = None,
     ):
         times = times.repeat(state.shape[0])
         if self.use_mlp_sampler:
             times = self.sinu_pos_emb(times)
             times = rearrange(times, "(b t) h -> b t h", b=state.shape[0])
-        cond_state = self.noise_proj(torch.cat([context_vector, state], dim=-1))
+            
+        if isinstance(context_vector, tuple):
+            cond_context, uncond_context = context_vector
+        else:
+            cond_context = context_vector
+            uncond_context = None
+
+        cond_state = self.noise_proj(torch.cat([cond_context, state], dim=-1))
         gs = self._group_size
         cond_out = self.net(
             x=cond_state,
@@ -290,9 +316,15 @@ class DiT(torch.nn.Module):
         if cfg_scale == 1.0:
             return cond_out
 
-        uncond_state = self.noise_proj(
-            torch.cat([torch.zeros_like(context_vector), state], dim=-1)
-        )
+        if uncond_context is not None:
+            uncond_state = self.noise_proj(
+                torch.cat([uncond_context, state], dim=-1)
+            )
+        else:
+            uncond_state = self.noise_proj(
+                torch.cat([torch.zeros_like(cond_context), state], dim=-1)
+            )
+            
         uncond_out = self.net(
             x=uncond_state,
             times=times,
@@ -301,7 +333,7 @@ class DiT(torch.nn.Module):
         )
 
         final = (cfg_scale * cond_out + (1 - cfg_scale) * uncond_out).to(
-            context_vector.dtype
+            cond_context.dtype
         )
 
         return final

@@ -198,7 +198,6 @@ class HybridTTSTrainer(Trainer):
         granular_losses = [
             "token_loss",
             "diffusion_loss",
-            "continuous_ratio",
         ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
 
@@ -300,11 +299,6 @@ class HybridTTSTrainer(Trainer):
             flat_metrics = {
                 "token_loss": token_loss.detach(),
                 "diffusion_loss": diffusion_loss.detach(),
-                "continuous_ratio": (
-                    outputs.continuous_ratio.detach()
-                    if outputs.continuous_ratio is not None
-                    else torch.tensor(0.0, device=total_loss.device)
-                ),
             }
             for key in self.control.granular_losses:
                 if flat_metrics.get(key) is not None:
@@ -330,6 +324,7 @@ class HybridTTSTrainer(Trainer):
                 tensor_val.zero_()
 
             original_log = self.log
+
             def patched_log(logs, *log_args, **log_kwargs):
                 logs.update(logs_to_add)
                 original_log(logs, *log_args, **log_kwargs)
