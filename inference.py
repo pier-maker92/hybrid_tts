@@ -27,48 +27,6 @@ from modules.submodules.MelCausalVAE.modules.builder import build_model as build
 from util import build_tokenizer
 
 
-def load_hybrid_config(
-    config_dir: str = "configs", setting_name: str = "setting-1"
-) -> Dict[str, Any]:
-    """Loads and merges the default and setting-specific yaml configurations."""
-    main_path = os.path.join(config_dir, "main.yaml")
-    if not os.path.exists(main_path):
-        raise FileNotFoundError(f"Main config not found at {main_path}")
-
-    main_cfg = OmegaConf.load(main_path)
-
-    # Load default components manually to simulate Hydra composition in standard python
-    train_defaults = OmegaConf.load(os.path.join(config_dir, "defaults", "train.yaml"))
-    backbone_defaults = OmegaConf.load(
-        os.path.join(config_dir, "defaults", "backbone.yaml")
-    )
-    diff_defaults = OmegaConf.load(
-        os.path.join(config_dir, "defaults", "diffusion_head.yaml")
-    )
-
-    merged_cfg = OmegaConf.create()
-    merged_cfg = OmegaConf.merge(merged_cfg, train_defaults)
-    merged_cfg = OmegaConf.merge(merged_cfg, backbone_defaults)
-    merged_cfg = OmegaConf.merge(merged_cfg, diff_defaults)
-    merged_cfg = OmegaConf.merge(merged_cfg, main_cfg)
-
-    # Load setting specific experiment config if it exists
-    if setting_name:
-        setting_path = os.path.join(
-            config_dir, "settings", "exps", f"{setting_name}.yaml"
-        )
-        if os.path.exists(setting_path):
-            logger.info(f"Merging experiment settings from {setting_path}")
-            setting_cfg = OmegaConf.load(setting_path)
-            merged_cfg = OmegaConf.merge(merged_cfg, setting_cfg)
-        else:
-            logger.warning(
-                f"Experiment settings file {setting_path} not found. Using defaults."
-            )
-
-    return OmegaConf.to_container(merged_cfg, resolve=True)
-
-
 def load_vae(
     checkpoint_dir: str, device: torch.device, dtype: torch.dtype
 ) -> Optional[torch.nn.Module]:
@@ -195,13 +153,7 @@ def main():
         "--hybrid_checkpoint",
         type=str,
         required=True,
-        help="Path to the HybridTTS checkpoint directory or weights file (model.safetensors / model.pt)",
-    )
-    parser.add_argument(
-        "--vae_checkpoint",
-        type=str,
-        required=True,
-        help="Path to the MelCausalVAE checkpoint directory",
+        help="Path to the HybridTTS checkpoint directory",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -229,12 +181,7 @@ def main():
         default="vocos",
         help="Vocoder type or HuggingFace checkpoint name (default: vocos -> charactr/vocos-mel-24khz)",
     )
-    parser.add_argument(
-        "--setting",
-        type=str,
-        default="2",
-        help="Experiment setting config name under configs/settings/exps/ (default: setting-1)",
-    )
+
     parser.add_argument(
         "--device",
         type=str,
@@ -314,10 +261,24 @@ def main():
 
     logger.info(f"Using device: {device}")
 
-    # Load configuration
-    logger.info(f"Loading HybridTTS configuration for '{args.setting}'...")
-    cfg_dict = load_hybrid_config(setting_name=args.setting)
+    # Resolve SCRATCH environment variable
+    scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
 
+    # Load configuration
+    config_path = os.path.join(args.hybrid_checkpoint, "config.json")
+    if not os.path.exists(config_path):
+        logger.error(f"Config file not found at {config_path}")
+        sys.exit(1)
+
+    logger.info(f"Loading HybridTTS configuration from {config_path}...")
+    with open(config_path, "r") as f:
+        cfg_dict = json.load(f)
+
+    # Resolve vae_checkpoint path
+    if cfg_dict.get("vae_checkpoint"):
+        cfg_dict["vae_checkpoint"] = cfg_dict["vae_checkpoint"].replace(
+            "$SCRATCH", scratch_dir
+        )
     # Determine appropriate precision (dtype) for stability on MPS/CPU
     if device.type == "mps":
         # Force float32 on MPS because bfloat16/float16 support is unstable/incomplete in many MPS kernels
@@ -349,14 +310,13 @@ def main():
 
     # Build tokenizer first as the single source of truth
     logger.info("Building tokenizer...")
-    cfg_dict["vae_checkpoint"] = args.vae_checkpoint
     tok = build_tokenizer(cfg_dict, pretrinaed=False)
 
     logger.info("Loading models...")
     hybrid_model = load_hybrid_model(
         cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok
     )
-    vae = load_vae(args.vae_checkpoint, device, dtype)
+    vae = load_vae(cfg_dict["vae_checkpoint"], device, dtype)
     if vae is None:
         logger.error("Could not load VAE model.")
         sys.exit(1)
@@ -453,7 +413,7 @@ def main():
         reconstructed_mel, reconstructed_padding_mask = vae.sample(
             num_steps=16,
             temperature=0.2,
-            guidance_scale=1.4,
+            guidance_scale=1.0,
             z=z_vae,
             padding_mask=padding_mask,
         )
