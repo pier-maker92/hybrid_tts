@@ -52,25 +52,6 @@ class AddGranularLossesToTrainerState(TrainerCallback):
         return control
 
 
-class ShuffleDatasetCallback(TrainerCallback):
-    def on_epoch_begin(
-        self,
-        args: TrainingArguments,
-        state: TrainerState,
-        control: TrainerControl,
-        **kwargs,
-    ):
-        train_dataloader = kwargs.get("train_dataloader")
-        if train_dataloader is not None and hasattr(
-            train_dataloader.dataset, "dataset"
-        ):
-            epoch = int(state.epoch) if state.epoch is not None else 0
-            train_dataloader.dataset.dataset = train_dataloader.dataset.dataset.shuffle(
-                seed=epoch
-            )
-            logger.info(
-                f"Explicitly shuffled underlying HuggingFace dataset for epoch {epoch}."
-            )
 
 
 def load_vae(checkpoint_dir: str, device: torch.device):
@@ -200,6 +181,20 @@ class HybridTTSTrainer(Trainer):
             "diffusion_loss",
         ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
+
+    def get_train_dataloader(self) -> DataLoader:
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+            
+        logger.info("Custom get_train_dataloader called. Enforcing shuffle=True.")
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            shuffle=True,
+        )
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if optimizer is None:
@@ -452,7 +447,7 @@ def main(cfg: DictConfig):
             "EvaluationCallback registered (VAE/Vocoder will be loaded lazily at eval time)."
         )
 
-    trainer.add_callback(ShuffleDatasetCallback())
+
 
     logger.info("Starting training...")
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)

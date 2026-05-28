@@ -411,7 +411,7 @@ class HybridTTS(nn.Module):
         self,
         continuous_tokens: torch.FloatTensor,
         padding_mask: torch.BoolTensor,
-        target_std: float = 1.0,
+        target_std: float = 0.1,
     ):
         """Add Gaussian noise to continuous tokens."""
         std = (
