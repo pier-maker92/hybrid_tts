@@ -125,6 +125,71 @@ class MLPAdapter(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class CausalLMWrapper(nn.Module):
+    def __init__(self, model_name: str, unified_vocab_size: int, pad_token_id: int):
+        super().__init__()
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        if model_name == "qwen-0.5b":
+            hf_config = AutoConfig.from_pretrained("Qwen/Qwen2-0.5B")
+        elif model_name == "llama-1b":
+            hf_config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")
+        else:
+            raise ValueError(f"Unknown model_type: {model_name}")
+
+        hf_config.vocab_size = unified_vocab_size
+        hf_config.pad_token_id = pad_token_id
+        self.model = AutoModelForCausalLM.from_config(hf_config)
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def get_output_embeddings(self):
+        return self.model.get_output_embeddings()
+
+    def forward(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: torch.LongTensor,
+        **kwargs,
+    ):
+        input_dict = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+
+        # deal with the extra args that are passed by the sample function
+        for arg_name in ["past_key_values", "use_cache", "position_ids"]:
+            if arg_name in kwargs:
+                input_dict[arg_name] = kwargs[arg_name]
+
+        # forward pass
+        outputs = self.model(**input_dict)
+        return outputs.hidden_states[-1]
+
+    def inference_forward(self, inputs_embeds, attention_mask=None, **kwargs):
+        input_dict = {
+            "inputs_embeds": inputs_embeds,
+            "attention_mask": attention_mask,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+
+        # deal with the extra args that are passed by the sample function
+        for arg_name in ["past_key_values", "use_cache", "position_ids"]:
+            if arg_name in kwargs:
+                input_dict[arg_name] = kwargs[arg_name]
+
+        # forward pass
+        outputs = self.model(**input_dict)
+        hidden_states = outputs.hidden_states[-1][:, -1:, :]
+        past_key_values = outputs.past_key_values
+
+        return hidden_states, past_key_values
+
+
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -181,6 +246,11 @@ class Transformer(nn.Module):
         )
         return self.norm(out)
 
+    def inference_forward(self, inputs_embeds, attention_mask=None, **kwargs):
+        out = self(inputs_embeds, attention_mask, **kwargs)
+        past_key_value = None
+        return out[:, -1, :], past_key_value
+
 
 # ---------------------------------------------------------------------------
 # HybridTTS
@@ -231,20 +301,10 @@ class HybridTTS(nn.Module):
                 raise NotImplementedError(
                     "Fine-tuning from_pretrained is not yet implemented. Focus is on training from scratch."
                 )
-            from transformers import AutoConfig, AutoModelForCausalLM
-
-            if bb_cfg.model_type == "qwen-0.5b":
-                hf_config = AutoConfig.from_pretrained("Qwen/Qwen2-0.5B")
-            elif bb_cfg.model_type == "llama-1b":
-                hf_config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")
-            else:
-                raise ValueError(f"Unknown model_type: {bb_cfg.model_type}")
-
-            hf_config.vocab_size = self.unified_vocab_size
-            hf_config.pad_token_id = self.pad_token_id
-
-            self.backbone = AutoModelForCausalLM.from_config(hf_config)
-            hidden_size = hf_config.hidden_size
+            self.backbone = CausalLMWrapper(
+                bb_cfg.model_type, self.unified_vocab_size, self.pad_token_id
+            )
+            hidden_size = self.backbone.model.config.hidden_size
 
         self.config.apply_backbone_dims(hidden_size)
 
@@ -515,24 +575,12 @@ class HybridTTS(nn.Module):
 
         for step in tqdm(range(max_steps)):
 
-            if self.config.backbone_config.model_type == "native":
-                last_hidden_state = self.backbone(
-                    inputs_embeds=input_embs,
-                    attention_mask=attention_mask,
-                )[
-                    :, -1:
-                ]  # (B, 1, H)
-            else:
-                outputs = self.backbone(
-                    inputs_embeds=input_embs,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=True,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                last_hidden_state = outputs.hidden_states[-1][:, -1:]  # (B, 1, H)
-                past_key_values = outputs.past_key_values
+            last_hidden_state, past_key_values = self.backbone.inference_forward(
+                inputs_embeds=input_embs,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
 
             target_embed_weight = self.backbone.get_output_embeddings().weight[
                 self.end_audio_id :

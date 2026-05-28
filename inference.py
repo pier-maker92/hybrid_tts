@@ -103,6 +103,18 @@ def load_hybrid_model(
     else:
         state_dict = torch.load(checkpoint_file, map_location="cpu")
 
+    # Retrocompatibility for CausalLMWrapper refactoring #FIXME this is supposed to be removed in the future
+    model_state_keys = set(model.state_dict().keys())
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k not in model_state_keys and k.startswith("backbone."):
+            alt_k = k.replace("backbone.", "backbone.model.", 1)
+            if alt_k in model_state_keys:
+                new_state_dict[alt_k] = v
+                continue
+        new_state_dict[k] = v
+    state_dict = new_state_dict
+
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     model.to(device=device, dtype=dtype)
