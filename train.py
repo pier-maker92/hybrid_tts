@@ -355,6 +355,14 @@ class HybridTTSTrainer(Trainer):
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    # Resolve SCRATCH environment variable
+    scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
+    if cfg_dict.get("vae_checkpoint"):
+        cfg_dict["vae_checkpoint"] = cfg_dict["vae_checkpoint"].replace(
+            "$SCRATCH", scratch_dir
+        )
+
     training_cfg = cfg_dict.get("training")
 
     seed = training_cfg.get("seed") if training_cfg else None
