@@ -1,11 +1,11 @@
 # @package _global_
 backbone:
-  num_layers: 6
-  num_heads: 8
-  hidden_dim: 512
-  ffn_dim: 2048
+  num_layers: null
+  num_heads: null
+  hidden_dim: null
+  ffn_dim: null
   dropout: 0.1
-  max_position_embeddings: 8192
+  max_position_embeddings: null
   from_pretrained: false
   shift_audio_offset: 0
   force_weight_tying: false
