@@ -126,7 +126,13 @@ class MLPAdapter(nn.Module):
 
 
 class CausalLMWrapper(nn.Module):
-    def __init__(self, model_name: str, unified_vocab_size: int, pad_token_id: int):
+    def __init__(
+        self,
+        model_name: str,
+        unified_vocab_size: int,
+        pad_token_id: int,
+        tie_word_embeddings: bool,
+    ):
         super().__init__()
         from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -139,7 +145,11 @@ class CausalLMWrapper(nn.Module):
 
         hf_config.vocab_size = unified_vocab_size
         hf_config.pad_token_id = pad_token_id
+        hf_config.tie_word_embeddings = tie_word_embeddings
         self.model = AutoModelForCausalLM.from_config(hf_config)
+
+        if not tie_word_embeddings:
+            self.model.lm_head = nn.Identity()
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -303,7 +313,10 @@ class HybridTTS(nn.Module):
                     "Fine-tuning from_pretrained is not yet implemented. Focus is on training from scratch."
                 )
             self.backbone = CausalLMWrapper(
-                bb_cfg.model_type, self.unified_vocab_size, self.pad_token_id
+                bb_cfg.model_type,
+                self.unified_vocab_size,
+                self.pad_token_id,
+                tie_word_embeddings=self.discrete_only or bb_cfg.force_weight_tying,
             )
             hidden_size = self.backbone.model.config.hidden_size
 
@@ -324,12 +337,19 @@ class HybridTTS(nn.Module):
             self.diffusion_head = DiT(config.diffusion_head_config)
         else:
             self.diffusion_head = None
-        # NOTE we use tie embeddings instead of a separate head
-        # self.token_head = nn.Linear(
-        #     hidden_size,
-        #     self.unified_vocab_size,
-        #     bias=False,
-        # )
+
+        # NOTE: weight tying is enabled only in discrete-only mode, since tying
+        # constrains the hidden states to align with the discrete token embedding
+        # space, potentially reducing the richness needed for continuous/acoustic
+        # conditioning when predicting both discrete and continuous features.
+        if not self.discrete_only and not bb_cfg.force_weight_tying:
+            self.token_head = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.SiLU(),
+                nn.Linear(
+                    hidden_size, self.discrete_token_vocab_size + 1, bias=False
+                ),  # Vq tokens + audio EOS
+            )
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -473,6 +493,19 @@ class HybridTTS(nn.Module):
 
             return discrete_sequence, attention_mask
 
+    def get_token_logits(self, tokens_hidden_states: torch.FloatTensor):
+        """
+        Get token logits from the backbone.
+        """
+        # token head
+        if hasattr(self, "token_head"):
+            return self.token_head(tokens_hidden_states)
+        else:
+            target_embed_weight = self.backbone.get_output_embeddings().weight[
+                self.end_audio_id :
+            ]
+            return F.linear(tokens_hidden_states, target_embed_weight)
+
     # -------------------------------------------------------------------------
     # Forward
     # -------------------------------------------------------------------------
@@ -529,18 +562,15 @@ class HybridTTS(nn.Module):
             end_idx,
         )
 
-        # token logits
-        target_embed_weight = self.backbone.get_output_embeddings().weight[
-            self.end_audio_id :
-        ]
-
+        # tokens
         if self.shift_audio_offset:
-            token_logits = F.linear(
-                audio_hidden_states[:, : -self.shift_audio_offset], target_embed_weight
-            )
+            tokens_hidden_states = audio_hidden_states[:, : -self.shift_audio_offset, :]
         else:
-            token_logits = F.linear(audio_hidden_states, target_embed_weight)
-        # diffuion loss
+            tokens_hidden_states = audio_hidden_states
+        token_logits = self.get_token_logits(tokens_hidden_states)
+
+        # continuous features
+        diffusion_loss = None
         if continuous_sequence is not None and self.diffusion_head is not None:
             diffusion_loss = self.diffusion_head(
                 target=continuous_sequence,
@@ -549,8 +579,6 @@ class HybridTTS(nn.Module):
                     :, self.shift_audio_offset : -1
                 ],  # we stop at last audio frame
             ).loss
-        else:
-            diffusion_loss = None
 
         return HybridTTSOutput(token_logits=token_logits, diffusion_loss=diffusion_loss)
 
@@ -631,36 +659,38 @@ class HybridTTS(nn.Module):
                 use_cache=True,
             )
 
-            target_embed_weight = self.backbone.get_output_embeddings().weight[
-                self.end_audio_id :
-            ]
-
             if do_cfg:
                 cond_hidden = last_hidden_state[:B_orig]
                 uncond_hidden = last_hidden_state[B_orig:]
 
-                token_logits_cond = F.linear(
-                    cond_hidden.squeeze(1), target_embed_weight
-                )
-                token_logits_uncond = F.linear(
-                    uncond_hidden.squeeze(1), target_embed_weight
-                )
-
-                cfg_scale = kwargs.get("guidance_scale")
-                token_logits = token_logits_uncond + cfg_scale * (
-                    token_logits_cond - token_logits_uncond
-                )
-
+                token_logits = self.get_token_logits(cond_hidden.squeeze(1))
                 diffusion_context = (cond_hidden, uncond_hidden)
             else:
-                token_logits = F.linear(
-                    last_hidden_state.squeeze(1), target_embed_weight
-                )
+                token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
                 diffusion_context = last_hidden_state
 
             sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
+            is_end = (sampled_id == 0).all()
 
-            if (sampled_id == 0).all():
+            if not (discrete_only or self.diffusion_head is None):
+                if step >= self.shift_audio_offset and (
+                    not is_end or self.shift_audio_offset > 0
+                ):
+                    generated_continuous_tokens = self.diffusion_head.generate(
+                        num_steps=kwargs.get("num_steps"),
+                        context_vector=diffusion_context,
+                        temperature=kwargs.get("diffusion_temperature"),
+                        guidance_scale=kwargs.get("guidance_scale"),
+                    ).audio_features
+
+                    all_continuous_tokens.append(generated_continuous_tokens)
+                    generated_continuous_tokens = self.norm_continuous(
+                        self.continuous_adapter(generated_continuous_tokens)
+                    ).detach()
+                else:
+                    generated_continuous_tokens = 0.0
+
+            if is_end:
                 break
 
             token_id = sampled_id - 1 + self.tokenizer.prompt_vocab_size
@@ -670,23 +700,6 @@ class HybridTTS(nn.Module):
             if discrete_only or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
-                generated_continuous_tokens = self.diffusion_head.generate(
-                    num_steps=kwargs.get("num_steps"),
-                    context_vector=diffusion_context,
-                    temperature=kwargs.get("diffusion_temperature"),
-                    guidance_scale=kwargs.get("guidance_scale"),
-                ).audio_features
-
-                all_continuous_tokens.append(generated_continuous_tokens)
-                generated_continuous_tokens = self.norm_continuous(
-                    self.continuous_adapter(generated_continuous_tokens)
-                ).detach()
-
-                # generated_continuous_tokens = (
-                #     generated_continuous_tokens
-                #     + torch.randn_like(generated_continuous_tokens) * 0.0
-                # )
-
                 next_token = (
                     embed_layer(token_id).unsqueeze(1) + generated_continuous_tokens
                 )

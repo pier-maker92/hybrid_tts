@@ -22,6 +22,7 @@ class DiTConfig:
 @dataclass(kw_only=True)
 class BackboneConfig:
     model_type: str
+    force_weight_tying: bool
     ffn_dim: Optional[int] = None
     dropout: Optional[float] = None
     num_heads: Optional[int] = None

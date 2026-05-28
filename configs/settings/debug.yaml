@@ -7,7 +7,7 @@ training:
   gradient_accumulation_steps: 2
   logging_steps: 1
   # report
-  report_to: wandb
+  report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: debug-lj_speech_512-token_and_features-shift
   run_id: ""
@@ -33,6 +33,7 @@ backbone:
   model_type: "qwen-0.5b"
   from_pretrained: false
   shift_audio_offset: 1
+  force_weight_tying: false
   # num_layers: 4
   # num_heads: 8
   # hidden_dim: 512
