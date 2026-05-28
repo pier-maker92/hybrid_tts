@@ -174,6 +174,7 @@ class HybridTTSTrainer(Trainer):
             eval_num_samples if eval_num_samples is not None else float("inf")
         )
         self.min_learning_rate = kwargs.pop("min_learning_rate", 0.0)
+        self.cfg_dict = kwargs.pop("cfg_dict", None)
         super().__init__(**kwargs)
         self.dataset_name = dataset_name
         granular_losses = [
@@ -337,19 +338,33 @@ class HybridTTSTrainer(Trainer):
             state_dict = self.model.state_dict()
 
         # Safetensors does not support saving shared tensors.
-        # Since backbone.lm_head.weight is tied to backbone.model.embed_tokens.weight,
+        # Since backbone.model.lm_head.weight is tied to backbone.model.model.embed_tokens.weight,
         # we clone one of them to prevent the RuntimeError during save_file.
-        if "backbone.lm_head.weight" in state_dict:
+        if "backbone.model.lm_head.weight" in state_dict:
+            state_dict["backbone.model.lm_head.weight"] = state_dict[
+                "backbone.model.lm_head.weight"
+            ].clone()
+        elif "backbone.lm_head.weight" in state_dict:
             state_dict["backbone.lm_head.weight"] = state_dict[
                 "backbone.lm_head.weight"
             ].clone()
 
         super()._save(output_dir, state_dict)
 
+        # Save config
+        if getattr(self, "cfg_dict", None) is not None:
+            save_dir = output_dir if output_dir is not None else self.args.output_dir
+            if save_dir is not None:
+                os.makedirs(save_dir, exist_ok=True)
+                config_path = os.path.join(save_dir, "config.json")
+                with open(config_path, "w") as f:
+                    json.dump(self.cfg_dict, f, indent=4)
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+    cfg_dict_to_save = json.loads(json.dumps(cfg_dict))
 
     # Resolve SCRATCH environment variable
     scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
@@ -422,6 +437,7 @@ def main(cfg: DictConfig):
         dataset_name=dataset_name,
         eval_num_samples=eval_num_samples,
         min_learning_rate=min_learning_rate,
+        cfg_dict=cfg_dict_to_save,
     )
 
     # Optional: Register EvaluationCallback with checkpoint paths (VAE/Vocoder loaded lazily).

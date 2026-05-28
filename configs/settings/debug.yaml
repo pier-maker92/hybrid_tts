@@ -1,9 +1,9 @@
 # @package _global_
 training:
-  dataset_name: lj_speech_512
-  output_dir: checkpoints/exps/debug-lj_speech_512-token_and_features-shift
+  dataset_name: librispeech-aligned #TODO this is handled with hardcoding, refactor in future
+  output_dir: checkpoints/exps/debug-token_and_features-shift
 
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 2
   gradient_accumulation_steps: 2
   logging_steps: 1
   # report
@@ -15,7 +15,7 @@ training:
   # eval
   eval_strategy: "no"
   eval_steps: null
-  save_steps: 1000
+  save_steps: 10
   eval_num_samples: 4
   num_train_epochs: 100
   # lr
@@ -24,8 +24,8 @@ training:
   lr_scheduler_type: "cosine"   
   warmup_ratio: 0.05         
   # cfg
-  uncond_prob: 0.0
-  no_augment_ratio: 0.1
+  uncond_prob: 0.5
+  no_augment_ratio: 0.8
   discrete_only: false
   # use_cpu: false
 
@@ -50,6 +50,6 @@ continuous_adapter:
   hidden_dim: 256
   num_layers: 2   # Crea 2 strati nascosti + strato di output
 
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set10_512"
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/exps/set10_512"
 vocoder_checkpoint: "vocos"
 debug: false
