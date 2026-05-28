@@ -2,7 +2,7 @@
 training:
   dataset_name: lj_speech_10_128
   output_dir: checkpoints/exps/lj-token_and_feat-128
-  per_device_train_batch_size: 12
+  per_device_train_batch_size: 16
   gradient_accumulation_steps: 1
   logging_steps: 1
   save_total_limit: 2
@@ -24,15 +24,15 @@ training:
   lr_scheduler_type: "cosine"   
   warmup_ratio: 0.05         
   # cfg
-  uncond_prob: 0.0
-  no_augment_ratio: 0.1
+  uncond_prob: 0.1
+  no_augment_ratio: 0.75
   discrete_only: false
   group_by_length: false
 
 backbone:
   model_type: "qwen-0.5b"
   from_pretrained: false
-  shift_audio_offset: 0
+  shift_audio_offset: 1
 
 diffusion_head: 
   net_dim: 512
@@ -44,6 +44,6 @@ continuous_adapter:
   hidden_dim: 256
   num_layers: 2
 
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set10_128/checkpoint-32500"
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/exps/set10_128"
 vocoder_checkpoint: "vocos"
 debug: false

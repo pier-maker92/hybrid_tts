@@ -183,19 +183,7 @@ class HybridTTSTrainer(Trainer):
         ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
 
-    def get_train_dataloader(self) -> DataLoader:
-        if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset.")
-            
-        logger.info("Custom get_train_dataloader called. Enforcing shuffle=True.")
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.args.train_batch_size,
-            collate_fn=self.data_collator,
-            num_workers=self.args.dataloader_num_workers,
-            pin_memory=self.args.dataloader_pin_memory,
-            shuffle=True,
-        )
+
 
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if optimizer is None:
