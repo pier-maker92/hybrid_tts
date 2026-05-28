@@ -1,3 +1,4 @@
+# @package _global_
 diffusion_head:
   sigma: 1e-5
   audio_latent_dim: 64

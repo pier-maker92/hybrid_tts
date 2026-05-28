@@ -27,13 +27,14 @@ training:
   uncond_prob: 0.5
   no_augment_ratio: 0.8
   discrete_only: false
+  group_by_length: false
   # use_cpu: false
 
 backbone:
   model_type: "qwen-0.5b"
   from_pretrained: false
   shift_audio_offset: 1
-  force_weight_tying: false
+  # force_weight_tying: false
   # num_layers: 4
   # num_heads: 8
   # hidden_dim: 512

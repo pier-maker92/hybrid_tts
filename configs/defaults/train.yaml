@@ -1,3 +1,4 @@
+# @package _global_
 training:
   seed: 42
   dataset_name: librispeech_aligned

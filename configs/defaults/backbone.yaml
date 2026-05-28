@@ -1,3 +1,4 @@
+# @package _global_
 backbone:
   num_layers: 6
   num_heads: 8
