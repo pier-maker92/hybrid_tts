@@ -1,15 +1,15 @@
 # @package _global_
 training:
   dataset_name: lj_speech_10_128
-  output_dir: checkpoints/exps/lj-token_and_feat-128
+  output_dir: checkpoints/exps/lj-token_and_feat-128-no-tying
   per_device_train_batch_size: 16
   gradient_accumulation_steps: 1
-  logging_steps: 1
+  logging_steps: 10
   save_total_limit: 2
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj-token_and_feat-128
+  wandb_run_name: lj-token_and_feat-128-no-tying
   run_id: ""
   bf16: true
   # eval
