@@ -427,11 +427,70 @@ class HybridTTS(nn.Module):
         audio_hidden_states[~audio_masks] = pad_embed
         return audio_hidden_states
 
-    def noise_augment_continuous_token(
+    def noise_augment_ode_simulation(
         self,
         continuous_tokens: torch.FloatTensor,
         padding_mask: torch.BoolTensor,
         target_std: float = 0.2,
+        min_ode_steps: int = 1,
+        max_ode_steps: int = 32,
+    ):
+        """Simula l'errore del solver ODE in inferenza in modo efficiente."""
+        B, T, D = continuous_tokens.shape
+        device = continuous_tokens.device
+        dtype = continuous_tokens.dtype
+
+        # 1. Campionamento del numero di step (K) per ogni elemento della batch.
+        # Questo simula il variare del NFE (Number of Function Evaluations).
+        K = torch.randint(
+            min_ode_steps, max_ode_steps + 1, (B, 1, 1), device=device, dtype=dtype
+        )
+
+        # 2. ODE Truncation Error Scaling
+        # L'errore globale di un solver (es. Eulero) scala con delta_t = 1/K.
+        # Normalizziamo in modo che a K=1 si abbia il target_std massimo,
+        # e a K=32 si abbia un rumore quasi nullo.
+        delta_t = 1.0 / K
+        ode_std = target_std * delta_t
+
+        # 3. Autoregressive Exposure Bias Scaling
+        # L'errore cresce man mano che il trasformatore genera nuovi token.
+        time_scale = torch.linspace(0.0, 1.0, steps=T, dtype=dtype, device=device)
+        time_scale = time_scale.view(1, T, 1)
+
+        # Varianza finale effettiva
+        effective_std = ode_std * time_scale
+
+        # 4. Purely Random Brownian Drift (Vettorizzato, NO FOR LOOPS)
+        # Generiamo step di rumore indipendente e li sommiamo cumulativamente.
+        # Questo crea il "drift" spezzettato senza dover calcolare nulla di complesso.
+        noise_steps = torch.randn((B, T, D), dtype=dtype, device=device)
+
+        # cumsum simula la natura cumulativa dell'errore lungo i token
+        correlated_noise = torch.cumsum(noise_steps, dim=1) / (T**0.5)
+
+        # Applichiamo la magnitudo dell'errore ODE
+        noise = correlated_noise * effective_std
+
+        # 5. Masking configurabile
+        if getattr(self.config, "no_augment_ratio", 0.0) > 0.0:
+            keep_mask = (
+                torch.rand(B, 1, 1, device=device) >= self.config.no_augment_ratio
+            )
+            noise = noise * keep_mask.to(dtype)
+
+        corrupted_continuous_tokens = continuous_tokens + noise
+        corrupted_continuous_tokens = corrupted_continuous_tokens.masked_fill(
+            padding_mask.unsqueeze(-1), 0.0
+        )
+
+        return corrupted_continuous_tokens
+
+    def noise_augment_continuous_token(
+        self,
+        continuous_tokens: torch.FloatTensor,
+        padding_mask: torch.BoolTensor,
+        target_std: float = 0.1,
     ):
         """Add Gaussian noise to continuous tokens."""
         std = (
