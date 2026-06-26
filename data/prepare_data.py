@@ -215,7 +215,7 @@ def main():
             continuous_feats_batch = []
 
             with torch.no_grad():
-                features, padding_mask = model.extract_features(audios_srs)
+                features, padding_mask, _, _, _ = model.extract_features(audios_srs)
                 encoder_output = model.encode(features, padding_mask)
                 padding_mask = encoder_output.padding_mask
 
