@@ -9,7 +9,7 @@ training:
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj-token_and_feat-512-no-tying
+  wandb_run_name: lj-token_and_feat-512
   run_id: ""
   bf16: true
   # eval
@@ -25,7 +25,7 @@ training:
   warmup_ratio: 0.05         
   # cfg
   uncond_prob: 0.1
-  no_augment_ratio: 0.75
+  no_augment_ratio: 0.25
   discrete_only: false
   group_by_length: false
 
@@ -33,6 +33,7 @@ backbone:
   model_type: "qwen-0.5b"
   from_pretrained: false
   shift_audio_offset: 1
+  force_weight_tying: false
 
 diffusion_head: 
   net_dim: 512

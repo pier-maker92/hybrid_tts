@@ -343,6 +343,7 @@ class HybridTTS(nn.Module):
         # space, potentially reducing the richness needed for continuous/acoustic
         # conditioning when predicting both discrete and continuous features.
         if not self.discrete_only and not bb_cfg.force_weight_tying:
+            print("initializing token head")
             self.token_head = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
                 nn.SiLU(),
@@ -490,7 +491,7 @@ class HybridTTS(nn.Module):
         self,
         continuous_tokens: torch.FloatTensor,
         padding_mask: torch.BoolTensor,
-        target_std: float = 0.1,
+        target_std: float = 1.0,
     ):
         """Add Gaussian noise to continuous tokens."""
         std = (
@@ -513,8 +514,8 @@ class HybridTTS(nn.Module):
             )
             std = std * keep_mask.to(std.dtype)
 
-        noise = torch.randn_like(continuous_tokens) * std
-        corrupted_continuous_tokens = continuous_tokens + noise
+        noise = torch.randn_like(continuous_tokens)  # * std
+        corrupted_continuous_tokens = continuous_tokens * std + noise * (1 - std)
         corrupted_continuous_tokens = corrupted_continuous_tokens.masked_fill(
             padding_mask.unsqueeze(-1), 0.0
         )
@@ -595,11 +596,11 @@ class HybridTTS(nn.Module):
 
         if continuous_sequence is not None:
             continuous_sequence = self.dynamic_normalizer(continuous_sequence)
-            adapted_c_emb = self.norm_continuous(
-                self.continuous_adapter(continuous_sequence)
+            corrupted_c_seq = self.noise_augment_continuous_token(
+                continuous_sequence.clone(), audio_padding_mask
             )
-            adapted_c_emb = self.noise_augment_continuous_token(
-                adapted_c_emb, audio_padding_mask
+            adapted_c_emb = self.norm_continuous(
+                self.continuous_adapter(corrupted_c_seq)
             )
 
             input_embs = self._add_continuous_token(

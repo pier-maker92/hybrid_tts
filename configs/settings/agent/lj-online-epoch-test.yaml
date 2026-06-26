@@ -1,0 +1,50 @@
+# @package _global_
+# LJ-speech + online VAE encoding, max_train_samples=200 -> ~50 steps/epoch (batch=4).
+# 5 epochs = 250 steps total, crosses 4 epoch boundaries.
+training:
+  dataset_name: lj_speech_online
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 1
+  logging_steps: 5
+  save_total_limit: 1
+  report_to: wandb
+  wandb_project: hybrid_tts
+  wandb_run_name: lj-online-epoch-test
+  run_id: ""
+  bf16: true
+  eval_strategy: "no"
+  eval_steps: null
+  save_steps: 200
+  eval_num_samples: 4
+  num_train_epochs: 5
+  max_steps: -1
+  max_train_samples: 200
+  learning_rate: 3.0e-4
+  min_learning_rate: 1.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  uncond_prob: 0.1
+  no_augment_ratio: 0.25
+  discrete_only: false
+  group_by_length: false
+  dataloader_num_workers: 0
+
+backbone:
+  model_type: "qwen-0.5b"
+  from_pretrained: false
+  shift_audio_offset: 1
+  force_weight_tying: false
+
+diffusion_head:
+  net_dim: 512
+  net_depth: 6
+  uncond_prob: 0.0
+  use_mlp_sampler: true
+
+continuous_adapter:
+  hidden_dim: 256
+  num_layers: 2
+
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/vq-finetune"
+vocoder_checkpoint: "vocos"
+debug: false

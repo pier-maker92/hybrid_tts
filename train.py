@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from modules.builder import build_model
 from omegaconf import DictConfig, OmegaConf
-from data.audio_dataset import DataCollator
+from data.audio_dataset import DataCollator, DataCollatorWithVAE
 from accelerate import InitProcessGroupKwargs
 from modules.hybrid_model import HybridTokenizer
 from util import build_dataset, build_tokenizer, wandb_init
@@ -402,6 +402,12 @@ def main(cfg: DictConfig):
     _ = training_cfg.pop("uncond_prob", 0.0)
     _ = training_cfg.pop("no_augment_ratio", 0.0)
     _ = training_cfg.pop("discrete_only", False)
+    max_train_samples = training_cfg.pop("max_train_samples", None)
+    if max_train_samples is not None:
+        train_dataset = torch.utils.data.Subset(
+            train_dataset, range(min(int(max_train_samples), len(train_dataset)))
+        )
+        logger.info(f"Limiting train dataset to {len(train_dataset)} samples.")
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     run_id = training_cfg.pop("run_id", None)
     resume_from_checkpoint = training_cfg.pop("resume_from_checkpoint", None)
@@ -415,7 +421,26 @@ def main(cfg: DictConfig):
         **training_cfg,
     )
 
-    data_collator = DataCollator(tokenizer=tok)
+    is_online = dataset_name in ["libritts-r", "libritts_r"]
+    if is_online:
+        online_vae_checkpoint = cfg_dict.get("vae_checkpoint")
+        logger.info(f"Online VAE encoding: loading VAE from {online_vae_checkpoint}")
+        # Resolve device directly — accelerator.device may be unavailable after
+        # HuggingFace datasets resets AcceleratorState during build_dataset.
+        online_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        online_vae = load_vae(online_vae_checkpoint, online_device)
+        if online_vae is None:
+            raise RuntimeError("Online VAE encoding requires a valid vae_checkpoint")
+        online_vae = online_vae.float().eval()
+        for p in online_vae.parameters():
+            p.requires_grad_(False)
+        data_collator = DataCollatorWithVAE(
+            tokenizer=tok, vae=online_vae, device=online_device
+        )
+        logger.info("DataCollatorWithVAE ready.")
+    else:
+        data_collator = DataCollator(tokenizer=tok)
+
     trainer = HybridTTSTrainer(
         model=model,
         args=training_args,

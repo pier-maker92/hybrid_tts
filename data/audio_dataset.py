@@ -1,4 +1,5 @@
 import torch
+import torchaudio
 from dataclasses import dataclass
 from typing import Sequence, Dict
 import torchaudio.transforms as T
@@ -226,3 +227,93 @@ class TestDatasetWrapper(SimpleAudioDataset):
     def _process_transcription(self, data_dict, transcription):
         data_dict.update({"transcription": transcription})
         return data_dict
+
+
+# ---------------------------------------------------------------------------
+# Online wrappers (raw audio → DataCollatorWithVAE handles VAE encoding)
+# ---------------------------------------------------------------------------
+
+class OnlineTrainDatasetWrapper(Dataset):
+    """Wraps a SimpleAudioDataset for online VAE encoding.
+    Returns raw audio dicts instead of pre-computed discrete/continuous tokens."""
+
+    def __init__(self, dataset: SimpleAudioDataset, split: str):
+        assert split in ["train", "test"]
+        self.dataset = getattr(dataset, f"{split}_dataset")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        phoneme_ids = data.get("phoneme_ids") or []
+        return {
+            "audio": data["audio"],
+            "phoneme_ids": phoneme_ids,
+            "ids": data.get("id", str(idx)),
+            "transcription": data.get("text_normalized") or data.get("transcript", ""),
+            # dummy for LengthGroupedSampler compatibility
+            "input_ids": [0] * (len(phoneme_ids) + 100),
+        }
+
+
+class OnlineTestDatasetWrapper(OnlineTrainDatasetWrapper):
+    pass
+
+
+class DataCollatorWithVAE:
+    """DataCollator that encodes raw audio through a frozen VAE online,
+    then delegates to DataCollator for sequence building."""
+
+    TARGET_SR = 24000
+
+    def __init__(self, tokenizer, vae, device):
+        self._base = DataCollator(tokenizer)
+        self.vae = vae
+        self.device = device
+
+    @torch.no_grad()
+    def _encode_batch(self, instances):
+        self.vae.eval()  # guard: prevent feature_extractor from updating std/mean statistics
+        audios_srs = []
+        for inst in instances:
+            audio_data = inst["audio"]
+            array = audio_data["array"]
+            sr = audio_data["sampling_rate"]
+            if isinstance(array, list):
+                tensor = torch.tensor(array, dtype=torch.float32)
+            else:
+                tensor = torch.as_tensor(array, dtype=torch.float32)
+            if tensor.dim() > 1:
+                tensor = tensor.squeeze(0)
+            tensor = tensor / (tensor.abs().max() + 1e-8)
+            if sr != self.TARGET_SR:
+                tensor = torchaudio.functional.resample(tensor, sr, self.TARGET_SR)
+            audios_srs.append((tensor.to(self.device), self.TARGET_SR))
+
+        features, padding_mask = self.vae.extract_features(audios_srs)
+        features = features.to(next(self.vae.parameters()).dtype)
+        encoder_output = self.vae.encode(features, padding_mask)
+
+        discrete_list, continuous_list = [], []
+        for i in range(len(instances)):
+            mask = ~encoder_output.padding_mask[i]
+            discrete_list.append(encoder_output.indices[i][mask].cpu().tolist())
+            continuous_list.append(
+                encoder_output.tail[i][mask].float().cpu().tolist()
+            )
+        return discrete_list, continuous_list
+
+    def __call__(self, instances):
+        discrete_list, continuous_list = self._encode_batch(instances)
+        patched = [
+            {
+                "discrete_tokens": discrete_list[i],
+                "continuous_tokens": continuous_list[i],
+                "phoneme_ids": instances[i]["phoneme_ids"],
+                "ids": instances[i]["ids"],
+                "transcription": instances[i].get("transcription"),
+            }
+            for i in range(len(instances))
+        ]
+        return self._base(patched)

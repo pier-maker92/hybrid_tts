@@ -1,9 +1,14 @@
 import os
 import json
 import wandb
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional
 from modules.hybrid_model import HybridTokenizer
-from data.audio_dataset import TrainDatasetWrapper, TestDatasetWrapper
+from data.audio_dataset import (
+    TrainDatasetWrapper,
+    TestDatasetWrapper,
+    OnlineTrainDatasetWrapper,
+    OnlineTestDatasetWrapper,
+)
 
 
 def wandb_init(training_cfg: Dict[str, Any], accelerator):
@@ -48,6 +53,20 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.lj_speech_512 import LJSpeechDataset
 
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
+    elif dataset_name in ["libritts-r", "libritts_r"]:
+        from data.libri_tts_r_online import LibriTTSROnline
+
+        dataset = LibriTTSROnline()
+        train_dataset = OnlineTrainDatasetWrapper(dataset, "train")
+        test_dataset = OnlineTestDatasetWrapper(dataset, "test")
+        return train_dataset, test_dataset, dataset_name
+    elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
+        from data.lj_speech_online import LJSpeechOnlineDataset, LJSpeechOnlineTrain, LJSpeechOnlineTest
+
+        base = LJSpeechOnlineDataset()
+        train_dataset = LJSpeechOnlineTrain(base)
+        test_dataset = LJSpeechOnlineTest(base)
+        return train_dataset, test_dataset, "libritts-r"  # reuse online collator path
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
