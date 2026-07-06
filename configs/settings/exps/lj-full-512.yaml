@@ -1,7 +1,7 @@
 # @package _global_
 training:
   dataset_name: lj_speech_10_512
-  output_dir: checkpoints/exps/lj_mel_chunk_64
+  output_dir: checkpoints/exps/lj_mel_chunk_64/test
   per_device_train_batch_size: 64
   gradient_accumulation_steps: 1
   logging_steps: 10
@@ -9,7 +9,7 @@ training:
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj_mel_chunk_64
+  wandb_run_name: lj_mel_chunk_64/test
   run_id: ""
   bf16: true
   # eval

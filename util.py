@@ -49,7 +49,7 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.lj_speech_128 import LJSpeechDataset
 
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
-    elif dataset_name == "lj_speech_10_512":
+    elif dataset_name in ["lj_speech_10_512", "LJSpeech-1.1_prepared"]:
         from data.lj_speech_512 import LJSpeechDataset
 
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
@@ -61,7 +61,11 @@ def build_dataset(training_cfg: Dict[str, Any]):
         test_dataset = OnlineTestDatasetWrapper(dataset, "test")
         return train_dataset, test_dataset, dataset_name
     elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
-        from data.lj_speech_online import LJSpeechOnlineDataset, LJSpeechOnlineTrain, LJSpeechOnlineTest
+        from data.lj_speech_online import (
+            LJSpeechOnlineDataset,
+            LJSpeechOnlineTrain,
+            LJSpeechOnlineTest,
+        )
 
         base = LJSpeechOnlineDataset()
         train_dataset = LJSpeechOnlineTrain(base)

@@ -128,11 +128,11 @@ class DataCollator(object):
                 ), (  # we have already added the audio_eos token
                     "continuous_tokens and discrete_tokens must have the same length"
                 )
-                if (
-                    len(c_token[0]) == 64
-                ):  # FIXME this is a temprary fix to handle the way I have extracted continuous token from prepare_data.py
-                    # in the future, continuous token will be exactly the tail of the VQ
-                    c_token = [c[32:] for c in c_token]
+                # if (
+                #     len(c_token[0]) == 64
+                # ):  # FIXME this is a temprary fix to handle the way I have extracted continuous token from prepare_data.py
+                #     # in the future, continuous token will be exactly the tail of the VQ
+                #     c_token = [c[32:] for c in c_token]
                 continuous_sequence.append(torch.tensor(c_token))
                 audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
 
@@ -233,6 +233,7 @@ class TestDatasetWrapper(SimpleAudioDataset):
 # Online wrappers (raw audio → DataCollatorWithVAE handles VAE encoding)
 # ---------------------------------------------------------------------------
 
+
 class OnlineTrainDatasetWrapper(Dataset):
     """Wraps a SimpleAudioDataset for online VAE encoding.
     Returns raw audio dicts instead of pre-computed discrete/continuous tokens."""
@@ -299,9 +300,7 @@ class DataCollatorWithVAE:
         for i in range(len(instances)):
             mask = ~encoder_output.padding_mask[i]
             discrete_list.append(encoder_output.indices[i][mask].cpu().tolist())
-            continuous_list.append(
-                encoder_output.tail[i][mask].float().cpu().tolist()
-            )
+            continuous_list.append(encoder_output.tail[i][mask].float().cpu().tolist())
         return discrete_list, continuous_list
 
     def __call__(self, instances):
