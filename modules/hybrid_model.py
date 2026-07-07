@@ -659,9 +659,9 @@ class HybridTTS(nn.Module):
             ).loss
 
         return HybridTTSOutput(
-            token_logits=token_logits, 
+            token_logits=token_logits,
             diffusion_loss=diffusion_loss,
-            norm_ratio=norm_ratio
+            norm_ratio=norm_ratio,
         )
 
     # -------------------------------------------------------------------------
@@ -769,9 +769,11 @@ class HybridTTS(nn.Module):
                     generated_continuous_tokens = self.norm_continuous(
                         self.continuous_adapter(generated_continuous_tokens)
                     ).detach()
-                    
+
                     if getattr(self, "continuous_scale", None) is not None:
-                        generated_continuous_tokens = generated_continuous_tokens * self.continuous_scale
+                        generated_continuous_tokens = (
+                            generated_continuous_tokens * self.continuous_scale
+                        )
                 else:
                     generated_continuous_tokens = 0.0
 
