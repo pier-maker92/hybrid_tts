@@ -3,12 +3,13 @@
 # Verifies pipeline (dataset loading, DataCollator, forward pass, checkpointing) with minimal resources.
 training:
   dataset_name: libritts-r-prepared
+  train_split: "test"
   output_dir: checkpoints/exps/libritts-r-prepared-smoke
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
   logging_steps: 5
   save_total_limit: 1
-  report_to: wandb
+  report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: libritts-r-prepared-smoke
   run_id: ""

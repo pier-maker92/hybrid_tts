@@ -28,6 +28,7 @@ def build_dataset(training_cfg: Dict[str, Any]):
     # Create AudioDataset
     dataset_name = training_cfg.pop("dataset_name")
     force_vocab_build = training_cfg.get("force_vocab_build")
+    train_split = training_cfg.pop("train_split", "train")
 
     if dataset_name == "mls":
         from data.mls import MLSDataset
@@ -57,7 +58,7 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.libri_tts_r_online import LibriTTSROnline
 
         dataset = LibriTTSROnline()
-        train_dataset = OnlineTrainDatasetWrapper(dataset, "train")
+        train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
         test_dataset = OnlineTestDatasetWrapper(dataset, "test")
         return train_dataset, test_dataset, dataset_name
     elif dataset_name in ["libritts-r-prepared", "libritts_r_prepared"]:
@@ -65,7 +66,7 @@ def build_dataset(training_cfg: Dict[str, Any]):
 
         dataset = LibriTTSRPrepared()
         discrete_only = training_cfg.get("discrete_only", False)
-        train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
+        train_dataset = TrainDatasetWrapper(dataset, train_split, discrete_only=discrete_only)
         test_dataset = TrainDatasetWrapper(dataset, "test", discrete_only=discrete_only)
         return train_dataset, test_dataset, dataset_name
     elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
