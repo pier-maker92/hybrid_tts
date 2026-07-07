@@ -91,6 +91,7 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         no_augment_ratio=training_cfg.get("no_augment_ratio"),
         discrete_only=discrete_only,
         shift_audio_offset=shift_audio_offset,
+        continuous_scaling_mode=cfg_dict.get("continuous_scaling_mode"),
     )
 
     return HybridTTS(config=hybrid_config, tokenizer=tokenizer)
