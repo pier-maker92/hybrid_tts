@@ -1,5 +1,7 @@
 import os
 import json
+from tqdm import tqdm
+from collections import defaultdict
 from datasets import load_dataset, concatenate_datasets
 from g2p_en import G2p
 from data.audio_dataset import SimpleAudioDataset
@@ -25,29 +27,56 @@ def _build_phoneme_ids(batch, phoneme_vocab):
 class LibriTTSRPrepared(SimpleAudioDataset):
     """LibriTTS-R pre-prepared dataset (discrete + continuous already extracted)."""
 
-    def __init__(self):
+    def __init__(self, force_vocab_build: bool = False):
         super().__init__()
         vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
-        if not os.path.exists(vocab_path):
-            raise ValueError(f"Phoneme vocab not found at {vocab_path}")
-        with open(vocab_path) as f:
-            self.phoneme_vocab = json.load(f)
 
         dataset = load_dataset("parquet", data_dir=parquet_dir)
 
-        train_parts, test_parts = [], []
+        # Organize partitions by destination (train/test)
+        partitions_per_destination = defaultdict(list)
         for partition in dataset:
-            dest = "train" if partition == "train" else "test"
-            ds = dataset[partition].map(
+            dest = "train" if "train" in partition else "test"
+            partitions_per_destination[dest].append(dataset[partition])
+
+        # --- Phoneme vocabulary: load or build ---
+        self.phoneme_vocab = {}
+
+        if not force_vocab_build and os.path.exists(vocab_path):
+            with open(vocab_path, "r") as f:
+                self.phoneme_vocab = json.load(f)
+            if self.phoneme_vocab:
+                print(
+                    f"Loaded existing phoneme vocabulary from {vocab_path} "
+                    f"(size: {len(self.phoneme_vocab)})"
+                )
+
+        if not self.phoneme_vocab:
+            print("Building phoneme vocabulary...")
+            g2p = G2p()
+            for dest, parts in partitions_per_destination.items():
+                ds = concatenate_datasets(parts)
+                for example in tqdm(ds, desc=f"Building phoneme vocab for {dest}"):
+                    text = example.get("text_normalized")
+                    if text:
+                        for p in g2p(text):
+                            if p not in self.phoneme_vocab:
+                                self.phoneme_vocab[p] = len(self.phoneme_vocab)
+
+            with open(vocab_path, "w") as f:
+                json.dump(self.phoneme_vocab, f, indent=4)
+            print(
+                f"Phoneme vocabulary saved to {vocab_path} "
+                f"(size: {len(self.phoneme_vocab)})"
+            )
+
+        # --- Map phoneme IDs onto each partition ---
+        for dest, parts in partitions_per_destination.items():
+            ds = concatenate_datasets(parts)
+            ds = ds.map(
                 _build_phoneme_ids,
                 fn_kwargs={"phoneme_vocab": self.phoneme_vocab},
                 batched=True,
                 num_proc=8,
             )
-            if dest == "train":
-                train_parts.append(ds)
-            else:
-                test_parts.append(ds)
-
-        self.train_dataset = concatenate_datasets(train_parts) if train_parts else None
-        self.test_dataset = concatenate_datasets(test_parts) if test_parts else None
+            setattr(self, f"{dest}_dataset", ds)
