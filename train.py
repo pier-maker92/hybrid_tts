@@ -180,6 +180,7 @@ class HybridTTSTrainer(Trainer):
         granular_losses = [
             "token_loss",
             "diffusion_loss",
+            "norm_ratio",
         ]
         self.add_callback(AddGranularLossesToTrainerState(granular_losses))
 
@@ -284,6 +285,9 @@ class HybridTTSTrainer(Trainer):
                 "token_loss": token_loss.detach(),
                 "diffusion_loss": diffusion_loss.detach(),
             }
+            if getattr(outputs, "norm_ratio", None) is not None:
+                flat_metrics["norm_ratio"] = outputs.norm_ratio.detach()
+                
             for key in self.control.granular_losses:
                 if flat_metrics.get(key) is not None:
                     val = flat_metrics[key].float()

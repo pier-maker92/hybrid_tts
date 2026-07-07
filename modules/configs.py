@@ -61,6 +61,7 @@ class HybridTTSConfig:
     no_augment_ratio: float = 0.0
     discrete_only: bool = False
     backbone_hidden_size: Optional[int] = None
+    continuous_scaling_mode: Optional[str] = None  # 'fixed' or 'learnable' or None
 
     def apply_backbone_dims(self, hidden_size: int) -> None:
         """Propagate HF backbone hidden size into sub-configs after model load."""

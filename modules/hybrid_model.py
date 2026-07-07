@@ -332,6 +332,15 @@ class HybridTTS(nn.Module):
         self.dynamic_normalizer = DynamicNormalizer(config.continuous_dim)
         self.norm_continuous = nn.LayerNorm(hidden_size)
 
+        # ---- Scaling ---------------------------------------------------------
+        scaling_mode = getattr(config, "continuous_scaling_mode", None)
+        if scaling_mode == "learnable":
+            self.continuous_scale = nn.Parameter(torch.tensor(0.02))
+        elif scaling_mode == "fixed":
+            self.continuous_scale = 0.02
+        else:
+            self.continuous_scale = None
+
         # ---- Output heads ----------------------------------------------------
         if config.diffusion_head_config is not None:
             self.diffusion_head = DiT(config.diffusion_head_config)
@@ -594,6 +603,8 @@ class HybridTTS(nn.Module):
         embed_layer = self.backbone.get_input_embeddings()
         input_embs = embed_layer(discrete_sequence)
 
+        norm_ratio = None
+
         if continuous_sequence is not None:
             continuous_sequence = self.dynamic_normalizer(continuous_sequence)
             corrupted_c_seq = self.noise_augment_continuous_token(
@@ -602,6 +613,13 @@ class HybridTTS(nn.Module):
             adapted_c_emb = self.norm_continuous(
                 self.continuous_adapter(corrupted_c_seq)
             )
+
+            if getattr(self, "continuous_scale", None) is not None:
+                adapted_c_emb = adapted_c_emb * self.continuous_scale
+
+            discrete_norm = input_embs.norm(dim=-1).mean()
+            continuous_norm = adapted_c_emb.norm(dim=-1).mean()
+            norm_ratio = discrete_norm / (continuous_norm + 1e-8)
 
             input_embs = self._add_continuous_token(
                 continuous_sequence=adapted_c_emb,
@@ -640,7 +658,11 @@ class HybridTTS(nn.Module):
                 ],  # we stop at last audio frame
             ).loss
 
-        return HybridTTSOutput(token_logits=token_logits, diffusion_loss=diffusion_loss)
+        return HybridTTSOutput(
+            token_logits=token_logits, 
+            diffusion_loss=diffusion_loss,
+            norm_ratio=norm_ratio
+        )
 
     # -------------------------------------------------------------------------
     # Evaluation / inference helper
@@ -747,6 +769,9 @@ class HybridTTS(nn.Module):
                     generated_continuous_tokens = self.norm_continuous(
                         self.continuous_adapter(generated_continuous_tokens)
                     ).detach()
+                    
+                    if getattr(self, "continuous_scale", None) is not None:
+                        generated_continuous_tokens = generated_continuous_tokens * self.continuous_scale
                 else:
                     generated_continuous_tokens = 0.0
 
