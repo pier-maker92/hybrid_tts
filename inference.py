@@ -420,14 +420,13 @@ def main():
                 device=device,
             )
 
-        z_vae = torch.cat([vq_emb, z_denorm], dim=-1)
-
         # Using hardcoded parameters for VAE sample as before
         reconstructed_mel, reconstructed_padding_mask = vae.sample(
             num_steps=16,
             temperature=0.2,
             guidance_scale=1.0,
-            z=z_vae,
+            z_semantic=vq_emb,
+            z_acoustic=z_denorm,
             padding_mask=padding_mask,
         )
 

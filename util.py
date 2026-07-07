@@ -60,6 +60,14 @@ def build_dataset(training_cfg: Dict[str, Any]):
         train_dataset = OnlineTrainDatasetWrapper(dataset, "train")
         test_dataset = OnlineTestDatasetWrapper(dataset, "test")
         return train_dataset, test_dataset, dataset_name
+    elif dataset_name in ["libritts-r-prepared", "libritts_r_prepared"]:
+        from data.libri_tts_r_prepared import LibriTTSRPrepared
+
+        dataset = LibriTTSRPrepared()
+        discrete_only = training_cfg.get("discrete_only", False)
+        train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
+        test_dataset = TrainDatasetWrapper(dataset, "test", discrete_only=discrete_only)
+        return train_dataset, test_dataset, dataset_name
     elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
         from data.lj_speech_online import (
             LJSpeechOnlineDataset,
