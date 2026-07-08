@@ -201,6 +201,7 @@ def main():
         help="Device to run inference on ('cuda', 'mps', or 'cpu'). Auto-selects if not provided.",
     )
     parser.add_argument(
+        "-n",
         "--num_steps",
         type=int,
         default=4,
@@ -389,6 +390,7 @@ def main():
             num_steps=args.num_steps,
             diffusion_temperature=args.diffusion_temperature,
             guidance_scale=args.guidance_scale,
+            vae=vae,
         )
 
         final_discrete = sample_out["discrete_tokens"]

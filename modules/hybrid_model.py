@@ -765,6 +765,16 @@ class HybridTTS(nn.Module):
                         guidance_scale=kwargs.get("guidance_scale"),
                     ).audio_features
 
+                    vae = kwargs.get("vae", None)
+                    if (
+                        vae is not None
+                        and hasattr(vae, "encoder")
+                        and hasattr(vae.encoder, "reparameterize")
+                    ):
+                        generated_continuous_tokens = vae.encoder.reparameterize(
+                            generated_continuous_tokens, std=0.2
+                        )
+
                     all_continuous_tokens.append(generated_continuous_tokens)
                     generated_continuous_tokens = self.norm_continuous(
                         self.continuous_adapter(generated_continuous_tokens)
