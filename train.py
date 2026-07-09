@@ -176,10 +176,13 @@ def main(cfg: DictConfig):
     per_device_train_batch_size = training_cfg.get("per_device_train_batch_size", 8)
     per_device_eval_batch_size = training_cfg.get("per_device_eval_batch_size", 8)
     
+    from torch.utils.data import RandomSampler
+    sampler = RandomSampler(train_dataset, replacement=True, num_samples=len(train_dataset))
+    
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=per_device_train_batch_size,
-        shuffle=True,
+        sampler=sampler,
         collate_fn=data_collator,
         drop_last=True
     )
