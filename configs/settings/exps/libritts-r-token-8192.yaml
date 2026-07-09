@@ -1,0 +1,47 @@
+# @package _global_
+discrete_token_vocab_size: 8192
+
+training:
+  dataset_name: libritts-r-prepared
+  output_dir: checkpoints/exps/libritts-r-token_only-8192
+  per_device_train_batch_size: 40
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  save_total_limit: 2
+  # report
+  report_to: wandb
+  wandb_project: hybrid_tts
+  wandb_run_name: libritts-r-token-only-8192
+  run_id: ""
+  bf16: true
+  # eval
+  eval_strategy: "no"
+  eval_steps: null
+  save_steps: 1000
+  eval_num_samples: 4
+  num_train_epochs: 100
+  # lr
+  learning_rate: 3e-4
+  min_learning_rate: 1e-5
+  lr_scheduler_type: "cosine"   
+  warmup_ratio: 0.05         
+  # cfg
+  uncond_prob: 0.0
+  no_augment_ratio: 0.1
+  discrete_only: true
+  group_by_length: false
+
+backbone:
+  model_type: "qwen-0.5b"
+  from_pretrained: false
+  shift_audio_offset: 0
+
+diffusion_head: null
+
+continuous_adapter: null
+
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
+vocoder_checkpoint: "vocos"
+debug: false
+use_tokenize: true
+bpe_tokenizer_path: "audio_bpe_libritts_r_8192_10k.json"
