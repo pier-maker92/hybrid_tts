@@ -8,7 +8,7 @@ diffusion_head:
   backbone_dim: 512
   uncond_prob: 0.1
   is_causal: false
-  use_conv_layer: false
+  use_conv_layer: true
   use_window_attention: false
   use_group_bidirectional: false
   use_mlp_sampler: false

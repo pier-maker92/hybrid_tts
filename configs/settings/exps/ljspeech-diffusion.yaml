@@ -1,15 +1,15 @@
 # @package _global_
 training:
   dataset_name: ljspeech-prepared
-  output_dir: checkpoints/exps/lj-token_only-128
-  per_device_train_batch_size: 12
+  output_dir: checkpoints/exps/ljspeech-diffusion
+  per_device_train_batch_size: 128
   gradient_accumulation_steps: 1
-  logging_steps: 1
+  logging_steps: 10
   save_total_limit: 2
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj-token_only-128
+  wandb_run_name: ljspeech-diffusion
   run_id: ""
   bf16: true
   # eval
@@ -24,19 +24,21 @@ training:
   lr_scheduler_type: "cosine"   
   warmup_ratio: 0.05         
   # cfg
-  uncond_prob: 0.0
-  no_augment_ratio: 0.1
-  discrete_only: true
+  uncond_prob: 0.1
+  no_augment_ratio: 0.25
+  discrete_only: false
   group_by_length: false
 
-backbone:
-  model_type: "qwen-0.5b"
-  from_pretrained: false
-  shift_audio_offset: 0
+diffusion_head: 
+  net_dim: 512
+  net_depth: 8
+  net_heads: 8
+  uncond_prob: 0.1
+  use_mlp_sampler: false
+  is_causal: false
+  use_conv_layer: true
+  use_window_attention: true
 
-diffusion_head: null
-continuous_adapter: null
-
-vae_checkpoint: "/scratch/piermel/MelCausalVAE/checkpoints/exps/set10_128/checkpoint-32500"
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
 vocoder_checkpoint: "vocos"
 debug: false

@@ -162,7 +162,7 @@ def main():
         description="Simple TTS Inference Script for HybridTTS Model"
     )
     parser.add_argument(
-        "--hybrid_checkpoint",
+        "-c","--hybrid_checkpoint",
         type=str,
         required=True,
         help="Path to the HybridTTS checkpoint directory",
@@ -397,6 +397,10 @@ def main():
         z_denorm = sample_out["continuous_tokens"]
 
         audio_tokens = final_discrete.squeeze(-1).squeeze(0).tolist()
+
+        if getattr(tok, "audio_bpe", None) is not None:
+            logger.info("Decoding BPE audio tokens to VAE tokens...")
+            audio_tokens = tok.audio_bpe.decode(audio_tokens)
 
         logger.info("Decoding continuous features using VAE...")
         if z_denorm is not None:

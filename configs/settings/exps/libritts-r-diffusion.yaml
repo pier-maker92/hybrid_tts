@@ -1,15 +1,15 @@
 # @package _global_
 training:
-  dataset_name: ljspeech-prepared
-  output_dir: checkpoints/exps/lj-token_and_feat-128-no-tying
-  per_device_train_batch_size: 16
+  dataset_name: libritts-r-prepared
+  output_dir: checkpoints/exps/libritts-r-diffusion
+  per_device_train_batch_size: 48
   gradient_accumulation_steps: 1
   logging_steps: 10
   save_total_limit: 2
   # report
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: lj-token_and_feat-128-no-tying
+  wandb_run_name: libritts-r-diffusion
   run_id: ""
   bf16: true
   # eval
@@ -17,7 +17,7 @@ training:
   eval_steps: null
   save_steps: 1000
   eval_num_samples: 4
-  num_train_epochs: 100
+  num_train_epochs: 10
   # lr
   learning_rate: 3e-4
   min_learning_rate: 1e-5
@@ -25,25 +25,20 @@ training:
   warmup_ratio: 0.05         
   # cfg
   uncond_prob: 0.1
-  no_augment_ratio: 0.75
+  no_augment_ratio: 0.25
   discrete_only: false
   group_by_length: false
 
-backbone:
-  model_type: "qwen-0.5b"
-  from_pretrained: false
-  shift_audio_offset: 1
-
 diffusion_head: 
   net_dim: 512
-  net_depth: 6
-  uncond_prob: 0.0
-  use_mlp_sampler: true
+  net_depth: 8
+  net_heads: 8
+  uncond_prob: 0.1
+  use_mlp_sampler: false
+  is_causal: false
+  use_conv_layer: true
+  use_window_attention: true
 
-continuous_adapter: 
-  hidden_dim: 256
-  num_layers: 2
-
-vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/exps/set10_128"
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
 vocoder_checkpoint: "vocos"
 debug: false

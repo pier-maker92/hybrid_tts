@@ -2,14 +2,15 @@
 # Full training — libritts-r-prepared, all 180 train shards, 30 epochs.
 training:
   dataset_name: libritts-r-prepared
-  output_dir: checkpoints/exps/libritts-r-prepared-full
-  per_device_train_batch_size: 16
+  train_split: "train"
+  output_dir: checkpoints/exps/libritts-r-prepared-fixed
+  per_device_train_batch_size: 8
   gradient_accumulation_steps: 4
   logging_steps: 10
   save_total_limit: 3
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: libritts-r-prepared-full
+  wandb_run_name: libritts-r-prepared-fixed
   run_id: ""
   bf16: true
   eval_strategy: "no"
@@ -44,6 +45,7 @@ continuous_adapter:
   hidden_dim: 512
   num_layers: 4
 
-vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/set15-64"
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
 vocoder_checkpoint: "vocos"
 debug: false
+continuous_scaling_mode: "fixed"

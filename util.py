@@ -46,17 +46,11 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.librispeech_align import LibriSpeechAlignDataset
 
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
-    elif dataset_name == "lj_speech_10_128":
-        from data.lj_speech_128 import LJSpeechDataset
-
-        dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
-    elif dataset_name in ["lj_speech_10_512", "LJSpeech-1.1_prepared"]:
-        from data.lj_speech_512 import LJSpeechDataset
-
+    elif dataset_name == "ljspeech-prepared":
+        from data.lj_speech_prepared import LJSpeechDataset
         dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
     elif dataset_name in ["libritts-r", "libritts_r"]:
         from data.libri_tts_r_online import LibriTTSROnline
-
         dataset = LibriTTSROnline()
         train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
         test_dataset = OnlineTestDatasetWrapper(dataset, "test")
@@ -69,13 +63,13 @@ def build_dataset(training_cfg: Dict[str, Any]):
         train_dataset = TrainDatasetWrapper(dataset, train_split, discrete_only=discrete_only)
         test_dataset = TrainDatasetWrapper(dataset, "test", discrete_only=discrete_only)
         return train_dataset, test_dataset, dataset_name
+    
     elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
         from data.lj_speech_online import (
             LJSpeechOnlineDataset,
             LJSpeechOnlineTrain,
             LJSpeechOnlineTest,
         )
-
         base = LJSpeechOnlineDataset()
         train_dataset = LJSpeechOnlineTrain(base)
         test_dataset = LJSpeechOnlineTest(base)
@@ -111,8 +105,18 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
             "vae_checkpoint is required and must exist to load discrete_token_vocab_size"
         )
     from modules.builder import load_codebook_config
+    from modules.audio_tokenizer import AudioTokenizer
 
     _, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+    
+    audio_bpe = None
+    if cfg_dict.get("use_tokenize") and cfg_dict.get("training", {}).get("discrete_only", False):
+        bpe_path = cfg_dict.get("bpe_tokenizer_path", "audio_bpe.json")
+        if os.path.exists(bpe_path):
+            audio_bpe = AudioTokenizer.load(bpe_path)
+            discrete_token_vocab_size = audio_bpe.vocab_size
+        else:
+            raise ValueError(f"bpe_tokenizer_path '{bpe_path}' not found, but use_tokenize is True.")
     end_audio_id = vocab_size + 2
     pad_token_id = vocab_size + 1
     start_audio_id = vocab_size + 0
@@ -125,4 +129,5 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
         end_audio_id=end_audio_id,
         pad_id=pad_token_id,
         discrete_token_vocab_size=discrete_token_vocab_size,
+        audio_bpe=audio_bpe,
     )

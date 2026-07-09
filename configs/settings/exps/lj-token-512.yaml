@@ -1,6 +1,6 @@
 # @package _global_
 training:
-  dataset_name: lj_speech_10_512
+  dataset_name: ljspeech-prepared
   output_dir: checkpoints/exps/lj-token_only-512
   per_device_train_batch_size: 12
   gradient_accumulation_steps: 1

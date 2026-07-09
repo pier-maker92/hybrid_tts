@@ -24,7 +24,7 @@ from modules.submodules.MelCausalVAE.modules.feature_extractor import (
 SLURM_TMPDIR = os.getenv("SLURM_TMPDIR")
 if SLURM_TMPDIR is None:
     raise ValueError("SLURM_TMPDIR environment variable not set.")
-parquet_dir = f"{SLURM_TMPDIR}/datasets/lj_speech_10_128"
+parquet_dir = f"{SLURM_TMPDIR}/datasets/ljspeech-prepared"
 # import mel spec encoder
 mel_spec_encoder = FeatureExtractor(config=MelSpectrogramConfig())
 

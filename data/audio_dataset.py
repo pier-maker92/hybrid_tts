@@ -58,6 +58,9 @@ class TrainDatasetWrapper(SimpleAudioDataset):
         assert split in ["train", "test"], "split must be either train or test"
         self.dataset = getattr(dataset, f"{split}_dataset")
         self.discrete_only = discrete_only
+        
+        if self.discrete_only and "continuous" in self.dataset.column_names:
+            self.dataset = self.dataset.remove_columns("continuous")
 
     def __len__(self):
         return len(self.dataset)
@@ -107,6 +110,9 @@ class DataCollator(object):
         continuous_sequence = []
         target_tokens = []
         for p_id, d_token, c_token in zip(p_ids, d_tokens, c_tokens):
+            if getattr(self.tokenizer, "audio_bpe", None) is not None:
+                d_token = self.tokenizer.audio_bpe.encode(d_token)
+                
             # vocab mapping
             # prompt tokens keep their original IDs
             p_id = p_id + [self.start_audio_id]
@@ -179,6 +185,72 @@ class DataCollator(object):
         return batch
 
 
+class DiffusionDataCollator(object):
+    """Collate examples for diffusion-only training. 
+    Passes discrete and continuous tokens exactly as they are without text/phoneme/LLM formatting."""
+
+    def __init__(self, pad_id=1024, tokenizer=None):
+        self.pad_id = pad_id
+        self.tokenizer = tokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        batch = {}
+
+        # Basic fields
+        batch["ids"] = [inst.get("ids") for inst in instances]
+
+        d_tokens = [inst.get("discrete_tokens") for inst in instances]
+        c_tokens = [inst.get("continuous_tokens") for inst in instances]
+
+        discrete_sequence = []
+        continuous_sequence = []
+        attention_mask = []
+        audio_padding_mask = []
+        
+        for d_token, c_token in zip(d_tokens, c_tokens):
+            if self.tokenizer is not None and getattr(self.tokenizer, "audio_bpe", None) is not None:
+                d_token = self.tokenizer.audio_bpe.encode(d_token)
+                
+            discrete_sequence.append(torch.tensor(d_token).long())
+            attention_mask.append(torch.tensor([1] * len(d_token)).bool())
+            
+            if c_token:
+                continuous_sequence.append(torch.tensor(c_token))
+                audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
+
+        # Pad discrete sequences
+        discrete_sequence = pad_sequence(
+            discrete_sequence,
+            batch_first=True,
+            padding_value=self.pad_id,
+        )
+        attention_mask = pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+        batch["discrete_sequence"] = discrete_sequence
+        batch["attention_mask"] = attention_mask
+
+        # Pad continuous sequences if present
+        if len(continuous_sequence) > 0:
+            continuous_sequence = pad_sequence(
+                continuous_sequence,
+                batch_first=True,
+                padding_value=0,
+            )
+            audio_padding_mask = pad_sequence(
+                audio_padding_mask,
+                batch_first=True,
+                padding_value=1,
+            )
+            batch["continuous_sequence"] = continuous_sequence
+            batch["audio_padding_mask"] = audio_padding_mask
+        else:
+            batch["continuous_sequence"] = None
+            batch["audio_padding_mask"] = None
+
+        return batch
+
+
+
 class TestDatasetWrapper(SimpleAudioDataset):
     def __init__(
         self, dataset: SimpleAudioDataset, split: str, discrete_only: bool = False
@@ -187,6 +259,9 @@ class TestDatasetWrapper(SimpleAudioDataset):
         assert split in ["test", "train"], "split must be test or train"
         self.dataset = getattr(dataset, f"{split}_dataset")
         self.discrete_only = discrete_only
+        
+        if self.discrete_only and "continuous" in self.dataset.column_names:
+            self.dataset = self.dataset.remove_columns("continuous")
 
     def __len__(self):
         return len(self.dataset)

@@ -29,12 +29,14 @@ class HybridTokenizer:
         end_audio_id: int,
         pad_id: int,
         discrete_token_vocab_size: int = 1024,
+        audio_bpe = None,
     ):
         self.prompt_vocab_size = prompt_vocab_size
         self.start_audio_id = start_audio_id
         self.end_audio_id = end_audio_id
         self.pad_id = pad_id
         self.discrete_token_vocab_size = discrete_token_vocab_size
+        self.audio_bpe = audio_bpe
 
     @property
     def unified_vocab_size(self) -> int:
@@ -166,7 +168,7 @@ class CausalLMWrapper(nn.Module):
         input_dict = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "output_hidden_states": True,
+            "output_hidden_states": False,
             "return_dict": True,
         }
 
@@ -176,14 +178,14 @@ class CausalLMWrapper(nn.Module):
                 input_dict[arg_name] = kwargs[arg_name]
 
         # forward pass
-        outputs = self.model(**input_dict)
-        return outputs.hidden_states[-1]
+        outputs = self.model.base_model(**input_dict)
+        return outputs.last_hidden_state
 
     def inference_forward(self, inputs_embeds, attention_mask=None, **kwargs):
         input_dict = {
             "inputs_embeds": inputs_embeds,
             "attention_mask": attention_mask,
-            "output_hidden_states": True,
+            "output_hidden_states": False,
             "return_dict": True,
         }
 
@@ -193,8 +195,8 @@ class CausalLMWrapper(nn.Module):
                 input_dict[arg_name] = kwargs[arg_name]
 
         # forward pass
-        outputs = self.model(**input_dict)
-        hidden_states = outputs.hidden_states[-1][:, -1:, :]
+        outputs = self.model.base_model(**input_dict)
+        hidden_states = outputs.last_hidden_state[:, -1:, :]
         past_key_values = outputs.past_key_values
 
         return hidden_states, past_key_values
@@ -715,11 +717,11 @@ class HybridTTS(nn.Module):
                 s_idx = start_idx[b].item()
                 if s_idx > 0:
                     keep_len = L - s_idx
-                    uncond_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
-                    uncond_discrete[b, keep_len:] = self.pad_token_id
+                    uncond_discrete[b, -keep_len:] = discrete_sequence[b, s_idx:]
+                    uncond_discrete[b, :-keep_len] = self.pad_token_id
 
-                    uncond_mask[b, :keep_len] = attention_mask[b, s_idx:]
-                    uncond_mask[b, keep_len:] = False
+                    uncond_mask[b, -keep_len:] = attention_mask[b, s_idx:]
+                    uncond_mask[b, :-keep_len] = False
 
             uncond_embs = embed_layer(uncond_discrete)
             input_embs = embed_layer(discrete_sequence)
@@ -746,6 +748,7 @@ class HybridTTS(nn.Module):
                 uncond_hidden = last_hidden_state[B_orig:]
 
                 token_logits = self.get_token_logits(cond_hidden.squeeze(1))
+                
                 diffusion_context = (cond_hidden, uncond_hidden)
             else:
                 token_logits = self.get_token_logits(last_hidden_state.squeeze(1))

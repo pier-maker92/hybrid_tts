@@ -1,24 +1,23 @@
 # @package _global_
-# Smoke test — libritts-r-prepared, test split, 200 samples, 2 epochs.
-# Verifies pipeline (dataset loading, DataCollator, forward pass, checkpointing) with minimal resources.
+# Full training — libritts-r-prepared, all 180 train shards, 30 epochs, TOKEN ONLY
 training:
   dataset_name: libritts-r-prepared
   train_split: "train"
-  output_dir: checkpoints/exps/libritts-r-prepared-smoke
+  output_dir: checkpoints/exps/libritts-r-token-only
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 1
-  logging_steps: 5
-  save_total_limit: 1
-  report_to: wandb
+  logging_steps: 10
+  save_total_limit: 3
+  report_to: none
   wandb_project: hybrid_tts
-  wandb_run_name: libritts-r-prepared-smoke
+  wandb_run_name: libritts-r-token-only
   run_id: ""
   bf16: true
   eval_strategy: "no"
   eval_steps: null
-  save_steps: 500
+  save_steps: 2000
   eval_num_samples: 4
-  num_train_epochs: 2
+  num_train_epochs: 30
   max_steps: -1
   learning_rate: 3.0e-4
   min_learning_rate: 1.0e-5
@@ -26,7 +25,7 @@ training:
   warmup_ratio: 0.05
   uncond_prob: 0.1
   no_augment_ratio: 0.25
-  discrete_only: false
+  discrete_only: true
   group_by_length: false
   dataloader_num_workers: 4
 
@@ -36,17 +35,8 @@ backbone:
   shift_audio_offset: 1
   force_weight_tying: false
 
-diffusion_head:
-  net_dim: 512
-  net_depth: 6
-  uncond_prob: 0.0
-  use_mlp_sampler: true
-
-continuous_adapter:
-  hidden_dim: 256
-  num_layers: 2
-
 vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
+use_tokenize: true
+bpe_tokenizer_path: "audio_bpe.json"
 vocoder_checkpoint: "vocos"
 debug: false
-continuous_scaling_mode: "learnable"

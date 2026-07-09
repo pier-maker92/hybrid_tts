@@ -8,6 +8,7 @@ import wandb
 import hydra
 import logging
 import datetime
+import time
 from typing import Dict, List, Optional
 from accelerate import Accelerator
 from accelerate import InitProcessGroupKwargs
@@ -15,7 +16,7 @@ from evaluation import run_evaluation
 from torch.utils.data import DataLoader
 from modules.builder import build_model
 from omegaconf import DictConfig, OmegaConf
-from data.audio_dataset import DataCollator, DataCollatorWithVAE
+from data.audio_dataset import DataCollator, DataCollatorWithVAE, DiffusionDataCollator
 from util import build_dataset, build_tokenizer, wandb_init
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -93,6 +94,76 @@ def load_vocoder(vocoder_name_or_path: str, device: torch.device):
         return None
 
 
+from modules.diffusion_head.cfm import DiT
+from modules.configs import HybridTTSConfig
+from torch.nn.utils.rnn import pad_sequence
+from modules.hybrid_model import DynamicNormalizer
+import torch.nn as nn
+
+class DiffusionOnlyModel(nn.Module):
+    def __init__(self, config: HybridTTSConfig, tokenizer):
+        super().__init__()
+        self.config = config
+        self.tokenizer = tokenizer
+        
+        # Determine the hidden size for the DiT conditioning
+        hidden_size = config.diffusion_head_config.backbone_dim
+        
+        # Look-Up Table (LUT) for discrete tokens. 
+        # Add +1 to discrete_token_vocab_size for the pad_id (usually 1024)
+        self.embed = nn.Embedding(
+            tokenizer.discrete_token_vocab_size + 1, 
+            hidden_size, 
+            padding_idx=tokenizer.discrete_token_vocab_size
+        )
+        
+        # Normalizer for continuous tokens
+        self.dynamic_normalizer = DynamicNormalizer(config.continuous_dim)
+        
+        # Diffusion head
+        self.diffusion_head = DiT(config.diffusion_head_config)
+        self.shift_audio_offset = config.shift_audio_offset
+
+    def forward(
+        self,
+        discrete_sequence: torch.LongTensor,
+        attention_mask: torch.BoolTensor,
+        continuous_sequence: torch.FloatTensor,
+        audio_padding_mask: torch.BoolTensor,
+        **kwargs
+    ):
+        # In this simplified scenario, discrete_sequence contains ONLY the discrete tokens 
+        # and continuous_sequence contains ONLY the continuous tokens. Lengths match exactly.
+        
+        # Embed discrete sequence to get the context_vector
+        context_vector = self.embed(discrete_sequence)
+
+        norm_ratio = None
+        diffusion_loss = None
+        
+        if continuous_sequence is not None:
+            continuous_sequence = self.dynamic_normalizer(continuous_sequence)
+            
+            diffusion_loss = self.diffusion_head(
+                target=continuous_sequence,
+                target_padding_mask=audio_padding_mask,
+                context_vector=context_vector,
+            ).loss
+            
+            # compute a fake norm ratio for logging compatibility
+            discrete_norm = context_vector.norm(dim=-1).mean()
+            continuous_norm = continuous_sequence.norm(dim=-1).mean()
+            norm_ratio = discrete_norm / (continuous_norm + 1e-8)
+
+        class Output:
+            pass
+        out = Output()
+        out.diffusion_loss = diffusion_loss
+        out.token_logits = torch.zeros(1, device=context_vector.device) # dummy
+        out.norm_ratio = norm_ratio
+        return out
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig):
     cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -126,16 +197,44 @@ def main(cfg: DictConfig):
     logger.info("Building dataset...")
     train_dataset, test_dataset, dataset_name = build_dataset(training_cfg)
 
-    backbone_cfg = cfg_dict.get("backbone", cfg_dict.get("backbone_config"))
-    is_pretrained = backbone_cfg.get("pretrained")
+    backbone_cfg = cfg_dict.get("backbone", cfg_dict.get("backbone_config", {}))
+    is_pretrained = backbone_cfg.get("pretrained", False)
     if is_pretrained:
         raise NotImplementedError("Pretrained backbone not supported yet.")
 
     logger.info("Creating HybridTTS tokenizer...")
     tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
-    logger.info("Creating HybridTTS model...")
-    model = build_model(cfg_dict, tokenizer=tok)
+    logger.info("Creating Diffusion-only model...")
+    from modules.builder import load_codebook_config
+    from modules.configs import HybridTTSConfig, DiTConfig
+    
+    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    continuous_dim, _ = load_codebook_config(vae_checkpoint)
+    
+    diffusion_head_cfg = cfg_dict.get("diffusion_head", cfg_dict.get("diffusion_head_config", {}))
+    diffusion_config = DiTConfig(**diffusion_head_cfg)
+    
+    # Override with actual dataset/model dimensions
+    diffusion_config.audio_latent_dim = continuous_dim
+    
+    # We use diffusion_config.net_dim as the backbone_dim for the embedding LUT
+    diffusion_config.backbone_dim = diffusion_config.net_dim
+
+    config = HybridTTSConfig(
+        backbone_config=None,
+        diffusion_head_config=diffusion_config,
+        continuous_adapter_config=None,
+        prompt_vocab_size=tok.prompt_vocab_size,
+        discrete_token_vocab_size=tok.discrete_token_vocab_size,
+        continuous_dim=continuous_dim,
+        pad_token_id=tok.pad_id,
+        start_audio_id=tok.start_audio_id,
+        end_audio_id=tok.end_audio_id,
+        shift_audio_offset=cfg_dict.get("training", {}).get("shift_audio_offset", 1),
+    )
+    
+    model = DiffusionOnlyModel(config, tokenizer=tok)
     model.tokenizer = tok
 
     learning_rate = float(training_cfg.get("learning_rate", 1e-4))
@@ -167,7 +266,7 @@ def main(cfg: DictConfig):
         )
         logger.info("DataCollatorWithVAE ready.")
     else:
-        data_collator = DataCollator(tokenizer=tok)
+        data_collator = DiffusionDataCollator(pad_id=tok.discrete_token_vocab_size, tokenizer=tok)
 
     per_device_train_batch_size = training_cfg.get("per_device_train_batch_size", 8)
     per_device_eval_batch_size = training_cfg.get("per_device_eval_batch_size", 8)
@@ -250,6 +349,7 @@ def main(cfg: DictConfig):
     running_diffusion_loss = 0.0
     running_norm_ratio = 0.0
     running_steps = 0
+    start_time = time.time()
 
     for epoch in range(starting_epoch, num_train_epochs):
         model.train()
@@ -262,19 +362,9 @@ def main(cfg: DictConfig):
                     audio_padding_mask=batch.get("audio_padding_mask"),
                 )
                 
-                token_logits = outputs.token_logits
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)
-                target_tokens = batch.get("target_tokens")
                 
-                unwrapped_model = accelerator.unwrap_model(model)
-                vocab_size = unwrapped_model.discrete_token_vocab_size + 1
-                
-                token_loss = loss_fct(
-                    token_logits.view(-1, vocab_size),
-                    target_tokens.view(-1)
-                )
-                
-                total_loss = token_loss + diffusion_loss
+                total_loss = diffusion_loss
                 accelerator.backward(total_loss)
                 
                 if accelerator.sync_gradients:
@@ -284,7 +374,7 @@ def main(cfg: DictConfig):
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 
-            running_token_loss += token_loss.detach().float()
+            running_token_loss += 0.0
             running_diffusion_loss += diffusion_loss.detach().float()
             if getattr(outputs, "norm_ratio", None) is not None:
                 running_norm_ratio += outputs.norm_ratio.detach().float()
@@ -294,22 +384,25 @@ def main(cfg: DictConfig):
                 global_step += 1
                 
                 if logging_steps is not None and logging_steps > 0 and global_step % logging_steps == 0:
-                    avg_token_loss = accelerator.gather(running_token_loss).mean().item() / running_steps
                     avg_diff_loss = accelerator.gather(running_diffusion_loss).mean().item() / running_steps
                     avg_norm_ratio = accelerator.gather(running_norm_ratio).mean().item() / running_steps if running_norm_ratio != 0 else 0
                     current_lr = lr_scheduler.get_last_lr()[0]
                     
+                    elapsed_time = time.time() - start_time
+                    steps_per_sec = global_step / elapsed_time if elapsed_time > 0 else 0
+                    eta_seconds = (num_training_steps - global_step) / steps_per_sec if steps_per_sec > 0 else 0
+                    eta_td = datetime.timedelta(seconds=int(eta_seconds))
+                    
                     if accelerator.is_main_process:
                         if wandb.run is not None:
                             wandb.log({
-                                "train/token_loss": avg_token_loss,
                                 "train/diffusion_loss": avg_diff_loss,
                                 "train/norm_ratio": avg_norm_ratio,
                                 "train/learning_rate": current_lr,
                                 "train/global_step": global_step,
                                 "train/epoch": epoch + (step + 1) / len(train_dataloader)
                             }, step=global_step)
-                        logger.info(f"Epoch {epoch} Step {global_step} | Token Loss: {avg_token_loss:.4f} | Diff Loss: {avg_diff_loss:.4f} | LR: {current_lr:.2e}")
+                        logger.info(f"Epoch {epoch} Step {global_step}/{num_training_steps} | Diff Loss: {avg_diff_loss:.4f} | LR: {current_lr:.2e} | ETA: {eta_td}")
                         
                     running_token_loss = 0.0
                     running_diffusion_loss = 0.0
@@ -346,18 +439,7 @@ def main(cfg: DictConfig):
                         vocoder = load_vocoder(vocoder_checkpoint, device) if vocoder_checkpoint else None
                         
                         try:
-                            run_evaluation(
-                                model=accelerator.unwrap_model(model),
-                                vae=vae,
-                                vocoder=vocoder,
-                                vocoder_type=vocoder_type,
-                                eval_dataloader=eval_dataloader,
-                                device=device,
-                                step=global_step,
-                                dataset_name=dataset_name,
-                                num_samples=eval_num_samples,
-                                run_id=wandb.run.id if wandb.run else "eval_run",
-                            )
+                            logger.info("Evaluation relies on full HybridTTS encode_decode. Skipping advanced evaluation for diffusion-only model.")
                         except Exception as e:
                             logger.error(f"Evaluation failed: {e}")
                         finally:

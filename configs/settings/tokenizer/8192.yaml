@@ -1,0 +1,11 @@
+# @package _global_
+training:
+  dataset_name: ljspeech-prepared
+
+tokenizer:
+  target_vocab_size: 8192
+  num_samples: -1
+  save_path: null
+  return_compressed: true
+
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"
