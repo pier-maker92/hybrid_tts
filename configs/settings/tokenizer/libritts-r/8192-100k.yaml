@@ -1,0 +1,11 @@
+# @package _global_
+training:
+  dataset_name: libritts-r-prepared
+
+tokenizer:
+  target_vocab_size: 8192
+  num_samples: 100000
+  save_path: /scratch/piermel/hybrid_tts/audio_bpe_libritts_r_8192_100k.json
+  return_compressed: true
+
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/set15-64"

@@ -85,13 +85,16 @@ def load_hybrid_model(
     if os.path.isdir(checkpoint_dir):
         safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
         pt_path = os.path.join(checkpoint_dir, "model.pt")
+        bin_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
         if os.path.exists(safetensors_path):
             checkpoint_file = safetensors_path
+        elif os.path.exists(bin_path):
+            checkpoint_file = bin_path
         elif os.path.exists(pt_path):
             checkpoint_file = pt_path
         else:
             raise FileNotFoundError(
-                f"No model weight file (model.safetensors or model.pt) found in {checkpoint_dir}"
+                f"No model weight file (model.safetensors, pytorch_model.bin or model.pt) found in {checkpoint_dir}"
             )
     else:
         checkpoint_file = checkpoint_dir

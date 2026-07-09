@@ -537,32 +537,31 @@ class HybridTTS(nn.Module):
     ):
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         # --- Unconditional training: drop prompts randomly ---
-        if self.training and getattr(self, "uncond_prob") > 0.0:
-            B, L = discrete_sequence.shape
-            drop_mask = (
-                torch.rand(B, device=discrete_sequence.device) < self.uncond_prob
-            )
+        B, L = discrete_sequence.shape
+        drop_mask = (
+            torch.rand(B, device=discrete_sequence.device) < self.uncond_prob
+        )
 
-            if drop_mask.any():
-                new_discrete = discrete_sequence.clone()
-                new_attention = attention_mask.clone()
+        if drop_mask.any():
+            new_discrete = discrete_sequence.clone()
+            new_attention = attention_mask.clone()
 
-                for b in range(B):
-                    if drop_mask[b]:
-                        s_idx = start_idx[b].item()
-                        if s_idx > 0:
-                            keep_len = L - s_idx
-                            # Shift tokens and attention mask to the left
-                            new_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
-                            new_discrete[b, keep_len:] = self.pad_token_id
+            for b in range(B):
+                if drop_mask[b]:
+                    s_idx = start_idx[b].item()
+                    if s_idx > 0:
+                        keep_len = L - s_idx
+                        # Shift tokens and attention mask to the left
+                        new_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
+                        new_discrete[b, keep_len:] = self.pad_token_id
 
-                            new_attention[b, :keep_len] = attention_mask[b, s_idx:]
-                            new_attention[b, keep_len:] = False
+                        new_attention[b, :keep_len] = attention_mask[b, s_idx:]
+                        new_attention[b, keep_len:] = False
 
-                discrete_sequence = new_discrete
-                attention_mask = new_attention
+            discrete_sequence = new_discrete
+            attention_mask = new_attention
 
-            return discrete_sequence, attention_mask
+        return discrete_sequence, attention_mask
 
     def get_token_logits(self, tokens_hidden_states: torch.FloatTensor):
         """
@@ -598,9 +597,10 @@ class HybridTTS(nn.Module):
             continuous_sequence: (B, L_audio, C) continuous tokens
             audio_padding_mask: (B, L_audio) False = valid, True = pad
         """
-        discrete_sequence, attention_mask = self.uncondition(
-            discrete_sequence, attention_mask
-        )
+        if self.training and getattr(self, "uncond_prob") > 0.0:
+            discrete_sequence, attention_mask = self.uncondition(
+                discrete_sequence, attention_mask
+            )
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         embed_layer = self.backbone.get_input_embeddings()
         input_embs = embed_layer(discrete_sequence)

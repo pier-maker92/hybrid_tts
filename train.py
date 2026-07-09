@@ -4,13 +4,14 @@ import math
 import random
 import numpy as np
 import torch
+import time
 import wandb
 import hydra
 import logging
 import datetime
 from typing import Dict, List, Optional
 from accelerate import Accelerator
-from accelerate import InitProcessGroupKwargs
+from accelerate import InitProcessGroupKwargs, DistributedDataParallelKwargs
 from evaluation import run_evaluation
 from torch.utils.data import DataLoader
 from modules.builder import build_model
@@ -110,9 +111,10 @@ def main(cfg: DictConfig):
 
     # Accelerate init
     kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(seconds=7200))
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     grad_accum_steps = training_cfg.get("gradient_accumulation_steps", 1)
     accelerator = Accelerator(
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=[kwargs, ddp_kwargs],
         gradient_accumulation_steps=grad_accum_steps,
         log_with="wandb",
     )
@@ -123,16 +125,18 @@ def main(cfg: DictConfig):
             logger.info("Initializing W&B...")
         wandb_init(training_cfg, accelerator)
 
-    logger.info("Building dataset...")
-    train_dataset, test_dataset, dataset_name = build_dataset(training_cfg)
+    with accelerator.main_process_first():
+        logger.info("Building dataset...")
+        train_dataset, test_dataset, dataset_name = build_dataset(training_cfg)
 
     backbone_cfg = cfg_dict.get("backbone", cfg_dict.get("backbone_config"))
     is_pretrained = backbone_cfg.get("pretrained")
     if is_pretrained:
         raise NotImplementedError("Pretrained backbone not supported yet.")
 
-    logger.info("Creating HybridTTS tokenizer...")
-    tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
+    with accelerator.main_process_first():
+        logger.info("Creating HybridTTS tokenizer...")
+        tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
     logger.info("Creating HybridTTS model...")
     model = build_model(cfg_dict, tokenizer=tok)
@@ -250,9 +254,17 @@ def main(cfg: DictConfig):
     running_diffusion_loss = 0.0
     running_norm_ratio = 0.0
     running_steps = 0
+    start_time = time.time()
 
     for epoch in range(starting_epoch, num_train_epochs):
         model.train()
+        
+        # Explicitly set the epoch for DistributedSampler to ensure data is shuffled differently each epoch
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(epoch)
+        elif hasattr(train_dataloader, "sampler") and hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
+            
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 outputs = model(
@@ -299,6 +311,11 @@ def main(cfg: DictConfig):
                     avg_norm_ratio = accelerator.gather(running_norm_ratio).mean().item() / running_steps if running_norm_ratio != 0 else 0
                     current_lr = lr_scheduler.get_last_lr()[0]
                     
+                    elapsed_time = time.time() - start_time
+                    steps_per_sec = (global_step - starting_step) / elapsed_time if elapsed_time > 0 else 0
+                    eta_seconds = (num_training_steps - global_step) / steps_per_sec if steps_per_sec > 0 else 0
+                    eta_td = datetime.timedelta(seconds=int(eta_seconds))
+                    
                     if accelerator.is_main_process:
                         if wandb.run is not None:
                             wandb.log({
@@ -309,7 +326,7 @@ def main(cfg: DictConfig):
                                 "train/global_step": global_step,
                                 "train/epoch": epoch + (step + 1) / len(train_dataloader)
                             }, step=global_step)
-                        logger.info(f"Epoch {epoch} Step {global_step} | Token Loss: {avg_token_loss:.4f} | Diff Loss: {avg_diff_loss:.4f} | LR: {current_lr:.2e}")
+                        logger.info(f"Epoch {epoch} Step {global_step}/{num_training_steps} | Token Loss: {avg_token_loss:.4f} | Diff Loss: {avg_diff_loss:.4f} | LR: {current_lr:.2e} | ETA: {eta_td}")
                         
                     running_token_loss = 0.0
                     running_diffusion_loss = 0.0
@@ -332,6 +349,25 @@ def main(cfg: DictConfig):
                         with open(os.path.join(save_dir, "config.json"), "w") as f:
                             json.dump(cfg_dict_to_save, f, indent=4)
                         logger.info(f"Saved checkpoint to {save_dir}")
+                        
+                        save_total_limit = training_cfg.get("save_total_limit")
+                        if save_total_limit is not None and save_total_limit > 0:
+                            import shutil
+                            import glob
+                            checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+                            valid_checkpoints = []
+                            for ckpt in checkpoints:
+                                basename = os.path.basename(ckpt)
+                                if basename.startswith("checkpoint-"):
+                                    step_str = basename.replace("checkpoint-", "")
+                                    if step_str.isdigit():
+                                        valid_checkpoints.append((int(step_str), ckpt))
+                            valid_checkpoints.sort(key=lambda x: x[0])
+                            
+                            while len(valid_checkpoints) > save_total_limit:
+                                ckpt_to_delete = valid_checkpoints.pop(0)[1]
+                                shutil.rmtree(ckpt_to_delete)
+                                logger.info(f"Deleted old checkpoint: {ckpt_to_delete}")
                         
                 if eval_steps is not None and eval_steps > 0 and global_step % eval_steps == 0:
                     accelerator.wait_for_everyone()

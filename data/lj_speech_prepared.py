@@ -5,8 +5,9 @@ import argparse
 from tqdm import tqdm
 from typing import Optional, List
 from collections import defaultdict
-from torch.utils.data import DataLoader
-from datasets import load_dataset, concatenate_datasets
+from torch.utils.data import DataLoader, Dataset
+import glob
+import pyarrow.parquet as pq
 from g2p_en import G2p
 from data.audio_dataset import (
     SimpleAudioDataset,
@@ -47,27 +48,55 @@ def build_vocab_and_map(batch, phoneme_vocab):
     return {"phoneme_ids": phoneme_ids_batch, "prompt_ids": phoneme_ids_batch}
 
 
+class CustomListDataset(Dataset):
+    def __init__(self, data_list):
+        self.data_list = data_list
+        if len(data_list) > 0:
+            self.column_names = list(data_list[0].keys())
+        else:
+            self.column_names = []
+            
+    def remove_columns(self, column_names):
+        if isinstance(column_names, str):
+            column_names = [column_names]
+        new_data_list = []
+        for item in self.data_list:
+            new_item = {k: v for k, v in item.items() if k not in column_names}
+            new_data_list.append(new_item)
+        return CustomListDataset(new_data_list)
+        
+    def __len__(self):
+        return len(self.data_list)
+        
+    def __getitem__(self, idx):
+        return self.data_list[idx]
+
+
 class LJSpeechDataset(SimpleAudioDataset):
     def __init__(
         self, languages: Optional[List[str]] = None, force_vocab_build: bool = False
     ):
         super().__init__()
-        # Load the prepared dataset
-        dataset = load_dataset(
-            "parquet",
-            data_dir=f"{parquet_dir}",
-        )
-        if "audio" in dataset["train"].column_names:
-            dataset = dataset.remove_columns("audio")
-
-        partitions_per_destination = defaultdict(list)
-        for partition in dataset:
-            print(
-                f"partition: {partition}, destination: {self._partition_to_destination(partition)}"
-            )
-            partitions_per_destination[
-                self._partition_to_destination(partition)
-            ].append(dataset[partition])
+        print(f"Loading parquet files manually from {parquet_dir}...")
+        
+        train_data = []
+        test_data = []
+        
+        all_parquets = glob.glob(os.path.join(parquet_dir, "**/*.parquet"), recursive=True)
+        if not all_parquets:
+            raise FileNotFoundError(f"No parquet files found in {parquet_dir}")
+            
+        for f in all_parquets:
+            table = pq.read_table(f)
+            if "audio" in table.column_names:
+                table = table.drop(["audio"])
+            pylist = table.to_pylist()
+            if "test" in f or "dev" in f or "eval" in f:
+                test_data.extend(pylist)
+            else:
+                train_data.extend(pylist)
+                
+        print(f"Loaded {len(train_data)} train samples and {len(test_data)} test samples.")
 
         self.phoneme_vocab = {}
 
@@ -85,20 +114,13 @@ class LJSpeechDataset(SimpleAudioDataset):
 
         if not self.phoneme_vocab:
             print("Building phoneme vocabulary...")
-            # First pass: build vocabulary
-            for destination in partitions_per_destination:
-                ds = concatenate_datasets(partitions_per_destination[destination])
-                for example in tqdm(
-                    ds, desc=f"Building phoneme vocab for {destination}"
-                ):
-                    transcription = example.get("transcript") or example.get(
-                        "transcription"
-                    )
-                    if transcription:
-                        phonemes = g2p(transcription)
-                        for p in phonemes:
-                            if p not in self.phoneme_vocab:
-                                self.phoneme_vocab[p] = len(self.phoneme_vocab)
+            for example in tqdm(train_data + test_data, desc="Building phoneme vocab"):
+                transcription = example.get("transcript") or example.get("transcription")
+                if transcription:
+                    phonemes = g2p(transcription)
+                    for p in phonemes:
+                        if p not in self.phoneme_vocab:
+                            self.phoneme_vocab[p] = len(self.phoneme_vocab)
 
             with open(vocab_path, "w") as f:
                 json.dump(self.phoneme_vocab, f, indent=4)
@@ -106,21 +128,26 @@ class LJSpeechDataset(SimpleAudioDataset):
                 f"Phoneme vocabulary saved to {vocab_path} (size: {len(self.phoneme_vocab)})"
             )
 
-        for destination in partitions_per_destination:
-            ds = concatenate_datasets(partitions_per_destination[destination])
-            ds = ds.map(
-                build_vocab_and_map,
-                fn_kwargs={"phoneme_vocab": self.phoneme_vocab},
-                batched=True,
-                num_proc=1,
-            )
-            setattr(self, f"{destination}_dataset", ds)
+        for example in tqdm(train_data, desc="Mapping train dataset"):
+            transcription = example.get("transcript") or example.get("transcription")
+            phoneme_ids = []
+            if transcription:
+                for p in g2p(transcription):
+                    phoneme_ids.append(self.phoneme_vocab.get(p, 0))
+            example["phoneme_ids"] = phoneme_ids
+            example["prompt_ids"] = phoneme_ids
+            
+        for example in tqdm(test_data, desc="Mapping test dataset"):
+            transcription = example.get("transcript") or example.get("transcription")
+            phoneme_ids = []
+            if transcription:
+                for p in g2p(transcription):
+                    phoneme_ids.append(self.phoneme_vocab.get(p, 0))
+            example["phoneme_ids"] = phoneme_ids
+            example["prompt_ids"] = phoneme_ids
 
-    def _partition_to_destination(self, partition_name):
-        if "train" in partition_name:
-            return "train"
-        else:
-            return "test"
+        self.train_dataset = CustomListDataset(train_data)
+        self.test_dataset = CustomListDataset(test_data)
 
     # def __len__(self):
     #     return len(self.dataset)

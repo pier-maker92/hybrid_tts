@@ -79,9 +79,10 @@ def build_dataset(training_cfg: Dict[str, Any]):
 
     discrete_only = training_cfg.get("discrete_only", False)
     train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
+
     test_dataset = TestDatasetWrapper(
-        dataset, "train", discrete_only=discrete_only
-    )  # FIXME workaround for LJSpeech
+        dataset, "train", discrete_only=discrete_only # FIXME handle the test partition in Ljspeech (now missing)
+    )
 
     return train_dataset, test_dataset, dataset_name
 

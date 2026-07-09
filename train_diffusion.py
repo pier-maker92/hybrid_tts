@@ -353,6 +353,13 @@ def main(cfg: DictConfig):
 
     for epoch in range(starting_epoch, num_train_epochs):
         model.train()
+        
+        # Explicitly set the epoch for DistributedSampler to ensure data is shuffled differently each epoch
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(epoch)
+        elif hasattr(train_dataloader, "sampler") and hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
+            
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
                 outputs = model(
