@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import time
 import torch
 import argparse
 import logging
@@ -16,9 +17,15 @@ logger = logging.getLogger("inference_tts")
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from inference import load_hybrid_model, load_vae, load_vocoder, clean_text_and_phonemize
+from inference import (
+    load_hybrid_model,
+    load_vae,
+    load_vocoder,
+    clean_text_and_phonemize,
+)
 from inference_diffusion import load_diffusion_model
 from util import build_tokenizer
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -86,14 +93,14 @@ def main():
         "-dg",
         "--guidance_scale",
         type=float,
-        default=1.3,
+        default=1.0,
         help="CFG guidance scale for the diffusion head (default: 1.3)",
     )
     parser.add_argument(
         "-n",
         "--num_steps",
         type=int,
-        default=16,
+        default=8,
         help="Number of diffusion steps (default: 16)",
     )
     args = parser.parse_args()
@@ -161,7 +168,7 @@ def main():
     hybrid_model = load_hybrid_model(
         hybrid_cfg, args.hybrid_checkpoint, device, dtype, tokenizer=hybrid_tok
     )
-    
+
     diffusion_model = load_diffusion_model(
         diffusion_cfg, args.diffusion_checkpoint, device, dtype, tokenizer=diffusion_tok
     )
@@ -183,7 +190,9 @@ def main():
         sys.exit(1)
 
     prompt_ids.append(hybrid_tok.start_audio_id)
-    
+
+    start_time = time.time()
+
     # 2. Hybrid Model Inference (Discrete Token Generation)
     with torch.no_grad():
         logger.info("Generating discrete tokens with HybridModel...")
@@ -201,7 +210,7 @@ def main():
             batch=batch,
             max_steps=args.max_len,
             temperature=args.temperature,
-            num_steps=1, # Diffusion not used here
+            num_steps=1,  # Diffusion not used here
             vae=None,
         )
 
@@ -212,21 +221,29 @@ def main():
 
         # Decode BPE if applicable. The Diffusion model ALWAYS expects raw VAE tokens.
         if getattr(hybrid_tok, "audio_bpe", None) is not None:
-            logger.info("Hybrid uses BPE. Decoding BPE audio tokens to raw VAE tokens before diffusion...")
+            logger.info(
+                "Hybrid uses BPE. Decoding BPE audio tokens to raw VAE tokens before diffusion..."
+            )
             audio_tokens = hybrid_tok.audio_bpe.decode(audio_tokens)
             logger.info(f"Decoded into {len(audio_tokens)} raw VAE tokens.")
 
         # 3. Diffusion Model Inference (Continuous Feature Generation)
         logger.info("Generating continuous features with DiffusionOnlyModel...")
-        
+
         # Prepare input for diffusion model
-        diffusion_discrete_sequence = torch.tensor([audio_tokens], dtype=torch.long, device=device)
-        diffusion_attention_mask = torch.ones_like(diffusion_discrete_sequence, dtype=torch.bool, device=device)
-        
+        diffusion_discrete_sequence = torch.tensor(
+            [audio_tokens], dtype=torch.long, device=device
+        )
+        diffusion_attention_mask = torch.ones_like(
+            diffusion_discrete_sequence, dtype=torch.bool, device=device
+        )
+
         context_vector = diffusion_model.embed(diffusion_discrete_sequence)
-        
+
         if args.guidance_scale > 1.0:
-            uncond_discrete = torch.full_like(diffusion_discrete_sequence, diffusion_model.config.pad_token_id)
+            uncond_discrete = torch.full_like(
+                diffusion_discrete_sequence, diffusion_model.config.pad_token_id
+            )
             uncond_context_vector = diffusion_model.embed(uncond_discrete)
             context_vector = (context_vector, uncond_context_vector)
 
@@ -245,12 +262,14 @@ def main():
 
         # 4. Synthesize Audio (VAE + Vocoder)
         logger.info("Synthesizing waveform using VAE and Vocoder...")
-        padding_mask = torch.zeros((1, len(audio_tokens)), dtype=torch.bool, device=device)
-        
+        padding_mask = torch.zeros(
+            (1, len(audio_tokens)), dtype=torch.bool, device=device
+        )
+
         tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
         vq_emb = vae.encoder.vq.codebook(tokens_tensor)
         vq_emb = vq_emb.unsqueeze(0)
-        
+
         reconstructed_mel, reconstructed_padding_mask = vae.sample(
             num_steps=16,
             temperature=0.2,
@@ -264,13 +283,20 @@ def main():
         mask = reconstructed_padding_mask[0]
         mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
         recon_audio = vocoder.decode(mel).squeeze()
-        
+
         recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
         if recon_audio.dim() == 1:
             recon_audio = recon_audio.unsqueeze(0)
-            
+
+        end_time = time.time()
+        processing_time = end_time - start_time
+        audio_duration = recon_audio.shape[-1] / 24000.0
+        rtf = processing_time / audio_duration if audio_duration > 0 else 0
+        logger.info(f"Generated {audio_duration:.2f}s of audio in {processing_time:.2f}s (RTF: {rtf:.3f})")
+
         torchaudio.save(args.output, recon_audio.cpu(), 24000)
         logger.info(f"SUCCESS: Audio generated and saved to '{args.output}'!")
+
 
 if __name__ == "__main__":
     main()

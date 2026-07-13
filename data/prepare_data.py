@@ -106,8 +106,10 @@ def main():
 
     if local_rank == 0:
         print("Loading ECAPA model...")
+    ecapa_savedir = os.path.join(os.environ.get("SCRATCH", ""), ".cache/speechbrain/spkrec-ecapa-voxceleb")
     ecapa_classifier = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=ecapa_savedir,
         run_opts={"device": str(device)}
     )
 

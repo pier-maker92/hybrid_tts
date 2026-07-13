@@ -163,6 +163,7 @@ class Transformer(Module):
         
         # FiLM ECAPA injection
         if self.use_ecapa_film and ecapa is not None:
+            ecapa = F.normalize(ecapa, p=2, dim=-1)
             time_emb = time_emb + self.ecapa_proj(ecapa)
 
         # add register tokens to the left
