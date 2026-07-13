@@ -17,6 +17,8 @@ class DiTConfig:
     window_attention_seconds: float = 0.0
     use_group_bidirectional: bool = False
     use_mlp_sampler: bool = False
+    use_ecapa_film: bool = False
+    ecapa_dim: int = 192
 
 
 @dataclass(kw_only=True)

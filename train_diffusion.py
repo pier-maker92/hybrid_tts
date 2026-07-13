@@ -130,6 +130,7 @@ class DiffusionOnlyModel(nn.Module):
         attention_mask: torch.BoolTensor,
         continuous_sequence: torch.FloatTensor,
         audio_padding_mask: torch.BoolTensor,
+        ecapa: Optional[torch.FloatTensor] = None,
         **kwargs
     ):
         # In this simplified scenario, discrete_sequence contains ONLY the discrete tokens 
@@ -148,6 +149,7 @@ class DiffusionOnlyModel(nn.Module):
                 target=continuous_sequence,
                 target_padding_mask=audio_padding_mask,
                 context_vector=context_vector,
+                ecapa=ecapa,
             ).loss
             
             # compute a fake norm ratio for logging compatibility
@@ -236,6 +238,17 @@ def main(cfg: DictConfig):
     
     model = DiffusionOnlyModel(config, tokenizer=tok)
     model.tokenizer = tok
+
+    pretrained_checkpoint = training_cfg.get("pretrained_checkpoint")
+    if pretrained_checkpoint:
+        logger.info(f"Loading pretrained weights from {pretrained_checkpoint}")
+        checkpoint_path = os.path.join(pretrained_checkpoint, "pytorch_model.bin")
+        if os.path.exists(checkpoint_path):
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded pretrained weights. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        else:
+            logger.warning(f"Pretrained checkpoint {checkpoint_path} not found!")
 
     learning_rate = float(training_cfg.get("learning_rate", 1e-4))
     min_learning_rate = float(training_cfg.get("min_learning_rate", 0.0))
@@ -367,6 +380,7 @@ def main(cfg: DictConfig):
                     attention_mask=batch.get("attention_mask"),
                     continuous_sequence=batch.get("continuous_sequence"),
                     audio_padding_mask=batch.get("audio_padding_mask"),
+                    ecapa=batch.get("ecapa"),
                 )
                 
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)

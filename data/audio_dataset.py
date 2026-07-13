@@ -77,6 +77,7 @@ class TrainDatasetWrapper(SimpleAudioDataset):
 
         data_dict["ids"] = data.get("id")
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
+        data_dict["ecapa"] = data.get("ecapa")
 
         return data_dict
 
@@ -103,13 +104,15 @@ class DataCollator(object):
         p_ids = [inst.get("phoneme_ids") for inst in instances]
         d_tokens = [inst.get("discrete_tokens") for inst in instances]
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
+        ecapa_embs = [inst.get("ecapa") for inst in instances]
 
         attention_mask = []
         discrete_sequence = []
         audio_padding_mask = []
         continuous_sequence = []
+        ecapa_sequence = []
         target_tokens = []
-        for p_id, d_token, c_token in zip(p_ids, d_tokens, c_tokens):
+        for p_id, d_token, c_token, ecapa_emb in zip(p_ids, d_tokens, c_tokens, ecapa_embs):
             if getattr(self.tokenizer, "audio_bpe", None) is not None:
                 d_token = self.tokenizer.audio_bpe.encode(d_token)
                 
@@ -141,6 +144,9 @@ class DataCollator(object):
                 #     c_token = [c[32:] for c in c_token]
                 continuous_sequence.append(torch.tensor(c_token))
                 audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
+
+            if ecapa_emb:
+                ecapa_sequence.append(torch.tensor(ecapa_emb, dtype=torch.float32))
 
         # all discrete
         discrete_sequence = pad_sequence(
@@ -177,6 +183,11 @@ class DataCollator(object):
             batch["continuous_sequence"] = None
             batch["audio_padding_mask"] = None
 
+        if len(ecapa_sequence) > 0:
+            batch["ecapa"] = torch.stack(ecapa_sequence, dim=0)
+        else:
+            batch["ecapa"] = None
+
         # Include transcriptions if available
         transcriptions = [inst.get("transcription") for inst in instances]
         if all(x is not None for x in transcriptions):
@@ -201,11 +212,13 @@ class DiffusionDataCollator(object):
 
         d_tokens = [inst.get("discrete_tokens") for inst in instances]
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
+        ecapa_embs = [inst.get("ecapa") for inst in instances]
 
         discrete_sequence = []
         continuous_sequence = []
         attention_mask = []
         audio_padding_mask = []
+        ecapa_sequence = []
         
         for d_token, c_token in zip(d_tokens, c_tokens):
             if self.tokenizer is not None and getattr(self.tokenizer, "audio_bpe", None) is not None:
@@ -217,6 +230,10 @@ class DiffusionDataCollator(object):
             if c_token:
                 continuous_sequence.append(torch.tensor(c_token))
                 audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
+                
+        for ecapa_emb in ecapa_embs:
+            if ecapa_emb:
+                ecapa_sequence.append(torch.tensor(ecapa_emb, dtype=torch.float32))
 
         # Pad discrete sequences
         discrete_sequence = pad_sequence(
@@ -246,6 +263,12 @@ class DiffusionDataCollator(object):
         else:
             batch["continuous_sequence"] = None
             batch["audio_padding_mask"] = None
+
+        if len(ecapa_sequence) > 0:
+            # ecapa is batch x 192 (usually 1D list), just stack them
+            batch["ecapa"] = torch.stack(ecapa_sequence, dim=0)
+        else:
+            batch["ecapa"] = None
 
         return batch
 
@@ -278,6 +301,7 @@ class TestDatasetWrapper(SimpleAudioDataset):
 
         data_dict["ids"] = data.get("id")
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
+        data_dict["ecapa"] = data.get("ecapa")
 
         # Robust transcription field lookup
         transcription = data.get("text_normalized") or data.get("transcript")

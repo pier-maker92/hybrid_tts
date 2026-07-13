@@ -31,11 +31,20 @@ class LibriTTSRPrepared(SimpleAudioDataset):
         super().__init__()
         vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
 
-        dataset = load_dataset("parquet", data_dir=parquet_dir)
+        # Load only train and test explicitly to avoid loading backups/sharded twice
+        data_files = {
+            "train": [f"{parquet_dir}/train/**/*.parquet", f"{parquet_dir}/train/*.parquet"],
+            "test": [f"{parquet_dir}/test/**/*.parquet", f"{parquet_dir}/test/*.parquet"]
+        }
+        
+        # Datasets will ignore globs that find nothing, but to be safe, we let HF find the parquets
+        hf_cache_dir = f"{SLURM_TMPDIR}/hf_cache"
+        os.makedirs(hf_cache_dir, exist_ok=True)
+        dataset = load_dataset("parquet", data_files=data_files, cache_dir=hf_cache_dir)
 
         # Organize partitions by destination (train/test)
         partitions_per_destination = defaultdict(list)
-        for partition in dataset:
+        for partition in dataset.keys():
             dest = "train" if "train" in partition else "test"
             partitions_per_destination[dest].append(dataset[partition])
 
@@ -73,10 +82,4 @@ class LibriTTSRPrepared(SimpleAudioDataset):
         # --- Map phoneme IDs onto each partition ---
         for dest, parts in partitions_per_destination.items():
             ds = concatenate_datasets(parts)
-            ds = ds.map(
-                _build_phoneme_ids,
-                fn_kwargs={"phoneme_vocab": self.phoneme_vocab},
-                batched=True,
-                num_proc=8,
-            )
             setattr(self, f"{dest}_dataset", ds)

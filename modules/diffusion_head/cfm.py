@@ -33,6 +33,8 @@ class DiT(torch.nn.Module):
         self.use_window_attention = config.use_window_attention
         self.use_group_bidirectional = config.use_group_bidirectional
         self.use_mlp_sampler = config.use_mlp_sampler
+        self.use_ecapa_film = getattr(config, 'use_ecapa_film', False)
+        self.ecapa_dim = getattr(config, 'ecapa_dim', 192)
 
         latent_fps = 12.5  # 24000 / 256 #FIXME hardcoded to 24kHz dataset
         self.window_size = (
@@ -83,6 +85,8 @@ class DiT(torch.nn.Module):
                 is_causal=self.is_causal,
                 attn_flash=True,
                 window_size=self.window_size,
+                use_ecapa_film=self.use_ecapa_film,
+                ecapa_dim=self.ecapa_dim,
             )
 
     def handle_context_vector(
@@ -174,6 +178,7 @@ class DiT(torch.nn.Module):
         state: torch.FloatTensor,
         target: torch.FloatTensor,
         flow_mask: torch.BoolTensor,
+        ecapa: Optional[torch.FloatTensor] = None,
     ):
         mask_to_loss = ~flow_mask
         v = self.net(
@@ -181,6 +186,7 @@ class DiT(torch.nn.Module):
             times=times,
             attention_mask=mask_to_loss if not self.use_mlp_sampler else None,
             group_size=self._group_size if not self.use_mlp_sampler else None,
+            ecapa=ecapa,
         )
 
         v_to_loss = v[mask_to_loss].view(-1, self.audio_latent_dim)
@@ -194,6 +200,7 @@ class DiT(torch.nn.Module):
         target: torch.FloatTensor,
         target_padding_mask: torch.BoolTensor,
         context_vector: torch.FloatTensor,
+        ecapa: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         context_vector, prior, _ = self.handle_context_vector(context_vector)
@@ -211,6 +218,7 @@ class DiT(torch.nn.Module):
             state=state,
             target=v_target,
             flow_mask=target_padding_mask,
+            ecapa=ecapa,
         )
 
         return DecoderOutput(
@@ -225,6 +233,7 @@ class DiT(torch.nn.Module):
         guidance_scale: float = 1.0,
         generator: Optional[torch.Generator] = None,
         padding_mask: Optional[torch.BoolTensor] = None,
+        ecapa: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         cfg_scale = guidance_scale
@@ -273,6 +282,7 @@ class DiT(torch.nn.Module):
                     if upsampled_padding_mask is not None
                     else None
                 ),
+                ecapa=ecapa,
             )
             return features
 
@@ -293,6 +303,7 @@ class DiT(torch.nn.Module):
         cfg_scale: float,
         context_vector,
         attention_mask: Optional[torch.BoolTensor] = None,
+        ecapa: Optional[torch.FloatTensor] = None,
     ):
         times = times.repeat(state.shape[0])
         if self.use_mlp_sampler:
@@ -312,6 +323,7 @@ class DiT(torch.nn.Module):
             times=times,
             attention_mask=attention_mask if not self.use_mlp_sampler else None,
             group_size=gs if not self.use_mlp_sampler else None,
+            ecapa=ecapa,
         )
         if cfg_scale == 1.0:
             return cond_out
@@ -330,6 +342,7 @@ class DiT(torch.nn.Module):
             times=times,
             attention_mask=attention_mask if not self.use_mlp_sampler else None,
             group_size=gs if not self.use_mlp_sampler else None,
+            ecapa=torch.zeros_like(ecapa) if ecapa is not None else None,
         )
 
         final = (cfg_scale * cond_out + (1 - cfg_scale) * uncond_out).to(

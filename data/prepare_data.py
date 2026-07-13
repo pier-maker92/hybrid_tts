@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 from datasets import load_dataset
 from torch.utils.data import DataLoader, DistributedSampler
 from modules.submodules.MelCausalVAE.modules.builder import build_model
+from speechbrain.inference.speaker import EncoderClassifier
 
 
 def collate_fn(batch):
@@ -103,6 +104,13 @@ def main():
     model.to(device)
     model.eval()
 
+    if local_rank == 0:
+        print("Loading ECAPA model...")
+    ecapa_classifier = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        run_opts={"device": str(device)}
+    )
+
     slurm_tmp = os.getenv("SLURM_TMPDIR", "")
     input_dir = Path(
         args.input_dir
@@ -186,6 +194,7 @@ def main():
         pbar = tqdm(dataloader, disable=(local_rank != 0), desc=f"Extracting {split}")
         for batch in pbar:
             audios_srs = []
+            ecapa_wavs = []
             for audio_item in batch["audio"]:
                 # Manually decode using torchaudio
                 try:
@@ -198,11 +207,17 @@ def main():
                     # Resample if necessary
                     if sr != target_sr:
                         tensor = torchaudio.functional.resample(tensor, sr, target_sr)
+                        
+                    if sr != 16000:
+                        wav_16k = torchaudio.functional.resample(wav.squeeze(0).float(), sr, 16000)
+                    else:
+                        wav_16k = wav.squeeze(0).float()
 
                     # Apply dtype
                     tensor = tensor.to(dtype)
 
                     audios_srs.append((tensor.to(device), target_sr))
+                    ecapa_wavs.append(wav_16k.to(device))
                 except Exception as e:
                     print(f"Error decoding audio: {e}")
                     # Fallback or skip
@@ -213,6 +228,7 @@ def main():
 
             discrete_feats_batch = []
             continuous_feats_batch = []
+            ecapa_feats_batch = []
 
             with torch.no_grad():
                 features, padding_mask, _, _, _ = model.extract_features(audios_srs)
@@ -252,10 +268,16 @@ def main():
                     discrete_feats_batch.append(discrete_feat)
                     continuous_feats_batch.append(continuous_feat)
 
+                # Extract ECAPA
+                for w in ecapa_wavs:
+                    emb = ecapa_classifier.encode_batch(w.unsqueeze(0))
+                    ecapa_feats_batch.append(emb.squeeze().cpu().numpy().tolist())
+
             # Stream batch to parquet to avoid OOM
             batch_data = {col: batch[col] for col in split_ds.column_names}
             batch_data["discrete"] = discrete_feats_batch
             batch_data["continuous"] = continuous_feats_batch
+            batch_data["ecapa"] = ecapa_feats_batch
 
             table = pa.Table.from_pydict(batch_data)
             if writer is None:
