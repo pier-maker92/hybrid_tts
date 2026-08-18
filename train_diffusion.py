@@ -208,11 +208,10 @@ def main(cfg: DictConfig):
     tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
     logger.info("Creating Diffusion-only model...")
-    from modules.builder import load_codebook_config
+    from modules.builder import load_codebook_config_from_cfg
     from modules.configs import HybridTTSConfig, DiTConfig
     
-    vae_checkpoint = cfg_dict.get("vae_checkpoint")
-    continuous_dim, _ = load_codebook_config(vae_checkpoint)
+    continuous_dim, _ = load_codebook_config_from_cfg(cfg_dict)
     
     diffusion_head_cfg = cfg_dict.get("diffusion_head", cfg_dict.get("diffusion_head_config", {}))
     diffusion_config = DiTConfig(**diffusion_head_cfg)

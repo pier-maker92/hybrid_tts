@@ -46,9 +46,12 @@ def build_dataset(training_cfg: Dict[str, Any]):
         from data.librispeech_align import LibriSpeechAlignDataset
 
         dataset = LibriSpeechAlignDataset(force_vocab_build=force_vocab_build)
-    elif dataset_name == "ljspeech-prepared":
+    elif dataset_name in ["ljspeech-prepared", "ljspeech-dicodec18-kmeans512-prepared"]:
         from data.lj_speech_prepared import LJSpeechDataset
-        dataset = LJSpeechDataset(force_vocab_build=force_vocab_build)
+        dataset = LJSpeechDataset(
+            force_vocab_build=force_vocab_build,
+            dataset_dir_name=dataset_name,
+        )
     elif dataset_name in ["libritts-r", "libritts_r"]:
         from data.libri_tts_r_online import LibriTTSROnline
         dataset = LibriTTSROnline()
@@ -105,10 +108,10 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
         raise ValueError(
             "vae_checkpoint is required and must exist to load discrete_token_vocab_size"
         )
-    from modules.builder import load_codebook_config
+    from modules.builder import load_codebook_config_from_cfg
     from modules.audio_tokenizer import AudioTokenizer
 
-    _, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+    _, discrete_token_vocab_size = load_codebook_config_from_cfg(cfg_dict)
     
     audio_bpe = None
     if cfg_dict.get("use_tokenize") and cfg_dict.get("training", {}).get("discrete_only", False):

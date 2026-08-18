@@ -569,11 +569,14 @@ class HybridTTS(nn.Module):
         """
         # token head
         if hasattr(self, "token_head"):
+            head_dtype = next(self.token_head.parameters()).dtype
+            tokens_hidden_states = tokens_hidden_states.to(dtype=head_dtype)
             return self.token_head(tokens_hidden_states)
         else:
             target_embed_weight = self.backbone.get_output_embeddings().weight[
                 self.end_audio_id :
             ]
+            tokens_hidden_states = tokens_hidden_states.to(dtype=target_embed_weight.dtype)
             return F.linear(tokens_hidden_states, target_embed_weight)
 
     # -------------------------------------------------------------------------
@@ -652,12 +655,13 @@ class HybridTTS(nn.Module):
         # continuous features
         diffusion_loss = None
         if continuous_sequence is not None and self.diffusion_head is not None:
+            diffusion_dtype = next(self.diffusion_head.parameters()).dtype
             diffusion_loss = self.diffusion_head(
-                target=continuous_sequence,
+                target=continuous_sequence.to(dtype=diffusion_dtype),
                 target_padding_mask=audio_padding_mask,
                 context_vector=audio_hidden_states[
                     :, self.shift_audio_offset : -1
-                ],  # we stop at last audio frame
+                ].to(dtype=diffusion_dtype),  # we stop at last audio frame
             ).loss
 
         return HybridTTSOutput(

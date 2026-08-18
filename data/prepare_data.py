@@ -20,6 +20,50 @@ def collate_fn(batch):
     return {key: [item[key] for item in batch] for key in batch[0].keys()}
 
 
+def load_kmeans_codebook(path: str):
+    if path is None:
+        return None
+    if os.path.isdir(path):
+        path = os.path.join(path, "encoder_kmeans.pt")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"K-means checkpoint not found: {path}")
+    codebook = torch.load(path, map_location="cpu")
+    if "centroids" not in codebook:
+        raise ValueError(f"K-means checkpoint has no centroids: {path}")
+    return codebook
+
+
+def get_kmeans_latent_slice(codebook, latent_dim: int):
+    selection = codebook.get("latent_selection")
+    if selection is None:
+        start = 0
+        end = int(codebook["feature_dims"])
+    elif selection.get("indices") is not None:
+        raise ValueError("Non-contiguous k-means latent indices are not supported here.")
+    else:
+        start = int(selection.get("start", 0))
+        end = int(selection["end"])
+    if start != 0:
+        raise ValueError(
+            f"Expected k-means slice to start at 0, got [{start}:{end}]."
+        )
+    if end <= start or end > latent_dim:
+        raise ValueError(
+            f"K-means latent slice [{start}:{end}] is incompatible with dim {latent_dim}."
+        )
+    return start, end
+
+
+def assign_kmeans_tokens(latents, centroids, chunk_size: int):
+    assignments = []
+    latents = latents.to(dtype=torch.float32)
+    centroids = centroids.to(device=latents.device, dtype=torch.float32)
+    for chunk in latents.split(chunk_size):
+        distances = (chunk[:, None, :] - centroids[None, :, :]).square().sum(dim=-1)
+        assignments.append(distances.argmin(dim=1))
+    return torch.cat(assignments, dim=0)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract continuous and discrete features using MelCausalVAE"
@@ -63,7 +107,25 @@ def main():
     parser.add_argument(
         "--bf16", action="store_true", help="Use bfloat16 for inference"
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--kmeans_path",
+        type=str,
+        default=None,
+        help="Path to encoder_kmeans.pt or a directory containing it. If set, discrete tokens are nearest k-means centroids.",
+    )
+    parser.add_argument(
+        "--continuous_start",
+        type=int,
+        default=None,
+        help="First latent dimension to keep as continuous tokens. Defaults to the end of the k-means latent slice.",
+    )
+    parser.add_argument(
+        "--kmeans_chunk_size",
+        type=int,
+        default=16384,
+        help="Chunk size for nearest-centroid assignment.",
+    )
+    args, _ = parser.parse_known_args()
 
     # Setup distributed if torchrun is used
     is_distributed = "LOCAL_RANK" in os.environ
@@ -99,10 +161,34 @@ def main():
     checkpoint_path = os.path.join(args.checkpoint_dir, "model.safetensors")
     model.from_pretrained(checkpoint_path)
 
-    dtype = torch.bfloat16 if args.bf16 else torch.float32
+    # Keep feature extraction in fp32. The dicodec checkpoints include WavLM,
+    # whose input pipeline produces fp32 tensors; casting the full model to bf16
+    # causes WavLM conv input/weight dtype mismatches.
+    if args.bf16 and local_rank == 0:
+        print("Ignoring --bf16 for feature extraction; using float32.")
+    dtype = torch.float32
     model.to(dtype)
     model.to(device)
     model.eval()
+
+    kmeans_codebook = load_kmeans_codebook(args.kmeans_path)
+    kmeans_centroids = None
+    kmeans_start = None
+    kmeans_end = None
+    if kmeans_codebook is not None:
+        kmeans_start, kmeans_end = get_kmeans_latent_slice(
+            kmeans_codebook, int(model.config.latent_dim)
+        )
+        if args.continuous_start is None:
+            args.continuous_start = kmeans_end
+        kmeans_centroids = kmeans_codebook["centroids"].to(device=device)
+        if local_rank == 0:
+            print(
+                f"Using k-means tokens from dims [{kmeans_start}:{kmeans_end}], "
+                f"continuous dims [{args.continuous_start}:]."
+            )
+    elif args.continuous_start is None:
+        args.continuous_start = 0
 
     if local_rank == 0:
         print("Loading ECAPA model...")
@@ -132,7 +218,7 @@ def main():
         print(f"Loading dataset from {input_dir}...")
         print(f"Saving features to {output_dir}...")
         if args.bf16:
-            print("Using bfloat16 precision for inference.")
+            print("Requested bfloat16, but feature extraction is forced to float32.")
 
     # Identify dataset type based on name
     if "LJSpeech-1.1" in args.dataset_name:
@@ -241,13 +327,28 @@ def main():
                 for i in range(B):
                     mask = ~padding_mask[i]
 
-                    discrete_feat = (
-                        encoder_output.indices[i][mask].cpu().numpy().tolist()
+                    # Continuous features are always based on tail/z. If an external
+                    # k-means codebook is provided, nearest centroids on the configured
+                    # leading latent dims become the discrete tokens, and the remaining
+                    # dims become the continuous tokens.
+                    latent_source = (
+                        encoder_output.tail
+                        if encoder_output.tail is not None
+                        else encoder_output.z
                     )
-
-                    # Continuous features are always based on tail.
-                    # Add residual ONLY if add_vq_residual_to_stoch is True in config.
-                    continuous_tensor = encoder_output.tail[i][mask]
+                    continuous_tensor = latent_source[i][mask]
+                    if kmeans_centroids is not None:
+                        selected_for_kmeans = continuous_tensor[:, kmeans_start:kmeans_end]
+                        discrete_feat = assign_kmeans_tokens(
+                            selected_for_kmeans,
+                            kmeans_centroids,
+                            args.kmeans_chunk_size,
+                        ).cpu().numpy().tolist()
+                        continuous_tensor = continuous_tensor[:, args.continuous_start:]
+                    else:
+                        discrete_feat = (
+                            encoder_output.indices[i][mask].cpu().numpy().tolist()
+                        )
 
                     add_residual = False
                     if (

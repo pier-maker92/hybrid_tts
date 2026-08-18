@@ -25,7 +25,6 @@ from modules.submodules.MelCausalVAE.modules.feature_extractor import (
 SLURM_TMPDIR = os.getenv("SLURM_TMPDIR")
 if SLURM_TMPDIR is None:
     raise ValueError("SLURM_TMPDIR environment variable not set.")
-parquet_dir = f"{SLURM_TMPDIR}/datasets/ljspeech-prepared"
 # import mel spec encoder
 mel_spec_encoder = FeatureExtractor(config=MelSpectrogramConfig())
 
@@ -74,9 +73,13 @@ class CustomListDataset(Dataset):
 
 class LJSpeechDataset(SimpleAudioDataset):
     def __init__(
-        self, languages: Optional[List[str]] = None, force_vocab_build: bool = False
+        self,
+        languages: Optional[List[str]] = None,
+        force_vocab_build: bool = False,
+        dataset_dir_name: str = "ljspeech-prepared",
     ):
         super().__init__()
+        parquet_dir = f"{SLURM_TMPDIR}/datasets/{dataset_dir_name}"
         print(f"Loading parquet files manually from {parquet_dir}...")
         
         train_data = []

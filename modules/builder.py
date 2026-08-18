@@ -29,6 +29,37 @@ def load_codebook_config(vae_checkpoint: str):
     )
 
 
+def load_codebook_config_from_cfg(cfg_dict: Dict[str, Any]):
+    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    if not vae_checkpoint:
+        raise ValueError("VAE checkpoint is required to build model.")
+
+    continuous_dim, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+
+    kmeans_path = cfg_dict.get("kmeans_path")
+    if kmeans_path:
+        summary_path = (
+            os.path.join(kmeans_path, "summary.json")
+            if os.path.isdir(kmeans_path)
+            else os.path.join(os.path.dirname(kmeans_path), "summary.json")
+        )
+        if not os.path.exists(summary_path):
+            raise FileNotFoundError(f"kmeans_path requires summary.json: {summary_path}")
+        with open(summary_path, "r") as f:
+            summary = json.load(f)
+        latent_selection = summary.get("latent_selection", {})
+        if latent_selection.get("indices") is not None:
+            raise ValueError("Non-contiguous k-means latent indices are not supported.")
+        kmeans_end = int(
+            latent_selection.get("end", summary.get("feature_dims"))
+        )
+        continuous_start = int(cfg_dict.get("continuous_start", kmeans_end))
+        discrete_token_vocab_size = int(summary["num_clusters"])
+        continuous_dim = int(continuous_dim) - continuous_start
+
+    return continuous_dim, discrete_token_vocab_size
+
+
 def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridTTS:
     """Builds a HybridTTS model from a configuration dictionary."""
 
@@ -56,11 +87,9 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
     if token_head_cfg is not None:
         token_head_cfg = token_head_cfg.copy()
 
-    # Dynamic resolution of continuous_dim from VAE config.json
-    vae_checkpoint = cfg_dict.get("vae_checkpoint")
-    if not vae_checkpoint:
-        raise ValueError("VAE checkpoint is required to build model.")
-    continuous_dim, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+    # Dynamic resolution of continuous_dim/discrete vocab from VAE config.json,
+    # optionally overridden by an external k-means codebook.
+    continuous_dim, discrete_token_vocab_size = load_codebook_config_from_cfg(cfg_dict)
 
     shift_audio_offset = backbone_cfg.pop("shift_audio_offset")
     backbone_config = BackboneConfig(**backbone_cfg)

@@ -31,15 +31,16 @@ def load_diffusion_model(
     tokenizer
 ) -> torch.nn.Module:
     """Builds DiffusionOnlyModel and loads its weights from safetensors, pt or bin file."""
-    from modules.builder import load_codebook_config
+    from modules.builder import load_codebook_config_from_cfg
     from modules.configs import HybridTTSConfig, DiTConfig
     
     scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
     vae_checkpoint = cfg_dict.get("vae_checkpoint")
     if vae_checkpoint:
         vae_checkpoint = vae_checkpoint.replace("$SCRATCH", scratch_dir)
+        cfg_dict["vae_checkpoint"] = vae_checkpoint
         
-    continuous_dim, _ = load_codebook_config(vae_checkpoint)
+    continuous_dim, _ = load_codebook_config_from_cfg(cfg_dict)
     
     diffusion_head_cfg = cfg_dict.get("diffusion_head", cfg_dict.get("diffusion_head_config", {}))
     diffusion_config = DiTConfig(**diffusion_head_cfg)
