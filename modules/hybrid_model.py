@@ -29,7 +29,7 @@ class HybridTokenizer:
         end_audio_id: int,
         pad_id: int,
         discrete_token_vocab_size: int = 1024,
-        audio_bpe = None,
+        audio_bpe=None,
     ):
         self.prompt_vocab_size = prompt_vocab_size
         self.start_audio_id = start_audio_id
@@ -538,9 +538,7 @@ class HybridTTS(nn.Module):
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         # --- Unconditional training: drop prompts randomly ---
         B, L = discrete_sequence.shape
-        drop_mask = (
-            torch.rand(B, device=discrete_sequence.device) < self.uncond_prob
-        )
+        drop_mask = torch.rand(B, device=discrete_sequence.device) < self.uncond_prob
 
         if drop_mask.any():
             new_discrete = discrete_sequence.clone()
@@ -576,7 +574,9 @@ class HybridTTS(nn.Module):
             target_embed_weight = self.backbone.get_output_embeddings().weight[
                 self.end_audio_id :
             ]
-            tokens_hidden_states = tokens_hidden_states.to(dtype=target_embed_weight.dtype)
+            tokens_hidden_states = tokens_hidden_states.to(
+                dtype=target_embed_weight.dtype
+            )
             return F.linear(tokens_hidden_states, target_embed_weight)
 
     # -------------------------------------------------------------------------
@@ -659,9 +659,9 @@ class HybridTTS(nn.Module):
             diffusion_loss = self.diffusion_head(
                 target=continuous_sequence.to(dtype=diffusion_dtype),
                 target_padding_mask=audio_padding_mask,
-                context_vector=audio_hidden_states[
-                    :, self.shift_audio_offset : -1
-                ].to(dtype=diffusion_dtype),  # we stop at last audio frame
+                context_vector=audio_hidden_states[:, self.shift_audio_offset : -1].to(
+                    dtype=diffusion_dtype
+                ),  # we stop at last audio frame
             ).loss
 
         return HybridTTSOutput(
@@ -709,27 +709,31 @@ class HybridTTS(nn.Module):
 
         max_steps = kwargs.get("max_steps", 250)
 
-        do_cfg = kwargs.get("guidance_scale", 1.0) > 1.0
+        guidance_scale = kwargs.get("guidance_scale", 1.0)
+        if guidance_scale is None:
+            guidance_scale = 1.0
+        do_cfg = guidance_scale != 1.0 and not (
+            getattr(self.config, "discrete_only", False) or self.diffusion_head is None
+        )
         B_orig, L = discrete_sequence.shape
 
         if do_cfg:
-            start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
+            start_idx, _ = self._extract_audio_tokens_span(discrete_sequence)
             uncond_discrete = discrete_sequence.clone()
             uncond_mask = attention_mask.clone()
 
             for b in range(B_orig):
                 s_idx = start_idx[b].item()
-                if s_idx > 0:
-                    keep_len = L - s_idx
-                    uncond_discrete[b, -keep_len:] = discrete_sequence[b, s_idx:]
-                    uncond_discrete[b, :-keep_len] = self.pad_token_id
+                keep_len = L - s_idx
+                uncond_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
+                uncond_discrete[b, keep_len:] = self.pad_token_id
+                uncond_mask[b, :keep_len] = attention_mask[b, s_idx:]
+                uncond_mask[b, keep_len:] = False
 
-                    uncond_mask[b, -keep_len:] = attention_mask[b, s_idx:]
-                    uncond_mask[b, :-keep_len] = False
-
-            uncond_embs = embed_layer(uncond_discrete)
-            input_embs = embed_layer(discrete_sequence)
-            input_embs = torch.cat([input_embs, uncond_embs], dim=0)
+            input_embs = torch.cat(
+                [embed_layer(discrete_sequence), embed_layer(uncond_discrete)],
+                dim=0,
+            )
             attention_mask = torch.cat([attention_mask, uncond_mask], dim=0)
         else:
             input_embs = embed_layer(discrete_sequence)
@@ -750,9 +754,7 @@ class HybridTTS(nn.Module):
             if do_cfg:
                 cond_hidden = last_hidden_state[:B_orig]
                 uncond_hidden = last_hidden_state[B_orig:]
-
                 token_logits = self.get_token_logits(cond_hidden.squeeze(1))
-                
                 diffusion_context = (cond_hidden, uncond_hidden)
             else:
                 token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
@@ -765,12 +767,22 @@ class HybridTTS(nn.Module):
                 if step >= self.shift_audio_offset and (
                     not is_end or self.shift_audio_offset > 0
                 ):
-                    generated_continuous_tokens = self.diffusion_head.generate(
+                    generation_kwargs = dict(
                         num_steps=kwargs.get("num_steps"),
                         context_vector=diffusion_context,
                         temperature=kwargs.get("diffusion_temperature"),
-                        guidance_scale=kwargs.get("guidance_scale"),
+                    )
+                    feedback_continuous_tokens = self.diffusion_head.generate(
+                        **generation_kwargs,
+                        guidance_scale=1.0,
                     ).audio_features
+                    if do_cfg:
+                        generated_continuous_tokens = self.diffusion_head.generate(
+                            **generation_kwargs,
+                            guidance_scale=guidance_scale,
+                        ).audio_features
+                    else:
+                        generated_continuous_tokens = feedback_continuous_tokens
 
                     vae = kwargs.get("vae", None)
                     if (
@@ -778,21 +790,27 @@ class HybridTTS(nn.Module):
                         and hasattr(vae, "encoder")
                         and hasattr(vae.encoder, "reparameterize")
                     ):
-                        generated_continuous_tokens = vae.encoder.reparameterize(
-                            generated_continuous_tokens, std=0.2
+                        feedback_continuous_tokens = vae.encoder.reparameterize(
+                            feedback_continuous_tokens, std=0.2
                         )
+                        if do_cfg:
+                            generated_continuous_tokens = vae.encoder.reparameterize(
+                                generated_continuous_tokens, std=0.2
+                            )
+                        else:
+                            generated_continuous_tokens = feedback_continuous_tokens
 
                     all_continuous_tokens.append(generated_continuous_tokens)
-                    generated_continuous_tokens = self.norm_continuous(
-                        self.continuous_adapter(generated_continuous_tokens)
+                    feedback_continuous_tokens = self.norm_continuous(
+                        self.continuous_adapter(feedback_continuous_tokens)
                     ).detach()
 
                     if getattr(self, "continuous_scale", None) is not None:
-                        generated_continuous_tokens = (
-                            generated_continuous_tokens * self.continuous_scale
+                        feedback_continuous_tokens = (
+                            feedback_continuous_tokens * self.continuous_scale
                         )
                 else:
-                    generated_continuous_tokens = 0.0
+                    feedback_continuous_tokens = 0.0
 
             if is_end:
                 break
@@ -805,17 +823,15 @@ class HybridTTS(nn.Module):
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
                 next_token = (
-                    embed_layer(token_id).unsqueeze(1) + generated_continuous_tokens
+                    embed_layer(token_id).unsqueeze(1) + feedback_continuous_tokens
                 )
 
             if do_cfg:
                 next_token = next_token.repeat(2, 1, 1)
-                sampled_mask = torch.cat(
-                    [
-                        torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
-                        torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(-1),
-                    ],
-                    dim=0,
+                sampled_mask = torch.ones(
+                    (B_orig * 2, 1),
+                    dtype=torch.bool,
+                    device=sampled_id.device,
                 )
             else:
                 sampled_mask = torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(

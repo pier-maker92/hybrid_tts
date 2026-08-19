@@ -21,6 +21,7 @@ from inference import (
     load_hybrid_model,
     load_vae,
     load_vocoder,
+    load_voice_condition,
     clean_text_and_phonemize,
 )
 from inference_diffusion import load_diffusion_model
@@ -103,6 +104,12 @@ def main():
         default=8,
         help="Number of diffusion steps (default: 16)",
     )
+    parser.add_argument(
+        "--voice_condition",
+        type=str,
+        default=None,
+        help="Reference audio file used to extract a speaker embedding for DiCodec decoder FiLM conditioning.",
+    )
     args = parser.parse_args()
 
     if args.device:
@@ -177,6 +184,18 @@ def main():
     if vae is None:
         logger.error("Could not load VAE model.")
         sys.exit(1)
+
+    speaker_embedding = None
+    if args.voice_condition:
+        logger.info(f"Extracting speaker embedding from {args.voice_condition}...")
+        try:
+            speaker_embedding = load_voice_condition(args.voice_condition, vae, device)
+        except Exception as e:
+            logger.error(f"Could not load voice condition: {e}")
+            sys.exit(1)
+        logger.info(
+            f"Voice conditioning enabled: speaker_embedding shape={tuple(speaker_embedding.shape)}"
+        )
 
     vocoder = load_vocoder(args.vocoder, device)
     if vocoder is None:
@@ -277,6 +296,7 @@ def main():
             z_semantic=vq_emb,
             z_acoustic=z_denorm,
             padding_mask=padding_mask,
+            speaker_embedding=speaker_embedding,
         )
 
         mel = reconstructed_mel[0]
