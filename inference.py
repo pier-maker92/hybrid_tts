@@ -591,9 +591,9 @@ def main():
             )
             z = torch.cat([z_semantic, z_acoustic], dim=-1)
             reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=16,
+                num_steps=8,
                 temperature=0.2,
-                guidance_scale=1.0,
+                guidance_scale=1.3,
                 z=z,
                 padding_mask=padding_mask,
                 speaker_embedding=speaker_embedding,
@@ -621,9 +621,9 @@ def main():
                     device=device,
                 )
             reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=16,
+                num_steps=8,
                 temperature=0.2,
-                guidance_scale=1.0,
+                guidance_scale=1.3,
                 z_semantic=vq_emb,
                 z_acoustic=z_denorm,
                 padding_mask=padding_mask,
