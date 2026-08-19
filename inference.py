@@ -280,12 +280,14 @@ def main():
         "--text",
         "-t",
         type=str,
+        action="append",
         help="Input text string to synthesize (requires g2p_en package)",
     )
     group.add_argument(
         "--phonemes",
         "-p",
         type=str,
+        action="append",
         help="Direct space-separated ARPAbet phoneme sequence (e.g., 'HH AH0 L OW1 W ER1 L D')",
     )
     parser.add_argument(
@@ -357,6 +359,11 @@ def main():
         type=float,
         default=2.2,
         help="Ratio of generated VQ frames per phoneme (default: 2.2)",
+    )
+    parser.add_argument(
+        "--no_ratio",
+        action="store_true",
+        help="Use max_len only as an EOS generation cap instead of deriving length from prompt ratio.",
     )
     parser.add_argument(
         "--token_first",
@@ -488,42 +495,70 @@ def main():
         sys.exit(1)
 
     # Parse inputs to phoneme IDs
+    prompt_batches = []
+    input_labels = []
     if args.phonemes:
-        input_phonemes = args.phonemes.split()
-        prompt_ids = []
-        for p in input_phonemes:
-            if p in phoneme_vocab:
-                prompt_ids.append(phoneme_vocab[p])
-            else:
-                logger.warning(f"Phoneme '{p}' not found in vocabulary, skipping.")
-        logger.info(f"Parsed direct phoneme sequence: {input_phonemes} -> {prompt_ids}")
+        for phoneme_index, phoneme_text in enumerate(args.phonemes):
+            input_phonemes = phoneme_text.split()
+            prompt_ids = []
+            for p in input_phonemes:
+                if p in phoneme_vocab:
+                    prompt_ids.append(phoneme_vocab[p])
+                else:
+                    logger.warning(f"Phoneme '{p}' not found in vocabulary, skipping.")
+            logger.info(
+                f"Parsed direct phoneme sequence {phoneme_index}: {input_phonemes} -> {prompt_ids}"
+            )
+            if not prompt_ids:
+                logger.error(f"Empty phoneme input for phoneme index {phoneme_index}.")
+                sys.exit(1)
+            prompt_batches.append(prompt_ids)
+            input_labels.append(f"phonemes_{phoneme_index}")
     else:
-        prompt_ids = clean_text_and_phonemize(args.text, phoneme_vocab)
+        for text_index, text in enumerate(args.text):
+            prompt_ids = clean_text_and_phonemize(text, phoneme_vocab)
+            if not prompt_ids:
+                logger.error(f"Empty phoneme input for text index {text_index}.")
+                sys.exit(1)
+            prompt_batches.append(prompt_ids)
+            input_labels.append(f"text_{text_index}")
 
-    if not prompt_ids:
-        logger.error("Empty phoneme input. Nothing to synthesize.")
+    if not prompt_batches:
+        logger.error("Empty input. Nothing to synthesize.")
         sys.exit(1)
 
     # Map prompt_ids to unified vocab and append <start_audio>
+    for prompt_ids in prompt_batches:
+        prompt_ids.append(tok.start_audio_id)
 
-    prompt_ids.append(tok.start_audio_id)
-
-    # Calculate target length based on prompt length if default max_len is used
-    if args.max_len == 500:
-        target_len = int(len(prompt_ids) * args.ratio)
+    # Calculate target length based on prompt length if requested by legacy default.
+    if args.max_len == 500 and not args.no_ratio:
+        target_len = max(
+            int(len(prompt_ids) * args.ratio) for prompt_ids in prompt_batches
+        )
         logger.info(
             f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})"
         )
     else:
         target_len = args.max_len
-        logger.info(f"Using explicitly specified max_len: {target_len} frames")
+        logger.info(f"Using max_len as EOS cap: {target_len} frames")
 
     with torch.no_grad():
-        logger.info("Running built-in sample function...")
-        discrete_sequence = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        attention_mask = torch.ones_like(
-            discrete_sequence, dtype=torch.bool, device=device
+        logger.info(
+            f"Running built-in sample function for batch_size={len(prompt_batches)}..."
         )
+        prompt_tensors = [
+            torch.tensor(prompt_ids, dtype=torch.long, device=device)
+            for prompt_ids in prompt_batches
+        ]
+        discrete_sequence = torch.nn.utils.rnn.pad_sequence(
+            prompt_tensors,
+            batch_first=True,
+            padding_value=tok.pad_id,
+        )
+        attention_mask = torch.zeros_like(discrete_sequence, dtype=torch.bool)
+        for sample_index, prompt_ids in enumerate(prompt_batches):
+            attention_mask[sample_index, : len(prompt_ids)] = True
 
         batch = {
             "discrete_sequence": discrete_sequence,
@@ -542,112 +577,149 @@ def main():
 
         final_discrete = sample_out["discrete_tokens"]
         z_denorm = sample_out["continuous_tokens"]
+        discrete_lengths = sample_out.get("discrete_lengths")
+        if discrete_lengths is None:
+            discrete_lengths = (final_discrete.squeeze(-1) >= 0).sum(dim=1)
 
-        audio_tokens = final_discrete.squeeze(-1).squeeze(0).tolist()
+        output_root, output_ext = os.path.splitext(args.output)
+        if output_ext == "":
+            output_ext = ".wav"
+        multi_output = len(prompt_batches) > 1
 
-        if getattr(tok, "audio_bpe", None) is not None:
-            logger.info("Decoding BPE audio tokens to VAE tokens...")
-            audio_tokens = tok.audio_bpe.decode(audio_tokens)
+        for sample_index in range(len(prompt_batches)):
+            token_len = int(discrete_lengths[sample_index].item())
+            sample_discrete = final_discrete[sample_index]
+            if sample_discrete.ndim == 2:
+                sample_discrete = sample_discrete[:, 0]
+            audio_tokens = sample_discrete[:token_len].clamp_min(0).long().tolist()
 
-        tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-        padding_mask = torch.zeros(
-            (1, len(audio_tokens)), dtype=torch.bool, device=device
-        )
+            if getattr(tok, "audio_bpe", None) is not None:
+                logger.info("Decoding BPE audio tokens to VAE tokens...")
+                audio_tokens = tok.audio_bpe.decode(audio_tokens)
 
-        if kmeans_centroids is not None:
-            logger.info(
-                "Decoding kmeans discrete tokens plus continuous features using VAE..."
-            )
-            if not args.decode_only_token:
-                tokens_tensor = trim_unpaired_discrete_tokens(tokens_tensor, z_denorm)
-                audio_tokens = tokens_tensor.tolist()
-                padding_mask = torch.zeros(
-                    (1, len(audio_tokens)), dtype=torch.bool, device=device
-                )
-            if tokens_tensor.numel() == 0:
-                logger.error("No audio tokens were generated.")
-                sys.exit(1)
-            if (
-                tokens_tensor.min().item() < 0
-                or tokens_tensor.max().item() >= kmeans_centroids.shape[0]
-            ):
+            if not audio_tokens:
                 logger.error(
-                    f"Generated token out of kmeans range: min={tokens_tensor.min().item()}, "
-                    f"max={tokens_tensor.max().item()}, clusters={kmeans_centroids.shape[0]}"
+                    f"No audio tokens were generated for sample {sample_index}."
                 )
                 sys.exit(1)
-            z_semantic = kmeans_centroids.index_select(0, tokens_tensor).unsqueeze(0)
-            if args.decode_only_token or z_denorm is None:
+
+            z_sample = (
+                None
+                if z_denorm is None
+                else z_denorm[sample_index : sample_index + 1, :token_len]
+            )
+
+            tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
+            padding_mask = torch.zeros(
+                (1, len(audio_tokens)), dtype=torch.bool, device=device
+            )
+
+            if kmeans_centroids is not None:
                 logger.info(
-                    "Using only generated kmeans tokens; continuous features zeroed out."
+                    "Decoding kmeans discrete tokens plus continuous features using VAE..."
                 )
-                z_denorm = None
-            z_acoustic = align_continuous_tokens(
-                z_denorm,
-                length=len(audio_tokens),
-                continuous_dim=hybrid_model.config.continuous_dim,
-                dtype=dtype,
-                device=device,
-            )
-            z = torch.cat([z_semantic, z_acoustic], dim=-1)
-            reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=8,
-                temperature=0.2,
-                guidance_scale=1.3,
-                z=z,
-                padding_mask=padding_mask,
-                speaker_embedding=speaker_embedding,
-            )
-        else:
-            logger.info(
-                "Decoding VQ discrete tokens plus continuous features using VAE..."
-            )
-            vq_emb = vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0)
-            if args.decode_only_token or z_denorm is None:
-                logger.info(
-                    "Using only generated quantized tokens (continuous features zeroed out)."
+                if not args.decode_only_token:
+                    tokens_tensor = trim_unpaired_discrete_tokens(
+                        tokens_tensor, z_sample
+                    )
+                    audio_tokens = tokens_tensor.tolist()
+                    padding_mask = torch.zeros(
+                        (1, len(audio_tokens)), dtype=torch.bool, device=device
+                    )
+                if tokens_tensor.numel() == 0:
+                    logger.error(
+                        f"No audio tokens were generated for sample {sample_index}."
+                    )
+                    sys.exit(1)
+                if (
+                    tokens_tensor.min().item() < 0
+                    or tokens_tensor.max().item() >= kmeans_centroids.shape[0]
+                ):
+                    logger.error(
+                        f"Generated token out of kmeans range for sample {sample_index}: "
+                        f"min={tokens_tensor.min().item()}, max={tokens_tensor.max().item()}, "
+                        f"clusters={kmeans_centroids.shape[0]}"
+                    )
+                    sys.exit(1)
+                z_semantic = kmeans_centroids.index_select(0, tokens_tensor).unsqueeze(
+                    0
                 )
-                z_denorm = torch.zeros(
-                    (1, len(audio_tokens), hybrid_model.config.continuous_dim),
-                    dtype=dtype,
-                    device=device,
-                )
-            else:
-                z_denorm = align_continuous_tokens(
-                    z_denorm,
+                if args.decode_only_token or z_sample is None:
+                    logger.info(
+                        "Using only generated kmeans tokens; continuous features zeroed out."
+                    )
+                    z_sample = None
+                z_acoustic = align_continuous_tokens(
+                    z_sample,
                     length=len(audio_tokens),
                     continuous_dim=hybrid_model.config.continuous_dim,
                     dtype=dtype,
                     device=device,
                 )
-            reconstructed_mel, reconstructed_padding_mask = vae.sample(
-                num_steps=8,
-                temperature=0.2,
-                guidance_scale=1.3,
-                z_semantic=vq_emb,
-                z_acoustic=z_denorm,
-                padding_mask=padding_mask,
-                speaker_embedding=speaker_embedding,
+                z = torch.cat([z_semantic, z_acoustic], dim=-1)
+                reconstructed_mel, reconstructed_padding_mask = vae.sample(
+                    num_steps=8,
+                    temperature=0.2,
+                    guidance_scale=1.3,
+                    z=z,
+                    padding_mask=padding_mask,
+                    speaker_embedding=speaker_embedding,
+                )
+            else:
+                logger.info(
+                    "Decoding VQ discrete tokens plus continuous features using VAE..."
+                )
+                vq_emb = vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0)
+                if args.decode_only_token or z_sample is None:
+                    logger.info(
+                        "Using only generated quantized tokens (continuous features zeroed out)."
+                    )
+                    z_sample = torch.zeros(
+                        (1, len(audio_tokens), hybrid_model.config.continuous_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                else:
+                    z_sample = align_continuous_tokens(
+                        z_sample,
+                        length=len(audio_tokens),
+                        continuous_dim=hybrid_model.config.continuous_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                reconstructed_mel, reconstructed_padding_mask = vae.sample(
+                    num_steps=8,
+                    temperature=0.2,
+                    guidance_scale=1.3,
+                    z_semantic=vq_emb,
+                    z_acoustic=z_sample,
+                    padding_mask=padding_mask,
+                    speaker_embedding=speaker_embedding,
+                )
+
+            logger.info("Synthesizing waveform using Vocoder...")
+            mel = reconstructed_mel[0]
+            mask = reconstructed_padding_mask[0]
+            mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
+
+            recon_audio = vocoder.decode(mel).squeeze()
+            recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
+            if recon_audio.dim() == 1:
+                recon_audio = recon_audio.unsqueeze(0)
+
+            output_path = (
+                f"{output_root}_{sample_index}{output_ext}"
+                if multi_output
+                else args.output
             )
-
-        # Step 5: Synthesize waveform using Vocoder
-        logger.info("Synthesizing waveform using Vocoder...")
-        mel = reconstructed_mel[0]
-        mask = reconstructed_padding_mask[0]
-        # Squeeze the padding mask if applicable
-        mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
-
-        recon_audio = vocoder.decode(mel).squeeze()
-
-        # Normalize audio and save to disk
-        recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
-
-        # Ensure correct shape [1, num_samples]
-        if recon_audio.dim() == 1:
-            recon_audio = recon_audio.unsqueeze(0)
-
-        torchaudio.save(args.output, recon_audio.cpu(), 24000)
-        logger.info(f"SUCCESS: Audio generated and saved to '{args.output}'!")
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            torchaudio.save(output_path, recon_audio.cpu(), 24000)
+            logger.info(
+                f"SUCCESS: Audio generated for {input_labels[sample_index]} "
+                f"({token_len} tokens) and saved to '{output_path}'!"
+            )
 
 
 if __name__ == "__main__":
@@ -658,6 +730,26 @@ if __name__ == "__main__":
 # python inference.py \
 #   -c checkpoints/tmp \
 #   --text "I tripped over my own shoelaces and landed face-first in a pie. At least dessert was served" \
+#   --voice_condition /Users/software/Research/MelCausalVAE/ablations/female.wav \
+#   -o output.wav \
+#  --num_steps 6 \
+#  --diffusion_temperature 0.3 \
+#  --guidance_scale 1.8
+
+# python inference.py \
+#   -c checkpoints/tmp \
+#   --text "I stood frozen, my heart pounding in my chest, as I witnessed the horrifying moment my father was taken from us, desperate tears streaming down my face as I screamed for someone, anyone, to help." \
+#   --voice_condition /Users/software/Research/MelCausalVAE/ablations/female.wav \
+#   -o output.wav \
+#  --num_steps 6 \
+#  --diffusion_temperature 0.3 \
+#  --guidance_scale 1.8
+
+# batch inference
+# python inference.py \
+#   -c checkpoints/tmp \
+#   --text "I tripped over my own shoelaces and landed face-first in a pie. At least dessert was served" \
+#   --text "I stood frozen, my heart pounding in my chest, as I witnessed the horrifying moment my father was taken from us, desperate tears streaming down my face as I screamed for someone, anyone, to help." \
 #   --voice_condition /Users/software/Research/MelCausalVAE/ablations/female.wav \
 #   -o output.wav \
 #  --num_steps 6 \

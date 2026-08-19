@@ -375,6 +375,29 @@ class HybridTTS(nn.Module):
         end_indices = (discrete_sequence == self.end_audio_id).long().argmax(dim=1)
         return start_indices, end_indices
 
+    def _left_pad_valid_tokens(
+        self, discrete_sequence: torch.LongTensor, attention_mask: torch.BoolTensor
+    ):
+        """
+        Pack valid tokens to the right before cached autoregressive decoding.
+        Right padding makes the first generated step read from pad positions in batch.
+        """
+        B, L = discrete_sequence.shape
+        packed_discrete = discrete_sequence.new_full((B, L), self.pad_token_id)
+        packed_attention = torch.zeros_like(attention_mask, dtype=torch.bool)
+
+        for b in range(B):
+            valid_tokens = discrete_sequence[b, attention_mask[b]]
+            keep_len = valid_tokens.numel()
+            if keep_len > 0:
+                packed_discrete[b, L - keep_len :] = valid_tokens
+                packed_attention[b, L - keep_len :] = True
+
+        return packed_discrete, packed_attention
+
+    def _make_position_ids(self, attention_mask: torch.BoolTensor):
+        return (attention_mask.long().cumsum(dim=1) - 1).clamp_min(0)
+
     def _add_continuous_token(
         self,
         continuous_sequence: torch.FloatTensor,
@@ -704,9 +727,6 @@ class HybridTTS(nn.Module):
 
         embed_layer = self.backbone.get_input_embeddings()
 
-        all_continuous_tokens = []
-        all_discrete_tokens = []
-
         max_steps = kwargs.get("max_steps", 250)
 
         guidance_scale = kwargs.get("guidance_scale", 1.0)
@@ -717,43 +737,61 @@ class HybridTTS(nn.Module):
         )
         B_orig, L = discrete_sequence.shape
 
+        # PyTorch SDPA on MPS produces incorrect hidden states for left-padded
+        # batches under no_grad. Keep the working batch-1 path unchanged.
+        if discrete_sequence.device.type == "mps" and (B_orig > 1 or do_cfg):
+            backbone_model = getattr(self.backbone, "model", None)
+            backbone_config = getattr(backbone_model, "config", None)
+            if backbone_config is not None:
+                backbone_config._attn_implementation = "eager"
+
+        discrete_sequence, attention_mask = self._left_pad_valid_tokens(
+            discrete_sequence, attention_mask
+        )
+
         if do_cfg:
             start_idx, _ = self._extract_audio_tokens_span(discrete_sequence)
-            uncond_discrete = discrete_sequence.clone()
-            uncond_mask = attention_mask.clone()
+            uncond_discrete = discrete_sequence.new_full(
+                discrete_sequence.shape, self.pad_token_id
+            )
+            uncond_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
 
             for b in range(B_orig):
                 s_idx = start_idx[b].item()
                 keep_len = L - s_idx
-                uncond_discrete[b, :keep_len] = discrete_sequence[b, s_idx:]
-                uncond_discrete[b, keep_len:] = self.pad_token_id
-                uncond_mask[b, :keep_len] = attention_mask[b, s_idx:]
-                uncond_mask[b, keep_len:] = False
+                uncond_discrete[b, L - keep_len :] = discrete_sequence[b, s_idx:]
+                uncond_mask[b, L - keep_len :] = attention_mask[b, s_idx:]
 
             input_embs = torch.cat(
-                [embed_layer(discrete_sequence), embed_layer(uncond_discrete)],
-                dim=0,
+                [embed_layer(discrete_sequence), embed_layer(uncond_discrete)], dim=0
             )
             attention_mask = torch.cat([attention_mask, uncond_mask], dim=0)
         else:
             input_embs = embed_layer(discrete_sequence)
+        position_ids = self._make_position_ids(attention_mask)
 
         discrete_only = getattr(self.config, "discrete_only", False)
 
         past_key_values = None
+        active_indices = torch.arange(
+            B_orig, dtype=torch.long, device=discrete_sequence.device
+        )
+        discrete_outputs = [[] for _ in range(B_orig)]
+        continuous_outputs = [[] for _ in range(B_orig)]
 
         for step in tqdm(range(max_steps)):
-
+            B_active = active_indices.numel()
             last_hidden_state, past_key_values = self.backbone.inference_forward(
                 inputs_embeds=input_embs,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
 
             if do_cfg:
-                cond_hidden = last_hidden_state[:B_orig]
-                uncond_hidden = last_hidden_state[B_orig:]
+                cond_hidden = last_hidden_state[:B_active]
+                uncond_hidden = last_hidden_state[B_active:]
                 token_logits = self.get_token_logits(cond_hidden.squeeze(1))
                 diffusion_context = (cond_hidden, uncond_hidden)
             else:
@@ -761,28 +799,21 @@ class HybridTTS(nn.Module):
                 diffusion_context = last_hidden_state
 
             sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
-            is_end = (sampled_id == 0).all()
+            eos_mask = sampled_id == 0
 
             if not (discrete_only or self.diffusion_head is None):
                 if step >= self.shift_audio_offset and (
-                    not is_end or self.shift_audio_offset > 0
+                    not eos_mask.all() or self.shift_audio_offset > 0
                 ):
-                    generation_kwargs = dict(
+                    feedback_generation_kwargs = dict(
                         num_steps=kwargs.get("num_steps"),
-                        context_vector=diffusion_context,
+                        context_vector=cond_hidden if do_cfg else diffusion_context,
                         temperature=kwargs.get("diffusion_temperature"),
                     )
                     feedback_continuous_tokens = self.diffusion_head.generate(
-                        **generation_kwargs,
+                        **feedback_generation_kwargs,
                         guidance_scale=1.0,
                     ).audio_features
-                    if do_cfg:
-                        generated_continuous_tokens = self.diffusion_head.generate(
-                            **generation_kwargs,
-                            guidance_scale=guidance_scale,
-                        ).audio_features
-                    else:
-                        generated_continuous_tokens = feedback_continuous_tokens
 
                     vae = kwargs.get("vae", None)
                     if (
@@ -793,18 +824,52 @@ class HybridTTS(nn.Module):
                         feedback_continuous_tokens = vae.encoder.reparameterize(
                             feedback_continuous_tokens, std=0.2
                         )
-                        if do_cfg:
+
+                    if do_cfg:
+                        cpu_rng_state = torch.random.get_rng_state()
+                        device_type = feedback_continuous_tokens.device.type
+                        if device_type == "mps":
+                            device_rng_state = torch.mps.get_rng_state()
+                        elif device_type == "cuda":
+                            device_rng_state = torch.cuda.get_rng_state(
+                                feedback_continuous_tokens.device
+                            )
+                        else:
+                            device_rng_state = None
+
+                        generated_continuous_tokens = self.diffusion_head.generate(
+                            num_steps=kwargs.get("num_steps"),
+                            context_vector=diffusion_context,
+                            temperature=kwargs.get("diffusion_temperature"),
+                            guidance_scale=guidance_scale,
+                        ).audio_features
+                        if (
+                            vae is not None
+                            and hasattr(vae, "encoder")
+                            and hasattr(vae.encoder, "reparameterize")
+                        ):
                             generated_continuous_tokens = vae.encoder.reparameterize(
                                 generated_continuous_tokens, std=0.2
                             )
-                        else:
-                            generated_continuous_tokens = feedback_continuous_tokens
 
-                    all_continuous_tokens.append(generated_continuous_tokens)
+                        torch.random.set_rng_state(cpu_rng_state)
+                        if device_type == "mps":
+                            torch.mps.set_rng_state(device_rng_state)
+                        elif device_type == "cuda":
+                            torch.cuda.set_rng_state(
+                                device_rng_state, feedback_continuous_tokens.device
+                            )
+                    else:
+                        generated_continuous_tokens = feedback_continuous_tokens
+
+                    for local_idx, original_idx in enumerate(active_indices.tolist()):
+                        continuous_outputs[original_idx].append(
+                            generated_continuous_tokens[local_idx : local_idx + 1]
+                        )
+
                     feedback_continuous_tokens = self.norm_continuous(
                         self.continuous_adapter(feedback_continuous_tokens)
                     ).detach()
-
                     if getattr(self, "continuous_scale", None) is not None:
                         feedback_continuous_tokens = (
                             feedback_continuous_tokens * self.continuous_scale
@@ -812,56 +877,108 @@ class HybridTTS(nn.Module):
                 else:
                     feedback_continuous_tokens = 0.0
 
-            if is_end:
+            for local_idx, original_idx in enumerate(active_indices.tolist()):
+                if not eos_mask[local_idx]:
+                    discrete_outputs[original_idx].append(sampled_id[local_idx] - 1)
+
+            if eos_mask.all():
                 break
 
-            token_id = sampled_id - 1 + self.tokenizer.prompt_vocab_size
-
-            all_discrete_tokens.append((sampled_id - 1).unsqueeze(-1))
+            survivor_indices = (~eos_mask).nonzero(as_tuple=False).squeeze(-1)
+            token_id = (
+                sampled_id.index_select(0, survivor_indices)
+                - 1
+                + self.tokenizer.prompt_vocab_size
+            )
 
             if discrete_only or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
+                survivor_feedback = feedback_continuous_tokens
+                if isinstance(feedback_continuous_tokens, torch.Tensor):
+                    survivor_feedback = feedback_continuous_tokens.index_select(
+                        0, survivor_indices
+                    )
                 next_token = (
-                    embed_layer(token_id).unsqueeze(1) + feedback_continuous_tokens
+                    embed_layer(token_id).unsqueeze(1)
+                    + survivor_feedback
                 )
 
             if do_cfg:
                 next_token = next_token.repeat(2, 1, 1)
-                sampled_mask = torch.ones(
-                    (B_orig * 2, 1),
-                    dtype=torch.bool,
-                    device=sampled_id.device,
+                cache_indices = torch.cat(
+                    [survivor_indices, survivor_indices + B_active], dim=0
                 )
             else:
-                sampled_mask = torch.ones_like(sampled_id, dtype=torch.bool).unsqueeze(
-                    -1
-                )
+                cache_indices = survivor_indices
+
+            if past_key_values is not None:
+                if hasattr(past_key_values, "batch_select_indices"):
+                    past_key_values.batch_select_indices(cache_indices)
+                else:
+                    past_key_values = tuple(
+                        tuple(
+                            state.index_select(0, cache_indices) for state in layer
+                        )
+                        for layer in past_key_values
+                    )
+
+            attention_mask = attention_mask.index_select(0, cache_indices)
+            sampled_mask = torch.ones(
+                (cache_indices.numel(), 1),
+                dtype=torch.bool,
+                device=sampled_id.device,
+            )
+            attention_mask = torch.cat([attention_mask, sampled_mask], dim=1)
+            position_ids = (attention_mask.long().sum(dim=1) - 1).unsqueeze(-1)
 
             if self.config.backbone_config.model_type == "native":
-                input_embs = torch.cat([input_embs, next_token], dim=1)
+                input_embs = torch.cat(
+                    [input_embs.index_select(0, cache_indices), next_token], dim=1
+                )
             else:
                 input_embs = next_token
 
-            attention_mask = torch.cat(
-                [
-                    attention_mask,
-                    sampled_mask,
-                ],
-                dim=1,
-            )
+            active_indices = active_indices.index_select(0, survivor_indices)
 
-        if len(all_continuous_tokens) > 0:
-            final_continuous = torch.cat(all_continuous_tokens, dim=1)
+        generated_lengths = torch.tensor(
+            [len(tokens) for tokens in discrete_outputs],
+            dtype=torch.long,
+            device=discrete_sequence.device,
+        )
+        max_discrete_len = int(generated_lengths.max().item())
+        final_discrete = torch.full(
+            (B_orig, max_discrete_len, 1),
+            -1,
+            dtype=torch.long,
+            device=discrete_sequence.device,
+        )
+        for b, tokens in enumerate(discrete_outputs):
+            if tokens:
+                final_discrete[b, : len(tokens), 0] = torch.stack(tokens)
+
+        max_continuous_len = max(len(tokens) for tokens in continuous_outputs)
+        if max_continuous_len > 0:
+            first_continuous = next(
+                tokens[0] for tokens in continuous_outputs if tokens
+            )
+            final_continuous = torch.zeros(
+                (B_orig, max_continuous_len, first_continuous.shape[-1]),
+                dtype=first_continuous.dtype,
+                device=discrete_sequence.device,
+            )
+            for b, tokens in enumerate(continuous_outputs):
+                if tokens:
+                    sample_continuous = torch.cat(tokens, dim=1).squeeze(0)
+                    final_continuous[b, : sample_continuous.shape[0]] = sample_continuous
             final_continuous = self.dynamic_normalizer.denormalize(final_continuous)
         else:
             final_continuous = None
 
-        final_discrete = torch.cat(all_discrete_tokens, dim=1)
-
         return {
             "discrete_tokens": final_discrete,
             "continuous_tokens": final_continuous,
+            "discrete_lengths": generated_lengths,
         }
 
     # -------------------------------------------------------------------------
