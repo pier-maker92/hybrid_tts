@@ -9,26 +9,33 @@ from data.audio_dataset import SimpleAudioDataset
 SLURM_TMPDIR = os.getenv("SLURM_TMPDIR")
 if SLURM_TMPDIR is None:
     raise ValueError("SLURM_TMPDIR is not set")
-parquet_dir = f"{SLURM_TMPDIR}/datasets/libritts-r-prepared"
+DEFAULT_DATASET_DIR_NAME = os.getenv("LIBRITTS_R_PREPARED_DIR", "libritts-r-prepared")
 
 
 def _build_phoneme_ids(batch, phoneme_vocab):
     g2p = G2p()
     ids_batch = []
-    for text in batch.get("text_normalized", []):
+    texts = (
+        batch.get("text_normalized")
+        or batch.get("transcript")
+        or batch.get("transcription")
+        or []
+    )
+    for text in texts:
         ids = []
         if text:
             for p in g2p(text):
                 ids.append(phoneme_vocab.get(p, 0))
         ids_batch.append(ids)
-    return {"phoneme_ids": ids_batch}
+    return {"phoneme_ids": ids_batch, "prompt_ids": ids_batch}
 
 
 class LibriTTSRPrepared(SimpleAudioDataset):
     """LibriTTS-R pre-prepared dataset (discrete + continuous already extracted)."""
 
-    def __init__(self, force_vocab_build: bool = False):
+    def __init__(self, force_vocab_build: bool = False, dataset_dir_name: str | None = None):
         super().__init__()
+        parquet_dir = f"{SLURM_TMPDIR}/datasets/{dataset_dir_name or DEFAULT_DATASET_DIR_NAME}"
         vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
 
         # Load only train and test explicitly to avoid loading backups/sharded twice
@@ -82,4 +89,10 @@ class LibriTTSRPrepared(SimpleAudioDataset):
         # --- Map phoneme IDs onto each partition ---
         for dest, parts in partitions_per_destination.items():
             ds = concatenate_datasets(parts)
+            if "phoneme_ids" not in ds.column_names:
+                ds = ds.map(
+                    lambda batch: _build_phoneme_ids(batch, self.phoneme_vocab),
+                    batched=True,
+                    desc=f"Mapping phoneme IDs for {dest}",
+                )
             setattr(self, f"{dest}_dataset", ds)

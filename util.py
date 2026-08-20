@@ -58,10 +58,15 @@ def build_dataset(training_cfg: Dict[str, Any]):
         train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
         test_dataset = OnlineTestDatasetWrapper(dataset, "test")
         return train_dataset, test_dataset, dataset_name
-    elif dataset_name in ["libritts-r-prepared", "libritts_r_prepared"]:
+    elif dataset_name in [
+        "libritts-r-prepared",
+        "libritts_r_prepared",
+        "libritts-r-dicodec18-kmeans512-prepared",
+        "libritts-r-dicodec18-kmeans512-noecapa-prepared",
+    ]:
         from data.libri_tts_r_prepared import LibriTTSRPrepared
 
-        dataset = LibriTTSRPrepared()
+        dataset = LibriTTSRPrepared(dataset_dir_name=dataset_name)
         discrete_only = training_cfg.get("discrete_only", False)
         train_dataset = TrainDatasetWrapper(dataset, train_split, discrete_only=discrete_only)
         test_dataset = TrainDatasetWrapper(dataset, "test", discrete_only=discrete_only)

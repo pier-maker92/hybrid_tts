@@ -125,6 +125,11 @@ def main():
         default=16384,
         help="Chunk size for nearest-centroid assignment.",
     )
+    parser.add_argument(
+        "--skip_ecapa",
+        action="store_true",
+        help="Skip ECAPA speaker embedding extraction.",
+    )
     args, _ = parser.parse_known_args()
 
     # Setup distributed if torchrun is used
@@ -190,14 +195,19 @@ def main():
     elif args.continuous_start is None:
         args.continuous_start = 0
 
-    if local_rank == 0:
-        print("Loading ECAPA model...")
-    ecapa_savedir = os.path.join(os.environ.get("SCRATCH", ""), ".cache/speechbrain/spkrec-ecapa-voxceleb")
-    ecapa_classifier = EncoderClassifier.from_hparams(
-        source="speechbrain/spkrec-ecapa-voxceleb",
-        savedir=ecapa_savedir,
-        run_opts={"device": str(device)}
-    )
+    ecapa_classifier = None
+    if args.skip_ecapa:
+        if local_rank == 0:
+            print("Skipping ECAPA extraction.")
+    else:
+        if local_rank == 0:
+            print("Loading ECAPA model...")
+        ecapa_savedir = os.path.join(os.environ.get("SCRATCH", ""), ".cache/speechbrain/spkrec-ecapa-voxceleb")
+        ecapa_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir=ecapa_savedir,
+            run_opts={"device": str(device)}
+        )
 
     slurm_tmp = os.getenv("SLURM_TMPDIR", "")
     input_dir = Path(
@@ -296,16 +306,18 @@ def main():
                     if sr != target_sr:
                         tensor = torchaudio.functional.resample(tensor, sr, target_sr)
                         
-                    if sr != 16000:
-                        wav_16k = torchaudio.functional.resample(wav.squeeze(0).float(), sr, 16000)
-                    else:
-                        wav_16k = wav.squeeze(0).float()
+                    if not args.skip_ecapa:
+                        if sr != 16000:
+                            wav_16k = torchaudio.functional.resample(wav.squeeze(0).float(), sr, 16000)
+                        else:
+                            wav_16k = wav.squeeze(0).float()
 
                     # Apply dtype
                     tensor = tensor.to(dtype)
 
                     audios_srs.append((tensor.to(device), target_sr))
-                    ecapa_wavs.append(wav_16k.to(device))
+                    if not args.skip_ecapa:
+                        ecapa_wavs.append(wav_16k.to(device))
                 except Exception as e:
                     print(f"Error decoding audio: {e}")
                     # Fallback or skip
@@ -371,16 +383,17 @@ def main():
                     discrete_feats_batch.append(discrete_feat)
                     continuous_feats_batch.append(continuous_feat)
 
-                # Extract ECAPA
-                for w in ecapa_wavs:
-                    emb = ecapa_classifier.encode_batch(w.unsqueeze(0))
-                    ecapa_feats_batch.append(emb.squeeze().cpu().numpy().tolist())
+                if not args.skip_ecapa:
+                    for w in ecapa_wavs:
+                        emb = ecapa_classifier.encode_batch(w.unsqueeze(0))
+                        ecapa_feats_batch.append(emb.squeeze().cpu().numpy().tolist())
 
             # Stream batch to parquet to avoid OOM
             batch_data = {col: batch[col] for col in split_ds.column_names}
             batch_data["discrete"] = discrete_feats_batch
             batch_data["continuous"] = continuous_feats_batch
-            batch_data["ecapa"] = ecapa_feats_batch
+            if not args.skip_ecapa:
+                batch_data["ecapa"] = ecapa_feats_batch
 
             table = pa.Table.from_pydict(batch_data)
             if writer is None:
