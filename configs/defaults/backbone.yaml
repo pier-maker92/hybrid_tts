@@ -6,6 +6,8 @@ backbone:
   ffn_dim: null
   dropout: 0.1
   max_position_embeddings: null
+  n_kv_heads: null
+  rope_theta: null
   from_pretrained: false
   shift_audio_offset: 0
   force_weight_tying: false

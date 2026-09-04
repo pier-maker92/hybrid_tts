@@ -33,8 +33,8 @@ class DiT(torch.nn.Module):
         self.use_window_attention = config.use_window_attention
         self.use_group_bidirectional = config.use_group_bidirectional
         self.use_mlp_sampler = config.use_mlp_sampler
-        self.use_ecapa_film = getattr(config, 'use_ecapa_film', False)
-        self.ecapa_dim = getattr(config, 'ecapa_dim', 192)
+        self.use_ecapa_film = getattr(config, "use_ecapa_film", False)
+        self.ecapa_dim = getattr(config, "ecapa_dim", 192)
 
         latent_fps = 12.5  # 24000 / 256 #FIXME hardcoded to 24kHz dataset
         self.window_size = (
@@ -237,7 +237,7 @@ class DiT(torch.nn.Module):
         **kwargs,
     ):
         cfg_scale = guidance_scale
-        
+
         if isinstance(context_vector, tuple):
             cond_context, uncond_context = context_vector
         else:
@@ -251,7 +251,7 @@ class DiT(torch.nn.Module):
             generator=generator,
             padding_mask=padding_mask,
         )
-        
+
         if uncond_context is not None:
             uncond_context, _, _ = self.handle_context_vector(
                 uncond_context,
@@ -309,7 +309,7 @@ class DiT(torch.nn.Module):
         if self.use_mlp_sampler:
             times = self.sinu_pos_emb(times)
             times = rearrange(times, "(b t) h -> b t h", b=state.shape[0])
-            
+
         if isinstance(context_vector, tuple):
             cond_context, uncond_context = context_vector
         else:
@@ -329,14 +329,12 @@ class DiT(torch.nn.Module):
             return cond_out
 
         if uncond_context is not None:
-            uncond_state = self.noise_proj(
-                torch.cat([uncond_context, state], dim=-1)
-            )
+            uncond_state = self.noise_proj(torch.cat([uncond_context, state], dim=-1))
         else:
             uncond_state = self.noise_proj(
                 torch.cat([torch.zeros_like(cond_context), state], dim=-1)
             )
-            
+
         uncond_out = self.net(
             x=uncond_state,
             times=times,

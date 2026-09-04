@@ -32,6 +32,8 @@ class BackboneConfig:
     num_layers: Optional[int] = None
     from_pretrained: Optional[bool] = None
     max_position_embeddings: Optional[int] = None
+    n_kv_heads: Optional[int] = None
+    rope_theta: Optional[float] = None
 
 
 @dataclass
@@ -62,6 +64,7 @@ class HybridTTSConfig:
     uncond_prob: float = 0.0
     no_augment_ratio: float = 0.0
     discrete_only: bool = False
+    continuous_only: bool = False
     backbone_hidden_size: Optional[int] = None
     continuous_scaling_mode: Optional[str] = None  # 'fixed' or 'learnable' or None
 

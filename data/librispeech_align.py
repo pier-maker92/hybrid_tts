@@ -15,18 +15,12 @@ from data.audio_dataset import (
     TestDatasetWrapper,
 )
 from modules.hybrid_model import HybridTokenizer
-from modules.submodules.MelCausalVAE.modules.feature_extractor import (
-    FeatureExtractor,
-    MelSpectrogramConfig,
-)
 
 # Specify custom cache directory
 SLURM_TMPDIR = os.getenv("SLURM_TMPDIR")
 if SLURM_TMPDIR is None:
     raise ValueError("SLURM_TMPDIR environment variable not set.")
 parquet_dir = f"{SLURM_TMPDIR}/datasets/librispeech-aligned_prepared"
-# import mel spec encoder
-mel_spec_encoder = FeatureExtractor(config=MelSpectrogramConfig())
 
 
 def simple_collate_fn(batch):
@@ -49,14 +43,25 @@ def build_vocab_and_map(batch, phoneme_vocab):
 
 class LibriSpeechAlignDataset(SimpleAudioDataset):
     def __init__(
-        self, languages: Optional[List[str]] = None, force_vocab_build: bool = False
+        self,
+        languages: Optional[List[str]] = None,
+        force_vocab_build: bool = False,
+        keep_audio: bool = False,
     ):
         super().__init__()
         # Load the two datasets
         dataset = load_dataset(
             "parquet",
             data_dir=f"{parquet_dir}",
-        ).remove_columns("audio")
+        )
+        if not keep_audio:
+            audio_columns = [
+                column
+                for column in dataset[next(iter(dataset))].column_names
+                if column == "audio"
+            ]
+            if audio_columns:
+                dataset = dataset.remove_columns(audio_columns)
         # dataset = load_dataset(
         #     "parquet",
         #     data_files={

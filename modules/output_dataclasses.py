@@ -12,8 +12,8 @@ class DecoderOutput:
 
 @dataclass
 class HybridTTSOutput:
-    token_logits: torch.Tensor
-    diffusion_loss: torch.Tensor
+    token_logits: Optional[torch.Tensor]
+    diffusion_loss: Optional[torch.Tensor]
     diffusion_output: Optional[DecoderOutput] = None
     continuous_ratio: Optional[torch.Tensor] = None
     norm_ratio: Optional[torch.Tensor] = None

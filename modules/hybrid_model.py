@@ -30,6 +30,8 @@ class HybridTokenizer:
         pad_id: int,
         discrete_token_vocab_size: int = 1024,
         audio_bpe=None,
+        char_tokenizer=None,
+        audio_placeholder_id: Optional[int] = None,
     ):
         self.prompt_vocab_size = prompt_vocab_size
         self.start_audio_id = start_audio_id
@@ -37,6 +39,17 @@ class HybridTokenizer:
         self.pad_id = pad_id
         self.discrete_token_vocab_size = discrete_token_vocab_size
         self.audio_bpe = audio_bpe
+        self.char_tokenizer = char_tokenizer
+        self.audio_placeholder_id = audio_placeholder_id
+
+    def encode_text(self, text: str):
+        """Encode raw text to token IDs using the character tokenizer.
+
+        Returns a list of integer token IDs. Raises ValueError if no char tokenizer is loaded.
+        """
+        if self.char_tokenizer is None:
+            raise ValueError("No character tokenizer loaded.")
+        return self.char_tokenizer.encode(text)
 
     @property
     def unified_vocab_size(self) -> int:
@@ -286,6 +299,7 @@ class HybridTTS(nn.Module):
         self.pad_token_id = tokenizer.pad_id
         self.uncond_prob = config.uncond_prob
         self.discrete_only = config.discrete_only
+        self.continuous_only = config.continuous_only
         self.end_audio_id = tokenizer.end_audio_id
         self.start_audio_id = tokenizer.start_audio_id
         self.shift_audio_offset = config.shift_audio_offset
@@ -309,6 +323,22 @@ class HybridTTS(nn.Module):
 
             self.backbone = Transformer(bb_cfg)
             hidden_size = bb_cfg.hidden_dim
+        elif bb_cfg.model_type == "llama3":
+            from .llama3 import LlamaBackbone
+            self.backbone = LlamaBackbone(
+                vocab_size=self.unified_vocab_size,
+                pad_token_id=self.pad_token_id,
+                num_layers=bb_cfg.num_layers or 12,
+                dim=bb_cfg.hidden_dim or 512,
+                ffn_dim=bb_cfg.ffn_dim or 2048,
+                n_heads=bb_cfg.num_heads or 4,
+                n_kv_heads=bb_cfg.n_kv_heads or 1,
+                dropout=bb_cfg.dropout or 0.0,
+                rope_theta=bb_cfg.rope_theta or 10000.0,
+                max_seq_len=bb_cfg.max_position_embeddings or 4096,
+                tie_word_embeddings=self.discrete_only or bb_cfg.force_weight_tying,
+            )
+            hidden_size = bb_cfg.hidden_dim or 512
         else:
             if bb_cfg.from_pretrained:
                 raise NotImplementedError(
@@ -353,7 +383,10 @@ class HybridTTS(nn.Module):
         # constrains the hidden states to align with the discrete token embedding
         # space, potentially reducing the richness needed for continuous/acoustic
         # conditioning when predicting both discrete and continuous features.
-        if not self.discrete_only and not bb_cfg.force_weight_tying:
+        if (
+            not (self.discrete_only or self.continuous_only)
+            and not bb_cfg.force_weight_tying
+        ):
             print("initializing token head")
             self.token_head = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
@@ -669,11 +702,15 @@ class HybridTTS(nn.Module):
         )
 
         # tokens
-        if self.shift_audio_offset:
-            tokens_hidden_states = audio_hidden_states[:, : -self.shift_audio_offset, :]
-        else:
-            tokens_hidden_states = audio_hidden_states
-        token_logits = self.get_token_logits(tokens_hidden_states)
+        token_logits = None
+        if not self.continuous_only:
+            if self.shift_audio_offset:
+                tokens_hidden_states = audio_hidden_states[
+                    :, : -self.shift_audio_offset, :
+                ]
+            else:
+                tokens_hidden_states = audio_hidden_states
+            token_logits = self.get_token_logits(tokens_hidden_states)
 
         # continuous features
         diffusion_loss = None
@@ -729,7 +766,7 @@ class HybridTTS(nn.Module):
 
         max_steps = kwargs.get("max_steps", 250)
 
-        guidance_scale = kwargs.get("guidance_scale", 1.0)
+        guidance_scale = kwargs.get("guidance_scale", None)
         if guidance_scale is None:
             guidance_scale = 1.0
         do_cfg = guidance_scale != 1.0 and not (
@@ -737,13 +774,14 @@ class HybridTTS(nn.Module):
         )
         B_orig, L = discrete_sequence.shape
 
-        # PyTorch SDPA on MPS produces incorrect hidden states for left-padded
-        # batches under no_grad. Keep the working batch-1 path unchanged.
-        if discrete_sequence.device.type == "mps" and (B_orig > 1 or do_cfg):
-            backbone_model = getattr(self.backbone, "model", None)
-            backbone_config = getattr(backbone_model, "config", None)
-            if backbone_config is not None:
-                backbone_config._attn_implementation = "eager"
+        # # PyTorch SDPA on MPS produces incorrect hidden states for left-padded
+        # # batches under no_grad. Keep the working batch-1 path unchanged.
+        # NOTE: AI refuse. I don't think this is useful
+        # if discrete_sequence.device.type == "mps" and (B_orig > 1 or do_cfg):
+        #     backbone_model = getattr(self.backbone, "model", None)
+        #     backbone_config = getattr(backbone_model, "config", None)
+        #     if backbone_config is not None:
+        #         backbone_config._attn_implementation = "eager"
 
         discrete_sequence, attention_mask = self._left_pad_valid_tokens(
             discrete_sequence, attention_mask
@@ -770,7 +808,7 @@ class HybridTTS(nn.Module):
             input_embs = embed_layer(discrete_sequence)
         position_ids = self._make_position_ids(attention_mask)
 
-        discrete_only = getattr(self.config, "discrete_only", False)
+        discrete_only = getattr(self.config, "discrete_only")
 
         past_key_values = None
         active_indices = torch.arange(
@@ -793,89 +831,44 @@ class HybridTTS(nn.Module):
                 cond_hidden = last_hidden_state[:B_active]
                 uncond_hidden = last_hidden_state[B_active:]
                 token_logits = self.get_token_logits(cond_hidden.squeeze(1))
+                # token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
                 diffusion_context = (cond_hidden, uncond_hidden)
             else:
                 token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
                 diffusion_context = last_hidden_state
 
             sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
-            eos_mask = sampled_id == 0
+            eos_mask = sampled_id == 0  # EOS token is assumed to be 0
 
             if not (discrete_only or self.diffusion_head is None):
                 if step >= self.shift_audio_offset and (
                     not eos_mask.all() or self.shift_audio_offset > 0
                 ):
-                    feedback_generation_kwargs = dict(
+                    generation_kwargs = dict(
                         num_steps=kwargs.get("num_steps"),
                         context_vector=cond_hidden if do_cfg else diffusion_context,
                         temperature=kwargs.get("diffusion_temperature"),
+                        guidance_scale=guidance_scale,
+                        generator=kwargs.get("generator", None),
                     )
-                    feedback_continuous_tokens = self.diffusion_head.generate(
-                        **feedback_generation_kwargs,
-                        guidance_scale=1.0,
+                    generated_continuous_tokens = self.diffusion_head.generate(
+                        **generation_kwargs
                     ).audio_features
-
-                    vae = kwargs.get("vae", None)
-                    if (
-                        vae is not None
-                        and hasattr(vae, "encoder")
-                        and hasattr(vae.encoder, "reparameterize")
-                    ):
-                        feedback_continuous_tokens = vae.encoder.reparameterize(
-                            feedback_continuous_tokens, std=0.2
-                        )
-
-                    if do_cfg:
-                        cpu_rng_state = torch.random.get_rng_state()
-                        device_type = feedback_continuous_tokens.device.type
-                        if device_type == "mps":
-                            device_rng_state = torch.mps.get_rng_state()
-                        elif device_type == "cuda":
-                            device_rng_state = torch.cuda.get_rng_state(
-                                feedback_continuous_tokens.device
-                            )
-                        else:
-                            device_rng_state = None
-
-                        generated_continuous_tokens = self.diffusion_head.generate(
-                            num_steps=kwargs.get("num_steps"),
-                            context_vector=diffusion_context,
-                            temperature=kwargs.get("diffusion_temperature"),
-                            guidance_scale=guidance_scale,
-                        ).audio_features
-                        if (
-                            vae is not None
-                            and hasattr(vae, "encoder")
-                            and hasattr(vae.encoder, "reparameterize")
-                        ):
-                            generated_continuous_tokens = vae.encoder.reparameterize(
-                                generated_continuous_tokens, std=0.2
-                            )
-
-                        torch.random.set_rng_state(cpu_rng_state)
-                        if device_type == "mps":
-                            torch.mps.set_rng_state(device_rng_state)
-                        elif device_type == "cuda":
-                            torch.cuda.set_rng_state(
-                                device_rng_state, feedback_continuous_tokens.device
-                            )
-                    else:
-                        generated_continuous_tokens = feedback_continuous_tokens
 
                     for local_idx, original_idx in enumerate(active_indices.tolist()):
                         continuous_outputs[original_idx].append(
                             generated_continuous_tokens[local_idx : local_idx + 1]
                         )
 
-                    feedback_continuous_tokens = self.norm_continuous(
-                        self.continuous_adapter(feedback_continuous_tokens)
+                    generated_continuous_tokens = self.norm_continuous(
+                        self.continuous_adapter(generated_continuous_tokens)
                     ).detach()
                     if getattr(self, "continuous_scale", None) is not None:
-                        feedback_continuous_tokens = (
-                            feedback_continuous_tokens * self.continuous_scale
+                        generated_continuous_tokens = (
+                            generated_continuous_tokens * self.continuous_scale
                         )
                 else:
-                    feedback_continuous_tokens = 0.0
+                    generated_continuous_tokens = 0.0
 
             for local_idx, original_idx in enumerate(active_indices.tolist()):
                 if not eos_mask[local_idx]:
@@ -894,15 +887,12 @@ class HybridTTS(nn.Module):
             if discrete_only or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
-                survivor_feedback = feedback_continuous_tokens
-                if isinstance(feedback_continuous_tokens, torch.Tensor):
-                    survivor_feedback = feedback_continuous_tokens.index_select(
+                survivor_feedback = generated_continuous_tokens
+                if isinstance(generated_continuous_tokens, torch.Tensor):
+                    survivor_feedback = generated_continuous_tokens.index_select(
                         0, survivor_indices
                     )
-                next_token = (
-                    embed_layer(token_id).unsqueeze(1)
-                    + survivor_feedback
-                )
+                next_token = embed_layer(token_id).unsqueeze(1) + survivor_feedback
 
             if do_cfg:
                 next_token = next_token.repeat(2, 1, 1)
@@ -917,9 +907,7 @@ class HybridTTS(nn.Module):
                     past_key_values.batch_select_indices(cache_indices)
                 else:
                     past_key_values = tuple(
-                        tuple(
-                            state.index_select(0, cache_indices) for state in layer
-                        )
+                        tuple(state.index_select(0, cache_indices) for state in layer)
                         for layer in past_key_values
                     )
 
@@ -970,7 +958,9 @@ class HybridTTS(nn.Module):
             for b, tokens in enumerate(continuous_outputs):
                 if tokens:
                     sample_continuous = torch.cat(tokens, dim=1).squeeze(0)
-                    final_continuous[b, : sample_continuous.shape[0]] = sample_continuous
+                    final_continuous[b, : sample_continuous.shape[0]] = (
+                        sample_continuous
+                    )
             final_continuous = self.dynamic_normalizer.denormalize(final_continuous)
         else:
             final_continuous = None

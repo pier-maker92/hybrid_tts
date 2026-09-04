@@ -10,22 +10,72 @@ from .configs import (
 )
 
 
-def load_codebook_config(vae_checkpoint: str):
+def _resolve_quantizer_checkpoint(cfg_dict: Dict[str, Any]) -> str | None:
+    training_cfg = cfg_dict.get("training", {}) or {}
+    external_cfg = (
+        cfg_dict.get("external_semantic_quantizer_config")
+        or cfg_dict.get("external_semantic_quantizer")
+        or {}
+    )
+    checkpoint = (
+        training_cfg.get("semantic_quantizer_checkpoint")
+        or cfg_dict.get("semantic_quantizer_checkpoint")
+        or external_cfg.get("checkpoint_path")
+    )
+    if checkpoint:
+        checkpoint = checkpoint.replace(
+            "$SCRATCH",
+            os.environ.get("SCRATCH", "/Users/software/Research"),
+        )
+    return checkpoint
+
+
+def _load_quantizer_vocab_size(cfg_dict: Dict[str, Any]) -> int:
+    training_cfg = cfg_dict.get("training", {}) or {}
+    external_cfg = (
+        cfg_dict.get("external_semantic_quantizer_config")
+        or cfg_dict.get("external_semantic_quantizer")
+        or {}
+    )
+    configured_size = (
+        training_cfg.get("semantic_codebook_size")
+        or cfg_dict.get("semantic_codebook_size")
+        or external_cfg.get("codebook_size")
+    )
+    checkpoint = _resolve_quantizer_checkpoint(cfg_dict)
+    if checkpoint and os.path.isdir(checkpoint):
+        config_path = os.path.join(checkpoint, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                quantizer_cfg = json.load(f)
+            configured_size = (
+                quantizer_cfg.get("codebook_size")
+                or quantizer_cfg.get("num_embeddings")
+                or quantizer_cfg.get("num_codebooks")
+                or configured_size
+            )
+    return int(configured_size or 0)
+
+
+def load_codebook_config(vae_checkpoint: str, cfg_dict: Dict[str, Any] | None = None):
     config_path = os.path.join(vae_checkpoint, "config.json")
     with open(config_path, "r") as f:
-        cfg_dict = json.load(f)
+        vae_cfg = json.load(f)
 
-    continuous_dim = cfg_dict.get("latent_dim")
-    vq_config = cfg_dict["encoder_config"].get("vq_config", None)
+    continuous_dim = vae_cfg.get("latent_dim")
     vq_vocab_size = 0
+    vq_config = vae_cfg.get("encoder_config", {}).get("vq_config", None)
     if vq_config is not None:
-        dim_to_quantize = vq_config.get("dim_to_quantize")
+        dim_to_quantize = int(vq_config.get("dim_to_quantize", 0))
         vq_vocab_size = vq_config.get("num_embeddings")
-        if not vq_config.get("add_vq_residual_to_stoch"):
+        if not vq_config.get("add_vq_residual_to_stoch", False):
             continuous_dim = continuous_dim - dim_to_quantize
+    elif cfg_dict is not None:
+        vq_vocab_size = _load_quantizer_vocab_size(cfg_dict)
+
     return (
         continuous_dim,
-        vq_vocab_size,
+        int(vq_vocab_size or 0),
     )
 
 
@@ -34,7 +84,10 @@ def load_codebook_config_from_cfg(cfg_dict: Dict[str, Any]):
     if not vae_checkpoint:
         raise ValueError("VAE checkpoint is required to build model.")
 
-    continuous_dim, discrete_token_vocab_size = load_codebook_config(vae_checkpoint)
+    continuous_dim, discrete_token_vocab_size = load_codebook_config(
+        vae_checkpoint,
+        cfg_dict,
+    )
 
     kmeans_path = cfg_dict.get("kmeans_path")
     if kmeans_path:
@@ -95,7 +148,10 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
     backbone_config = BackboneConfig(**backbone_cfg)
 
     training_cfg = cfg_dict.get("training")
-    discrete_only = training_cfg.get("discrete_only")
+    discrete_only = training_cfg.get("discrete_only", False)
+    continuous_only = training_cfg.get("continuous_only", False)
+    if discrete_only and continuous_only:
+        raise ValueError("discrete_only and continuous_only are mutually exclusive.")
 
     diffusion_head_config = None
     if diffusion_head_cfg is not None and not discrete_only:
@@ -119,6 +175,7 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         uncond_prob=training_cfg.get("uncond_prob"),
         no_augment_ratio=training_cfg.get("no_augment_ratio"),
         discrete_only=discrete_only,
+        continuous_only=continuous_only,
         shift_audio_offset=shift_audio_offset,
         continuous_scaling_mode=cfg_dict.get("continuous_scaling_mode"),
     )

@@ -1,0 +1,73 @@
+# @package _global_
+# Llama 3 decoder + character tokenization + online continuous-only encoding
+training:
+  dataset_name: librispeech-aligned
+  train_split: "train"
+  output_dir: checkpoints/exps/librispeech-aligned-llama3-char-continuous
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 1
+  logging_steps: 10
+  save_total_limit: 3
+  report_to: none
+  wandb_project: hybrid_tts
+  wandb_run_name: librispeech-aligned-llama3-char-continuous
+  run_id: ""
+  bf16: true
+  eval_strategy: "no"
+  eval_steps: null
+  eval_num_samples: 4
+  save_steps: 2000
+  num_train_epochs: 30
+  max_steps: -1
+  learning_rate: 3.0e-4
+  min_learning_rate: 1.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  uncond_prob: 0.1
+  no_augment_ratio: 0.25
+  discrete_only: false
+  continuous_only: true
+  online_encode: true
+  audio_quantizer_source: z
+  include_quantizer_residual: false
+  semantic_quantizer_checkpoint: null
+  semantic_quantizer_type: std_vq
+  semantic_codebook_size: null
+  group_by_length: false
+  dataloader_num_workers: 0
+
+backbone:
+  model_type: "llama3"
+  num_layers: 12
+  num_heads: 4
+  n_kv_heads: 1
+  hidden_dim: 512
+  ffn_dim: 2048
+  dropout: 0.0
+  rope_theta: 10000.0
+  max_position_embeddings: 4096
+  from_pretrained: false
+  shift_audio_offset: 1
+  force_weight_tying: false
+
+diffusion_head:
+  net_dim: 512
+  net_depth: 6
+  net_heads: 8
+  uncond_prob: 0.1
+  use_mlp_sampler: false
+  is_causal: false
+  use_conv_layer: true
+
+continuous_adapter:
+  hidden_dim: 512
+  num_layers: 4
+
+vae_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq"
+text_tokenizer: "char"
+use_tokenize: false
+bpe_tokenizer_path: "audio_bpe.json"
+vocoder_checkpoint: "vocos"
+debug: false
+continuous_scaling_mode: "fixed"

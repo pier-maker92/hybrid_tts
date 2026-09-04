@@ -54,26 +54,36 @@ def get_scheduler(optimizer, warmup_steps, num_training_steps, initial_lr, min_l
         
     return LambdaLR(optimizer, get_lr_lambda)
 
+def load_vae_encoder(checkpoint_dir: str, device: torch.device, training_cfg: Dict):
+    try:
+        from modules.vae_encoder_only import load_encoder_only
+
+        vae = load_encoder_only(
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+            semantic_quantizer_checkpoint=training_cfg.get(
+                "semantic_quantizer_checkpoint"
+            ),
+            semantic_quantizer_type=training_cfg.get(
+                "semantic_quantizer_type", "std_vq"
+            ),
+            semantic_codebook_size=training_cfg.get("semantic_codebook_size"),
+            semantic_quantizer_source=training_cfg.get("audio_quantizer_source"),
+        )
+        vae.eval()
+        return vae
+    except Exception as e:
+        logger.error(f"Failed to load encoder-only VAE from {checkpoint_dir}: {e}")
+        return None
+
+
 def load_vae(checkpoint_dir: str, device: torch.device):
     try:
-        from modules.submodules.MelCausalVAE.modules.builder import (
-            build_model as build_vae,
+        from modules.submodules.MelCausalVAE.dicodec.modules.builder import (
+            load_pretrained_model,
         )
 
-        config_path = os.path.join(checkpoint_dir, "config.json")
-        with open(config_path, "r") as f:
-            cfg_dict = json.load(f)
-        vae = build_vae(cfg_dict)
-
-        checkpoint_path = os.path.join(checkpoint_dir, "model.safetensors")
-        if os.path.exists(checkpoint_path):
-            vae.from_pretrained(checkpoint_path)
-        else:
-            checkpoint_path = os.path.join(checkpoint_dir, "model.pt")
-            if os.path.exists(checkpoint_path):
-                vae.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-
-        vae.eval()
+        vae = load_pretrained_model(checkpoint_dir)
         vae.to(device)
         return vae
     except Exception as e:
@@ -102,8 +112,11 @@ def main(cfg: DictConfig):
     scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
     if cfg_dict.get("vae_checkpoint"):
         cfg_dict["vae_checkpoint"] = cfg_dict["vae_checkpoint"].replace("$SCRATCH", scratch_dir)
-
     training_cfg = cfg_dict.get("training", {})
+    if training_cfg.get("semantic_quantizer_checkpoint"):
+        training_cfg["semantic_quantizer_checkpoint"] = training_cfg[
+            "semantic_quantizer_checkpoint"
+        ].replace("$SCRATCH", scratch_dir)
     
     seed = training_cfg.get("seed")
     if seed is not None:
@@ -155,19 +168,31 @@ def main(cfg: DictConfig):
     eval_num_samples = training_cfg.pop("eval_num_samples", 100)
     
     # DataLoader preparation
-    is_online = dataset_name in ["libritts-r", "libritts_r"]
+    is_online = training_cfg.get("online_encode", False)
     if is_online:
         online_vae_checkpoint = cfg_dict.get("vae_checkpoint")
         logger.info(f"Online VAE encoding: loading VAE from {online_vae_checkpoint}")
         online_device = accelerator.device
-        online_vae = load_vae(online_vae_checkpoint, online_device)
+        online_vae = load_vae_encoder(
+            online_vae_checkpoint,
+            online_device,
+            training_cfg,
+        )
         if online_vae is None:
             raise RuntimeError("Online VAE encoding requires a valid vae_checkpoint")
         online_vae = online_vae.float().eval()
         for p in online_vae.parameters():
             p.requires_grad_(False)
         data_collator = DataCollatorWithVAE(
-            tokenizer=tok, vae=online_vae, device=online_device
+            tokenizer=tok,
+            vae=online_vae,
+            device=online_device,
+            discrete_only=training_cfg.get("discrete_only", False),
+            continuous_only=training_cfg.get("continuous_only", False),
+            quantizer_source=training_cfg.get("audio_quantizer_source", "z"),
+            include_quantizer_residual=training_cfg.get(
+                "include_quantizer_residual", False
+            ),
         )
         logger.info("DataCollatorWithVAE ready.")
     else:
@@ -252,6 +277,7 @@ def main(cfg: DictConfig):
 
     global_step = starting_step
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
+    continuous_only = training_cfg.get("continuous_only", False)
     
     running_token_loss = 0.0
     running_diffusion_loss = 0.0
@@ -277,21 +303,29 @@ def main(cfg: DictConfig):
                     audio_padding_mask=batch.get("audio_padding_mask"),
                 )
                 
-                token_logits = outputs.token_logits
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)
-                target_tokens = batch.get("target_tokens")
                 
-                unwrapped_model = accelerator.unwrap_model(model)
-                vocab_size = unwrapped_model.discrete_token_vocab_size + 1
-                
-                token_loss = loss_fct(
-                    token_logits.view(-1, vocab_size),
-                    target_tokens.view(-1)
-                )
-                
-                total_loss = token_loss + diffusion_loss
+                if continuous_only:
+                    if outputs.diffusion_loss is None:
+                        raise RuntimeError(
+                            "continuous_only=True requires continuous_sequence and a diffusion_head."
+                        )
+                    token_loss = torch.tensor(0.0, device=accelerator.device)
+                    total_loss = diffusion_loss
+                else:
+                    token_logits = outputs.token_logits
+                    target_tokens = batch.get("target_tokens")
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    vocab_size = unwrapped_model.discrete_token_vocab_size + 1
+
+                    token_loss = loss_fct(
+                        token_logits.view(-1, vocab_size),
+                        target_tokens.view(-1)
+                    )
+
+                    total_loss = token_loss + diffusion_loss
                 accelerator.backward(total_loss)
-                
+
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     

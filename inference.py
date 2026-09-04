@@ -565,6 +565,10 @@ def main():
             "attention_mask": attention_mask,
         }
 
+        # intatiate genertor with seed 42
+        generator = torch.Generator(device=device)
+        generator.manual_seed(42)
+
         sample_out = hybrid_model.sample(
             batch=batch,
             max_steps=target_len,
@@ -573,6 +577,7 @@ def main():
             diffusion_temperature=args.diffusion_temperature,
             guidance_scale=args.guidance_scale,
             vae=vae,
+            generator=generator,
         )
 
         final_discrete = sample_out["discrete_tokens"]

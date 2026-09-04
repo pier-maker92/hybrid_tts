@@ -79,6 +79,13 @@ class TrainDatasetWrapper(SimpleAudioDataset):
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
         data_dict["ecapa"] = data.get("ecapa")
 
+        # Pass raw text for on-the-fly char tokenization.
+        data_dict["transcription"] = (
+            data.get("text_normalized")
+            or data.get("transcript")
+            or data.get("transcription")
+        )
+
         return data_dict
 
 
@@ -90,9 +97,12 @@ class DataCollator(object):
         self.pad_id = tokenizer.pad_id
         self.start_audio_id = tokenizer.start_audio_id
         self.end_audio_id = tokenizer.end_audio_id
+        self.audio_placeholder_id = tokenizer.audio_placeholder_id
         self.vq_vocab_size = tokenizer.discrete_token_vocab_size
         self.prompt_vocab_size = tokenizer.prompt_vocab_size
         self.audio_eos_id = self.prompt_vocab_size + self.vq_vocab_size
+        self.use_char_tokenizer = getattr(tokenizer, "char_tokenizer", None) is not None
+        self.continuous_only = self.audio_placeholder_id is not None
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
@@ -100,8 +110,15 @@ class DataCollator(object):
         # Basic fields
         batch["ids"] = [inst.get("ids") for inst in instances]
 
-        # Phoneme IDs (to be renamed to prompt_ids in the batch)
-        p_ids = [inst.get("phoneme_ids") for inst in instances]
+        # Text token IDs: either from char tokenizer (on-the-fly) or pre-computed phoneme_ids
+        if self.use_char_tokenizer:
+            p_ids = []
+            for inst in instances:
+                text = inst.get("transcription") or ""
+                p_ids.append(self.tokenizer.encode_text(text))
+        else:
+            p_ids = [inst.get("phoneme_ids") for inst in instances]
+
         d_tokens = [inst.get("discrete_tokens") for inst in instances]
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
         ecapa_embs = [inst.get("ecapa") for inst in instances]
@@ -112,31 +129,44 @@ class DataCollator(object):
         continuous_sequence = []
         ecapa_sequence = []
         target_tokens = []
-        for p_id, d_token, c_token, ecapa_emb in zip(p_ids, d_tokens, c_tokens, ecapa_embs):
-            if getattr(self.tokenizer, "audio_bpe", None) is not None:
+        for p_id, d_token, c_token, ecapa_emb in zip(
+            p_ids, d_tokens, c_tokens, ecapa_embs
+        ):
+            if d_token is not None and getattr(self.tokenizer, "audio_bpe", None) is not None:
                 d_token = self.tokenizer.audio_bpe.encode(d_token)
-                
-            # vocab mapping
-            # prompt tokens keep their original IDs
-            p_id = p_id + [self.start_audio_id]
 
-            # discrete tokens are shifted by prompt_vocab_size
-            shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
+            if self.continuous_only:
+                if c_token is None:
+                    raise ValueError("continuous_only=True requires continuous_tokens.")
+                audio_len = len(c_token)
+                prompt_tokens = [self.audio_placeholder_id] * len(p_id)
+                shifted_d_token = [self.audio_placeholder_id] * audio_len
+                target_tokens.append(torch.full((audio_len + 1,), -100).long())
+            else:
+                if d_token is None:
+                    raise ValueError(
+                        "discrete_tokens are required unless continuous_only=True."
+                    )
+                prompt_tokens = p_id
+                shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
+                target_tokens.append(
+                    torch.tensor([d + 1 for d in d_token] + [0]).long()
+                )  # Targets are the vq tokens starting at 1. 0 will be the end_audio_id in the decoder.
 
-            # sequence ends with audio_eos_id
+            # vocab mapping: prompt/special tokens keep their IDs; audio slots are shifted
+            # VQ IDs in normal mode, or the generic placeholder in continuous-only mode.
+            p_id = prompt_tokens + [self.start_audio_id]
             sequence = p_id + shifted_d_token + [self.end_audio_id]
-            target_tokens.append(
-                torch.tensor([d + 1 for d in d_token] + [0]).long()
-            )  # Targets are the vq tokens starting at 1. 0 will be the end_audio_id in the decoder.
             discrete_sequence.append(torch.tensor(sequence).long())
             attention_mask.append(torch.tensor([1] * len(sequence)).bool())
             # continuous tail
-            if c_token:
-                assert len(c_token) == len(
-                    d_token
-                ), (  # we have already added the audio_eos token
-                    "continuous_tokens and discrete_tokens must have the same length"
-                )
+            if c_token is not None and len(c_token) > 0:
+                if not self.continuous_only:
+                    assert len(c_token) == len(
+                        d_token
+                    ), (  # we have already added the audio_eos token
+                        "continuous_tokens and discrete_tokens must have the same length"
+                    )
                 # if (
                 #     len(c_token[0]) == 64
                 # ):  # FIXME this is a temprary fix to handle the way I have extracted continuous token from prepare_data.py
@@ -351,7 +381,11 @@ class OnlineTrainDatasetWrapper(Dataset):
             "audio": data["audio"],
             "phoneme_ids": phoneme_ids,
             "ids": data.get("id", str(idx)),
-            "transcription": data.get("text_normalized") or data.get("transcript", ""),
+            "transcription": (
+                data.get("text_normalized")
+                or data.get("transcript")
+                or data.get("transcription", "")
+            ),
             # dummy for LengthGroupedSampler compatibility
             "input_ids": [0] * (len(phoneme_ids) + 100),
         }
@@ -367,10 +401,25 @@ class DataCollatorWithVAE:
 
     TARGET_SR = 24000
 
-    def __init__(self, tokenizer, vae, device):
+    def __init__(
+        self,
+        tokenizer,
+        vae,
+        device,
+        discrete_only: bool = False,
+        continuous_only: bool = False,
+        quantizer_source: str = "z",
+        include_quantizer_residual: bool = False,
+    ):
         self._base = DataCollator(tokenizer)
         self.vae = vae
         self.device = device
+        self.discrete_only = discrete_only
+        self.continuous_only = continuous_only
+        self.quantizer_source = quantizer_source
+        self.include_quantizer_residual = include_quantizer_residual
+        if self.quantizer_source not in {"z", "z_sem"}:
+            raise ValueError("quantizer_source must be either 'z' or 'z_sem'.")
 
     @torch.no_grad()
     def _encode_batch(self, instances):
@@ -391,15 +440,63 @@ class DataCollatorWithVAE:
                 tensor = torchaudio.functional.resample(tensor, sr, self.TARGET_SR)
             audios_srs.append((tensor.to(self.device), self.TARGET_SR))
 
-        features, padding_mask = self.vae.extract_features(audios_srs)
-        features = features.to(next(self.vae.parameters()).dtype)
-        encoder_output = self.vae.encode(features, padding_mask)
+        features, padding_mask = self.vae.extract_features(audios_srs)[:2]
+        vae_dtype = self.vae.dtype if hasattr(self.vae, "dtype") else next(self.vae.parameters()).dtype
+        features = features.to(vae_dtype)
+        encoder_output = self.vae.encode(
+            features,
+            padding_mask,
+            run_quantizer=not self.continuous_only,
+        )
 
         discrete_list, continuous_list = [], []
         for i in range(len(instances)):
             mask = ~encoder_output.padding_mask[i]
-            discrete_list.append(encoder_output.indices[i][mask].cpu().tolist())
-            continuous_list.append(encoder_output.tail[i][mask].float().cpu().tolist())
+            if self.continuous_only:
+                discrete_list.append(None)
+                continuous_list.append(encoder_output.z[i][mask].float().cpu().tolist())
+                continue
+
+            quantizer_output = getattr(encoder_output, "quantizer_output", None)
+            indices = (
+                getattr(quantizer_output, "indices", None)
+                if quantizer_output is not None
+                else getattr(encoder_output, "indices", None)
+            )
+            if indices is None:
+                raise RuntimeError(
+                    "Discrete token training requires an encoder or semantic quantizer."
+                )
+            discrete_list.append(indices[i][mask].cpu().tolist())
+
+            if self.discrete_only:
+                continuous_list.append(None)
+                continue
+
+            residual = (
+                getattr(quantizer_output, "residual", None)
+                if quantizer_output is not None
+                else getattr(encoder_output, "residual", None)
+            )
+            if self.quantizer_source == "z":
+                if residual is None:
+                    raise RuntimeError("source='z' hybrid training requires residual.")
+                continuous = residual
+            else:
+                if quantizer_output is None or quantizer_output.z_pros is None:
+                    raise RuntimeError(
+                        "source='z_sem' requires an external semantic quantizer "
+                        "that provides z_pros."
+                    )
+                continuous = quantizer_output.z_pros
+                if self.include_quantizer_residual:
+                    if residual is None:
+                        raise RuntimeError(
+                            "include_quantizer_residual=True requires residual."
+                        )
+                    continuous = continuous + residual
+
+            continuous_list.append(continuous[i][mask].float().cpu().tolist())
         return discrete_list, continuous_list
 
     def __call__(self, instances):
