@@ -98,7 +98,7 @@ class UTMOSPredictor:
 class WhisperASR:
     """faster-whisper based ASR for WER computation."""
 
-    def __init__(self, device: torch.device, model_name: str = "large-v3"):
+    def __init__(self, device: torch.device, model_name: str = "small"):
         logger.info(f"Loading faster-whisper ASR model: {model_name}")
         try:
             compute_type = "float16" if device.type == "cuda" else "float32"
