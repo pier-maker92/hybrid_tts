@@ -4,40 +4,54 @@ training:
   dataset_name: librispeech-aligned
   dataset_dir_name: librispeech-aligned
   train_split: "train"
-  max_audio_len: null
   output_dir: checkpoints/exps/librispeech-aligned-llama3
-  per_device_train_batch_size: 2
+
+  # audio len
+  max_audio_len: 20
+  per_device_train_batch_size: 8
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 1
   logging_steps: 10
   save_total_limit: 3
+
+  # logging
   report_to: none
   wandb_project: hybrid_tts
   wandb_run_name: librispeech-aligned-llama3
   run_id: ""
+
   bf16: true
-  eval_strategy: "no"
-  eval_steps: null
+
+  # eval and save
+  eval_strategy: "steps"
+  eval_steps: 30
   eval_num_samples: 4
   save_steps: 2000
+
+  # training
   num_train_epochs: 30
   max_steps: -1
   learning_rate: 3.0e-4
   min_learning_rate: 1.0e-5
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.05
+  warmup_ratio: 0.001
+
+  # uncond
   uncond_prob: 0.1
   no_augment_ratio: 0.25
+
+  # setting
   discrete_only: false
   continuous_only: false
   online_encode: true
   audio_quantizer_source: z_sem
-  include_quantizer_residual: false
+  include_quantizer_residual: true
   semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized/11kstep/z_sem"
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: 1024
+  
   group_by_length: false
-  dataloader_num_workers: 0
+  dataloader_num_workers: 8
 
 backbone:
   model_type: "llama3"

@@ -11,60 +11,64 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 from jiwer import wer as compute_wer, cer as compute_cer
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from faster_whisper import WhisperModel
+from transformers import WhisperTokenizer
 
 logger = logging.getLogger(__name__)
 
 
 class UTMOSPredictor:
-    """Standalone UTMOS predictor using utmosv2."""
+    """UTMOS predictor using tarepan/SpeechMOS."""
 
     def __init__(self, device: torch.device):
-        logger.info("Initializing UTMOSv2 model")
+        logger.info("Initializing UTMOS model")
         try:
-            import utmosv2
-
-            self.model = utmosv2.create_model(pretrained=True, device=str(device))
-        except ImportError:
-            logger.warning("utmosv2 not found. UTMOS prediction will be disabled.")
+            self.model = torch.hub.load(
+                "tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True
+            ).to(device)
+            self.model.eval()
+        except Exception as e:
+            logger.warning(f"Failed to load UTMOS model: {e}")
             self.model = None
         self.device = device
+        self.sample_rate = 16000
 
     @torch.no_grad()
-    def predict(self, wav_path: str) -> Optional[float]:
+    def predict(self, audio: torch.Tensor, sr: int) -> Optional[float]:
         if self.model is None:
             return None
-        # Disable utmosv2 multiprocessing to avoid issues
-        mos = self.model.predict(
-            input_path=str(wav_path),
-            device=str(self.device),
-            num_workers=0,
-        )
-        return float(mos)
+            
+        if sr != self.sample_rate:
+            audio = torchaudio.functional.resample(audio, sr, self.sample_rate)
+            
+        # Expects audio in shape [1, length]
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+            
+        audio = audio.to(self.device)
+        score = self.model(audio, self.sample_rate)
+        return float(score.cpu().item())
 
 
 class WhisperASR:
-    """Whisper based ASR for WER/CER computation."""
+    """faster-whisper based ASR for WER computation."""
 
-    def __init__(
-        self, device: torch.device, model_name: str = "openai/whisper-large-v3"
-    ):
-        if WhisperProcessor is None:
-            logger.warning("Transformers not found. Whisper ASR will be disabled.")
+    def __init__(self, device: torch.device, model_name: str = "large-v3"):
+        logger.info(f"Loading faster-whisper ASR model: {model_name}")
+        try:
+            compute_type = "float16" if device.type == "cuda" else "float32"
+            self.model = WhisperModel(model_name, device=device.type, compute_type=compute_type)
+            self.tokenizer = WhisperTokenizer.from_pretrained(f"openai/whisper-{model_name}")
+        except Exception as e:
+            logger.warning(f"Failed to load faster-whisper model: {e}")
             self.model = None
-            return
-
-        logger.info(f"Loading Whisper ASR model: {model_name}")
-        self.processor = WhisperProcessor.from_pretrained(model_name)
-        self.model = WhisperForConditionalGeneration.from_pretrained(model_name).to(
-            device
-        )
-        self.model.eval()
+            self.tokenizer = None
         self.device = device
 
-    @torch.no_grad()
     def transcribe(self, audio: torch.Tensor, sr: int) -> str:
-        """Transcribe audio tensor and return lowercase text."""
+        """Transcribe audio tensor and return normalized text."""
+        if self.model is None:
+            return ""
 
         # Whisper expects 16kHz mono
         if audio.dim() > 1:
@@ -72,22 +76,24 @@ class WhisperASR:
         if sr != 16000:
             audio = torchaudio.functional.resample(audio, sr, 16000)
 
-        # Whisper processor expects numpy/list on CPU
-        audio_input = (
-            audio.detach().cpu().float().numpy()
-            if isinstance(audio, torch.Tensor)
-            else audio
+        # faster-whisper expects numpy array on CPU
+        audio_input = audio.detach().cpu().numpy()
+
+        segs, _ = self.model.transcribe(
+            audio_input,
+            beam_size=1,
+            language="en",
+            without_timestamps=True,
         )
-
-        input_features = self.processor(
-            audio_input, sampling_rate=16000, return_tensors="pt"
-        ).input_features.to(self.device)
-        predicted_ids = self.model.generate(input_features)
-        transcription = self.processor.batch_decode(
-            predicted_ids, skip_special_tokens=True
-        )[0]
-
-        return transcription.lower().strip()
+        
+        text = ""
+        for seg in segs:
+            text += seg.text
+            
+        if self.tokenizer is not None:
+            text = self.tokenizer.normalize(text)
+            
+        return text.strip()
 
 
 def run_evaluation(
@@ -138,8 +144,6 @@ def run_evaluation(
         samples_metrics = []
         processed_count = 0
 
-        temp_wav_dir = eval_dir / "temp_wavs" / run_id
-        temp_wav_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Starting evaluation on up to {num_samples} samples...")
 
@@ -160,21 +164,18 @@ def run_evaluation(
 
             with torch.no_grad():
                 # Use bfloat16 autocast for the model
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    reconstruction_results = model.encode_decode(
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    reconstruction_results = model.sample(
                         batch=batch,
-                        vae=vae,
                         num_steps=16,
                         temperature=0.2,
                         guidance_scale=1.3,
+                        max_steps=250,
                     )
 
-                reconstructed_mels = reconstruction_results[
-                    "decoder_output"
-                ].audio_features
-                reconstructed_masks = reconstruction_results[
-                    "decoder_output"
-                ].padding_mask
+                reconstructed_mels = reconstruction_results["continuous_tokens"]
+                reconstructed_lengths = reconstruction_results["discrete_lengths"]
+                reconstructed_discrete = reconstruction_results["discrete_tokens"]
 
             for i in range(len(gt_texts)):
                 if processed_count >= num_samples:
@@ -191,23 +192,52 @@ def run_evaluation(
                     gt_cache[sid] = gt_metrics
 
                 # 2. Reconstruct audio from mel
-                mel = reconstructed_mels[i]
-                mask = reconstructed_masks[i]
-                # mel: [L, C] -> [1, C, L]
-                mel = mel[~mask].unsqueeze(0).permute(0, 2, 1).float().to(device)
+                if reconstructed_mels is None:
+                    continue
+                z_acoustic = reconstructed_mels[i]
+                mel_len = int(reconstructed_lengths[i].item())
+                mel_len = min(mel_len, z_acoustic.shape[0])
+                z_acoustic = z_acoustic[:mel_len].unsqueeze(0).float().to(device) # shape: [1, L, C]
 
                 with torch.no_grad():
+                    if vae is not None:
+                        padding_mask = torch.zeros((1, mel_len), dtype=torch.bool, device=device)
+                        if hasattr(vae, "encoder") and hasattr(vae.encoder, "vq") and reconstructed_discrete is not None:
+                            tokens_tensor = reconstructed_discrete[i][:mel_len, 0].to(device) # shape: [L]
+                            vq_emb = vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0) # shape: [1, L, C_vq]
+                            
+                            mel, mel_mask = vae.sample(
+                                num_steps=16,
+                                temperature=0.2,
+                                guidance_scale=1.4,
+                                z_semantic=vq_emb,
+                                z_acoustic=z_acoustic,
+                                padding_mask=padding_mask,
+                            )
+                        else:
+                            mel, mel_mask = vae.sample(
+                                num_steps=16,
+                                temperature=0.2,
+                                guidance_scale=1.4,
+                                z=z_acoustic,
+                                padding_mask=padding_mask,
+                            )
+                        mel = mel[0][~mel_mask[0]].unsqueeze(0).permute(0, 2, 1).float().to(device)
+                    else:
+                        # Fallback if no VAE is provided
+                        mel = z_acoustic.permute(0, 2, 1)
+
                     recon_audio = vocoder.decode(mel).squeeze()
 
                 recon_audio = recon_audio / (recon_audio.abs().max() + 1e-8)
                 sr = 24000  # FIXME: assume 24kHz
 
-                recon_wav_path = temp_wav_dir / f"{sid}_recon.wav"
-                torchaudio.save(str(recon_wav_path), recon_audio.unsqueeze(0).cpu(), sr)
+                recon_utmos = utmos_predictor.predict(recon_audio, sr)
+                recon_transcription = asr_model.transcribe(recon_audio, sr)
+                
+                if hasattr(asr_model, "tokenizer") and asr_model.tokenizer is not None:
+                    gt_text = asr_model.tokenizer.normalize(gt_text).strip()
 
-                recon_utmos = utmos_predictor.predict(str(recon_wav_path))
-                with torch.cuda.amp.autocast():
-                    recon_transcription = asr_model.transcribe(recon_audio, sr)
 
                 recon_wer = compute_wer(gt_text, recon_transcription)
                 recon_cer = compute_cer(gt_text, recon_transcription)
@@ -225,8 +255,6 @@ def run_evaluation(
                 samples_metrics.append(sample_res)
                 processed_count += 1
 
-                if recon_audio is not None and recon_wav_path.exists():
-                    recon_wav_path.unlink()
 
         # Save GT cache
         try:
