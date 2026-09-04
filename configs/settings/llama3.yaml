@@ -1,9 +1,9 @@
 # @package _global_
-# Llama 3 decoder + character tokenization + online continuous-only encoding
+# Llama 3 decoder + character tokenization + online z_sem discrete/continuous training
 training:
   dataset_name: librispeech-aligned
   train_split: "train"
-  output_dir: checkpoints/exps/librispeech-aligned-llama3-char-continuous
+  output_dir: checkpoints/exps/librispeech-aligned-llama3
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 1
@@ -11,7 +11,7 @@ training:
   save_total_limit: 3
   report_to: none
   wandb_project: hybrid_tts
-  wandb_run_name: librispeech-aligned-llama3-char-continuous
+  wandb_run_name: librispeech-aligned-llama3
   run_id: ""
   bf16: true
   eval_strategy: "no"
@@ -27,13 +27,13 @@ training:
   uncond_prob: 0.1
   no_augment_ratio: 0.25
   discrete_only: false
-  continuous_only: true
+  continuous_only: false
   online_encode: true
-  audio_quantizer_source: z
+  audio_quantizer_source: z_sem
   include_quantizer_residual: false
-  semantic_quantizer_checkpoint: null
-  semantic_quantizer_type: std_vq
-  semantic_codebook_size: null
+  semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized"
+  semantic_quantizer_type: vq_ema
+  semantic_codebook_size: 1024
   group_by_length: false
   dataloader_num_workers: 0
 
