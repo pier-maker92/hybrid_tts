@@ -2,6 +2,7 @@
 # Llama 3 decoder + character tokenization + online z_sem discrete/continuous training
 training:
   dataset_name: librispeech-aligned
+  dataset_dir_name: librispeech-aligned
   train_split: "train"
   output_dir: checkpoints/exps/librispeech-aligned-llama3
   per_device_train_batch_size: 2

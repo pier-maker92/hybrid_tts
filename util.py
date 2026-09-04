@@ -49,6 +49,10 @@ def build_dataset(training_cfg: Dict[str, Any]):
         dataset = LibriSpeechAlignDataset(
             force_vocab_build=force_vocab_build,
             keep_audio=online_encode,
+            dataset_dir_name=training_cfg.get(
+                "dataset_dir_name",
+                "librispeech-aligned_prepared",
+            ),
         )
         if online_encode:
             train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
