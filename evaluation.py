@@ -17,6 +17,51 @@ from transformers import WhisperTokenizer
 logger = logging.getLogger(__name__)
 
 
+def _codebook_lookup(quantizer_module: torch.nn.Module, tokens: torch.Tensor):
+    if hasattr(quantizer_module, "embedding"):
+        embedding = quantizer_module.embedding
+        if isinstance(embedding, torch.nn.Embedding):
+            return embedding(tokens)
+        return torch.nn.functional.embedding(
+            tokens,
+            embedding.to(device=tokens.device),
+        )
+
+    if hasattr(quantizer_module, "codebook"):
+        return torch.nn.functional.embedding(
+            tokens,
+            quantizer_module.codebook.to(device=tokens.device),
+        )
+
+    if hasattr(quantizer_module, "toks_to_codes"):
+        return quantizer_module.toks_to_codes(tokens)
+
+    raise RuntimeError(
+        "External semantic quantizer does not expose embedding/codebook/toks_to_codes."
+    )
+
+
+def _decode_external_quantizer_tokens(
+    vae: torch.nn.Module,
+    tokens: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    semantic_quantizer = getattr(vae, "external_semantic_quantizer", None)
+    if semantic_quantizer is None:
+        return None
+
+    wrapper = getattr(semantic_quantizer, "quantizer", None)
+    quantizer_module = getattr(wrapper, "quantizer_module", wrapper)
+    if quantizer_module is None:
+        raise RuntimeError("External semantic quantizer has no quantizer module.")
+
+    param = next(semantic_quantizer.parameters(), None)
+    dtype = param.dtype if param is not None else getattr(vae, "dtype", torch.float32)
+    codes = _codebook_lookup(quantizer_module, tokens).unsqueeze(0).to(dtype=dtype)
+    if hasattr(semantic_quantizer, "decoder"):
+        return semantic_quantizer.decoder(codes)
+    return codes
+
+
 class UTMOSPredictor:
     """UTMOS predictor using tarepan/SpeechMOS."""
 
@@ -202,10 +247,13 @@ def run_evaluation(
                 with torch.no_grad():
                     if vae is not None:
                         padding_mask = torch.zeros((1, mel_len), dtype=torch.bool, device=device)
-                        if hasattr(vae, "encoder") and hasattr(vae.encoder, "vq") and reconstructed_discrete is not None:
+                        tokens_tensor = None
+                        if reconstructed_discrete is not None:
                             tokens_tensor = reconstructed_discrete[i][:mel_len, 0].to(device) # shape: [L]
+
+                        if hasattr(vae, "encoder") and hasattr(vae.encoder, "vq") and tokens_tensor is not None:
                             vq_emb = vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0) # shape: [1, L, C_vq]
-                            
+
                             mel, mel_mask = vae.sample(
                                 num_steps=16,
                                 temperature=0.2,
@@ -215,11 +263,20 @@ def run_evaluation(
                                 padding_mask=padding_mask,
                             )
                         else:
+                            z = z_acoustic
+                            if tokens_tensor is not None:
+                                z_quantized = _decode_external_quantizer_tokens(
+                                    vae,
+                                    tokens_tensor,
+                                )
+                                if z_quantized is not None:
+                                    z = z_quantized + z_acoustic
+
                             mel, mel_mask = vae.sample(
                                 num_steps=16,
                                 temperature=0.2,
                                 guidance_scale=1.4,
-                                z=z_acoustic,
+                                z=z,
                                 padding_mask=padding_mask,
                             )
                         mel = mel[0][~mel_mask[0]].unsqueeze(0).permute(0, 2, 1).float().to(device)

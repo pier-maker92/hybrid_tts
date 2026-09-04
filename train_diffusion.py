@@ -89,13 +89,27 @@ def load_vae_encoder(checkpoint_dir: str, device: torch.device, training_cfg: Di
         return None
 
 
-def load_vae(checkpoint_dir: str, device: torch.device):
+def load_vae(
+    checkpoint_dir: str,
+    device: torch.device,
+    training_cfg: Optional[Dict] = None,
+):
     try:
         from modules.submodules.MelCausalVAE.dicodec.modules.builder import (
+            load_external_semantic_quantizer,
             load_pretrained_model,
         )
 
         vae = load_pretrained_model(checkpoint_dir)
+        training_cfg = training_cfg or {}
+        if training_cfg.get("semantic_quantizer_checkpoint"):
+            load_external_semantic_quantizer(
+                vae,
+                checkpoint_path=training_cfg["semantic_quantizer_checkpoint"],
+                quantizer_type=training_cfg.get("semantic_quantizer_type", "std_vq"),
+                codebook_size=training_cfg.get("semantic_codebook_size"),
+                target_source=training_cfg.get("audio_quantizer_source"),
+            )
         vae.to(device)
         return vae
     except Exception as e:
@@ -496,7 +510,11 @@ def main(cfg: DictConfig):
                         vocoder_type = cfg_dict.get("vocoder_type")
                         
                         device = accelerator.device
-                        vae = load_vae(vae_checkpoint, device) if vae_checkpoint else None
+                        vae = (
+                            load_vae(vae_checkpoint, device, training_cfg)
+                            if vae_checkpoint
+                            else None
+                        )
                         vocoder = load_vocoder(vocoder_checkpoint, device) if vocoder_checkpoint else None
                         
                         try:
