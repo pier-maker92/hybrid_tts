@@ -9,6 +9,7 @@ import hydra
 import logging
 import datetime
 import time
+import warnings
 from typing import Dict, List, Optional
 from accelerate import Accelerator
 from accelerate import InitProcessGroupKwargs
@@ -19,6 +20,17 @@ from omegaconf import DictConfig, OmegaConf
 from data.audio_dataset import DataCollator, DataCollatorWithVAE, DiffusionDataCollator
 from util import build_dataset, build_tokenizer, wandb_init
 from torch.optim.lr_scheduler import LambdaLR
+
+warnings.filterwarnings(
+    "ignore",
+    message="Support for mismatched key_padding_mask and attn_mask is deprecated.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="enable_nested_tensor is True, but self.use_nested_tensor is False.*",
+    category=UserWarning,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
