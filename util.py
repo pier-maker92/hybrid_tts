@@ -30,6 +30,7 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
     force_vocab_build = training_cfg.get("force_vocab_build")
     train_split = training_cfg.pop("train_split", "train")
     online_encode = training_cfg.get("online_encode", False)
+    max_audio_len = training_cfg.get("max_audio_len")
 
     if dataset_name == "mls":
         from data.mls import MLSDataset
@@ -56,8 +57,16 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
             build_phoneme_vocab=text_tokenizer != "char",
         )
         if online_encode:
-            train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
-            test_dataset = OnlineTestDatasetWrapper(dataset, "test")
+            train_dataset = OnlineTrainDatasetWrapper(
+                dataset,
+                train_split,
+                max_audio_len=max_audio_len,
+            )
+            test_dataset = OnlineTestDatasetWrapper(
+                dataset,
+                "test",
+                max_audio_len=max_audio_len,
+            )
             return train_dataset, test_dataset, dataset_name
     elif dataset_name in ["ljspeech-prepared", "ljspeech-dicodec18-kmeans512-prepared"]:
         from data.lj_speech_prepared import LJSpeechDataset
@@ -73,8 +82,16 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
             )
         from data.libri_tts_r_online import LibriTTSROnline
         dataset = LibriTTSROnline()
-        train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)
-        test_dataset = OnlineTestDatasetWrapper(dataset, "test")
+        train_dataset = OnlineTrainDatasetWrapper(
+            dataset,
+            train_split,
+            max_audio_len=max_audio_len,
+        )
+        test_dataset = OnlineTestDatasetWrapper(
+            dataset,
+            "test",
+            max_audio_len=max_audio_len,
+        )
         return train_dataset, test_dataset, dataset_name
     elif dataset_name in [
         "libritts-r-prepared",
@@ -86,8 +103,18 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
 
         dataset = LibriTTSRPrepared(dataset_dir_name=dataset_name)
         discrete_only = training_cfg.get("discrete_only", False)
-        train_dataset = TrainDatasetWrapper(dataset, train_split, discrete_only=discrete_only)
-        test_dataset = TrainDatasetWrapper(dataset, "test", discrete_only=discrete_only)
+        train_dataset = TrainDatasetWrapper(
+            dataset,
+            train_split,
+            discrete_only=discrete_only,
+            max_audio_len=max_audio_len,
+        )
+        test_dataset = TrainDatasetWrapper(
+            dataset,
+            "test",
+            discrete_only=discrete_only,
+            max_audio_len=max_audio_len,
+        )
         return train_dataset, test_dataset, dataset_name
     
     elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
@@ -109,10 +136,19 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
         raise ValueError(f"Dataset {dataset_name} not supported")
 
     discrete_only = training_cfg.get("discrete_only", False)
-    train_dataset = TrainDatasetWrapper(dataset, "train", discrete_only=discrete_only)
+    train_dataset = TrainDatasetWrapper(
+        dataset,
+        "train",
+        discrete_only=discrete_only,
+        max_audio_len=max_audio_len,
+    )
 
     test_dataset = TestDatasetWrapper(
-        dataset, "train", discrete_only=discrete_only # FIXME handle the test partition in Ljspeech (now missing)
+        dataset,
+        "train",
+        discrete_only=discrete_only,
+        max_audio_len=max_audio_len,
+        # FIXME handle the test partition in Ljspeech (now missing)
     )
 
     return train_dataset, test_dataset, dataset_name

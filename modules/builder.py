@@ -1,6 +1,9 @@
-import os
 import json
-from typing import Dict, Any
+import os
+from typing import Any, Dict, Optional
+
+import torch
+
 from .hybrid_model import HybridTTS, HybridTokenizer
 from .configs import (
     HybridTTSConfig,
@@ -55,6 +58,47 @@ def _load_quantizer_vocab_size(cfg_dict: Dict[str, Any]) -> int:
                 or configured_size
             )
     return int(configured_size or 0)
+
+
+def _load_quantizer_state_dict(checkpoint: str) -> dict[str, torch.Tensor]:
+    model_path = (
+        os.path.join(checkpoint, "model.pt")
+        if os.path.isdir(checkpoint)
+        else checkpoint
+    )
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Missing quantizer checkpoint: {model_path}")
+
+    state_dict = torch.load(model_path, map_location="cpu")
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    return state_dict
+
+
+def load_quantizer_embeddings(cfg_dict: Dict[str, Any]) -> Optional[torch.Tensor]:
+    checkpoint = _resolve_quantizer_checkpoint(cfg_dict)
+    if checkpoint is None:
+        return None
+
+    state_dict = _load_quantizer_state_dict(checkpoint)
+    candidate_keys = (
+        "quantizer.quantizer_module.embedding.weight",
+        "quantizer.quantizer_module.embedding",
+        "quantizer.quantizer_module.codebook",
+    )
+    for key in candidate_keys:
+        value = state_dict.get(key)
+        if value is not None:
+            if value.ndim != 2:
+                raise ValueError(
+                    f"Quantizer embedding key {key} has invalid shape "
+                    f"{tuple(value.shape)}."
+                )
+            return value.float()
+    raise ValueError(
+        "Could not find quantizer embeddings in checkpoint. Tried: "
+        + ", ".join(candidate_keys)
+    )
 
 
 def load_codebook_config(vae_checkpoint: str, cfg_dict: Dict[str, Any] | None = None):
@@ -180,4 +224,13 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         continuous_scaling_mode=cfg_dict.get("continuous_scaling_mode"),
     )
 
-    return HybridTTS(config=hybrid_config, tokenizer=tokenizer)
+    model = HybridTTS(config=hybrid_config, tokenizer=tokenizer)
+    if not continuous_only and training_cfg.get(
+        "init_discrete_embeddings_from_quantizer",
+        True,
+    ):
+        quantizer_embeddings = load_quantizer_embeddings(cfg_dict)
+        if quantizer_embeddings is not None:
+            model.initialize_discrete_embeddings(quantizer_embeddings)
+
+    return model

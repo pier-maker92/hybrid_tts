@@ -396,6 +396,47 @@ class HybridTTS(nn.Module):
                 ),  # Vq tokens + audio EOS
             )
 
+    @torch.no_grad()
+    def initialize_discrete_embeddings(
+        self,
+        codebook_embeddings: torch.Tensor,
+    ) -> None:
+        if self.continuous_only:
+            logger.info("Skipping discrete embedding init in continuous-only mode.")
+            return
+
+        if codebook_embeddings.ndim != 2:
+            raise ValueError(
+                "Quantizer embeddings must have shape [codebook_size, dim], got "
+                f"{tuple(codebook_embeddings.shape)}."
+            )
+        if codebook_embeddings.shape[0] != self.discrete_token_vocab_size:
+            raise ValueError(
+                "Quantizer codebook size does not match tokenizer discrete vocab: "
+                f"{codebook_embeddings.shape[0]} vs {self.discrete_token_vocab_size}."
+            )
+
+        embed_weight = self.backbone.get_input_embeddings().weight
+        vocab_start = self.tokenizer.prompt_vocab_size
+        vocab_end = vocab_start + self.discrete_token_vocab_size
+        hidden_dim = embed_weight.shape[1]
+        codebook_dim = codebook_embeddings.shape[1]
+
+        resized = embed_weight.new_zeros(self.discrete_token_vocab_size, hidden_dim)
+        copy_dim = min(hidden_dim, codebook_dim)
+        resized[:, :copy_dim] = codebook_embeddings[:, :copy_dim].to(
+            device=embed_weight.device,
+            dtype=embed_weight.dtype,
+        )
+        embed_weight[vocab_start:vocab_end].copy_(resized)
+        logger.info(
+            "Initialized %d discrete token embeddings from quantizer codebook "
+            "(codebook_dim=%d, hidden_dim=%d).",
+            self.discrete_token_vocab_size,
+            codebook_dim,
+            hidden_dim,
+        )
+
     # -------------------------------------------------------------------------
     # Internal helpers
     # -------------------------------------------------------------------------

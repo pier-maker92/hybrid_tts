@@ -4,6 +4,7 @@ training:
   dataset_name: librispeech-aligned
   dataset_dir_name: librispeech-aligned
   train_split: "train"
+  max_audio_len: null
   output_dir: checkpoints/exps/librispeech-aligned-llama3
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
@@ -32,7 +33,7 @@ training:
   online_encode: true
   audio_quantizer_source: z_sem
   include_quantizer_residual: false
-  semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized"
+  semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized/11kstep/z_sem"
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: 1024
   group_by_length: false

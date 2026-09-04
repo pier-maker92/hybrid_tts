@@ -1,13 +1,39 @@
 import torch
 import torchaudio
 from dataclasses import dataclass
-from typing import Sequence, Dict
+from typing import Dict, Optional, Sequence
 import torchaudio.transforms as T
 from torch.utils.data import Dataset
 
 import torch
 import torchaudio.transforms as T
 from torch.nn.utils.rnn import pad_sequence
+
+
+def _get_audio_duration_seconds(example: Dict) -> Optional[float]:
+    duration = example.get("duration", example.get("duration_sec"))
+    if duration is not None:
+        return float(duration)
+
+    audio = example.get("audio")
+    if audio is None:
+        return None
+    return len(audio["array"]) / audio["sampling_rate"]
+
+
+def _is_within_max_audio_len(example: Dict, max_audio_len: float) -> bool:
+    duration = _get_audio_duration_seconds(example)
+    return duration is None or duration <= max_audio_len
+
+
+def _filter_by_max_audio_len(dataset, max_audio_len: Optional[float]):
+    if max_audio_len is None:
+        return dataset
+    return dataset.filter(
+        _is_within_max_audio_len,
+        fn_kwargs={"max_audio_len": float(max_audio_len)},
+        num_proc=8,
+    )
 
 
 class SimpleAudioDataset(Dataset):
@@ -52,13 +78,18 @@ class SimpleAudioDataset(Dataset):
 
 class TrainDatasetWrapper(SimpleAudioDataset):
     def __init__(
-        self, dataset: SimpleAudioDataset, split: str, discrete_only: bool = False
+        self,
+        dataset: SimpleAudioDataset,
+        split: str,
+        discrete_only: bool = False,
+        max_audio_len: Optional[float] = None,
     ):
         super().__init__()
         assert split in ["train", "test"], "split must be either train or test"
         self.dataset = getattr(dataset, f"{split}_dataset")
+        self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
         self.discrete_only = discrete_only
-        
+
         if self.discrete_only and "continuous" in self.dataset.column_names:
             self.dataset = self.dataset.remove_columns("continuous")
 
@@ -306,13 +337,18 @@ class DiffusionDataCollator(object):
 
 class TestDatasetWrapper(SimpleAudioDataset):
     def __init__(
-        self, dataset: SimpleAudioDataset, split: str, discrete_only: bool = False
+        self,
+        dataset: SimpleAudioDataset,
+        split: str,
+        discrete_only: bool = False,
+        max_audio_len: Optional[float] = None,
     ):
         super().__init__()
         assert split in ["test", "train"], "split must be test or train"
         self.dataset = getattr(dataset, f"{split}_dataset")
+        self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
         self.discrete_only = discrete_only
-        
+
         if self.discrete_only and "continuous" in self.dataset.column_names:
             self.dataset = self.dataset.remove_columns("continuous")
 
@@ -367,9 +403,15 @@ class OnlineTrainDatasetWrapper(Dataset):
     """Wraps a SimpleAudioDataset for online VAE encoding.
     Returns raw audio dicts instead of pre-computed discrete/continuous tokens."""
 
-    def __init__(self, dataset: SimpleAudioDataset, split: str):
+    def __init__(
+        self,
+        dataset: SimpleAudioDataset,
+        split: str,
+        max_audio_len: Optional[float] = None,
+    ):
         assert split in ["train", "test"]
         self.dataset = getattr(dataset, f"{split}_dataset")
+        self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
 
     def __len__(self):
         return len(self.dataset)
