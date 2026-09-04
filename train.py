@@ -140,7 +140,10 @@ def main(cfg: DictConfig):
 
     with accelerator.main_process_first():
         logger.info("Building dataset...")
-        train_dataset, test_dataset, dataset_name = build_dataset(training_cfg)
+        train_dataset, test_dataset, dataset_name = build_dataset(
+            training_cfg,
+            text_tokenizer=cfg_dict.get("text_tokenizer"),
+        )
 
     backbone_cfg = cfg_dict.get("backbone", cfg_dict.get("backbone_config"))
     is_pretrained = backbone_cfg.get("pretrained")

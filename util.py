@@ -24,7 +24,7 @@ def wandb_init(training_cfg: Dict[str, Any], accelerator):
         )
 
 
-def build_dataset(training_cfg: Dict[str, Any]):
+def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = None):
     # Create AudioDataset
     dataset_name = training_cfg.pop("dataset_name")
     force_vocab_build = training_cfg.get("force_vocab_build")
@@ -53,6 +53,7 @@ def build_dataset(training_cfg: Dict[str, Any]):
                 "dataset_dir_name",
                 "librispeech-aligned_prepared",
             ),
+            build_phoneme_vocab=text_tokenizer != "char",
         )
         if online_encode:
             train_dataset = OnlineTrainDatasetWrapper(dataset, train_split)

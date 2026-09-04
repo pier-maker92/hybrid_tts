@@ -7,7 +7,6 @@ from typing import Optional, List
 from collections import defaultdict
 from torch.utils.data import DataLoader
 from datasets import load_dataset, concatenate_datasets
-from g2p_en import G2p
 from data.audio_dataset import (
     SimpleAudioDataset,
     DataCollator,
@@ -27,6 +26,8 @@ def simple_collate_fn(batch):
 
 
 def build_vocab_and_map(batch, phoneme_vocab):
+    from g2p_en import G2p
+
     g2p = G2p()
     phoneme_ids_batch = []
     transcriptions = batch.get("transcript") or batch.get("transcription") or []
@@ -47,6 +48,7 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
         force_vocab_build: bool = False,
         keep_audio: bool = False,
         dataset_dir_name: str = "librispeech-aligned_prepared",
+        build_phoneme_vocab: bool = True,
     ):
         super().__init__()
         parquet_dir = os.path.join(SLURM_TMPDIR, "datasets", dataset_dir_name)
@@ -80,7 +82,16 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
             ].append(dataset[partition])
 
         self.phoneme_vocab = {}
+        if not build_phoneme_vocab:
+            for destination in partitions_per_destination:
+                setattr(
+                    self,
+                    f"{destination}_dataset",
+                    concatenate_datasets(partitions_per_destination[destination]),
+                )
+            return
 
+        from g2p_en import G2p
         g2p = G2p()
 
         vocab_path = os.path.join(os.path.dirname(__file__), "phoneme_vocab.json")
