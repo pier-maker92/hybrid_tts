@@ -383,7 +383,22 @@ def load_encoder_only(
         cfg_dict = json.load(f)
     model = DicodecEncoderOnly(_build_config(cfg_dict))
 
-    prefixes = ("feature_extractor.", "wavlm.", "wavlm_extractor.", "encoder.", "lowpass_filter.")
+    prefixes = (
+        "feature_extractor.",
+        "wavlm.",
+        "wavlm_extractor.",
+        "encoder.",
+        "lowpass_filter.",
+    )
+    model_state = model.state_dict()
+
+    def should_load_key(key: str, value: torch.Tensor) -> bool:
+        return (
+            key.startswith(prefixes)
+            and key in model_state
+            and model_state[key].shape == value.shape
+        )
+
     safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
     pt_path = os.path.join(checkpoint_dir, "model.pt")
     if os.path.exists(safetensors_path):
@@ -392,14 +407,19 @@ def load_encoder_only(
         state_dict = {}
         with safe_open(safetensors_path, framework="pt", device="cpu") as f:
             for key in f.keys():
-                if key.startswith(prefixes):
-                    state_dict[key] = f.get_tensor(key)
+                if not key.startswith(prefixes):
+                    continue
+                value = f.get_tensor(key)
+                if should_load_key(key, value):
+                    state_dict[key] = value
     elif os.path.exists(pt_path):
         raw_state = torch.load(pt_path, map_location="cpu")
         if "state_dict" in raw_state:
             raw_state = raw_state["state_dict"]
         state_dict = {
-            key: value for key, value in raw_state.items() if key.startswith(prefixes)
+            key: value
+            for key, value in raw_state.items()
+            if should_load_key(key, value)
         }
     else:
         raise FileNotFoundError(f"No model.safetensors or model.pt in {checkpoint_dir}")
@@ -415,9 +435,6 @@ def load_encoder_only(
             "Missing encoder-only checkpoint weights: "
             + ", ".join(required_missing[:8])
         )
-    if unexpected:
-        raise RuntimeError("Unexpected encoder-only weights: " + ", ".join(unexpected[:8]))
-
     model.to(device)
     if semantic_quantizer_checkpoint:
         quantizer_config = read_semantic_quantizer_config(semantic_quantizer_checkpoint)
