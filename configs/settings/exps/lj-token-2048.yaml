@@ -28,7 +28,8 @@ training:
   # cfg
   uncond_prob: 0.0
   no_augment_ratio: 0.1
-  discrete_only: true
+  discrete: true
+  continuous: false
   group_by_length: false
 
 backbone:

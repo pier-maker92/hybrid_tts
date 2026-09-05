@@ -16,6 +16,7 @@ from accelerate import InitProcessGroupKwargs, DistributedDataParallelKwargs
 from evaluation import run_evaluation
 from torch.utils.data import DataLoader
 from modules.builder import build_model
+from modules.modalities import resolve_modalities
 from omegaconf import DictConfig, OmegaConf
 from data.audio_dataset import DataCollator, DataCollatorWithVAE
 from util import build_dataset, build_tokenizer, wandb_init
@@ -29,6 +30,12 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore",
     message="enable_nested_tensor is True, but self.use_nested_tensor is False.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="In 2.9, this function's implementation will be changed to use "
+    "torchaudio.load_with_torchcodec.*",
     category=UserWarning,
 )
 
@@ -66,15 +73,28 @@ def get_scheduler(optimizer, warmup_steps, num_training_steps, initial_lr, min_l
         
     return LambdaLR(optimizer, get_lr_lambda)
 
+
+def voice_condition_enabled(cfg_dict: Dict) -> bool:
+    backbone_cfg = cfg_dict.get("backbone", cfg_dict.get("backbone_config", {})) or {}
+    diffusion_cfg = (
+        cfg_dict.get("diffusion_head", cfg_dict.get("diffusion_head_config", {})) or {}
+    )
+    return bool(backbone_cfg.get("voice_condition", False)) or bool(
+        diffusion_cfg.get("voice_condition", False)
+    )
+
 def load_vae_encoder(checkpoint_dir: str, device: torch.device, training_cfg: Dict):
     try:
         from modules.vae_encoder_only import load_encoder_only
 
+        discrete, _ = resolve_modalities(training_cfg)
         vae = load_encoder_only(
             checkpoint_dir=checkpoint_dir,
             device=device,
-            semantic_quantizer_checkpoint=training_cfg.get(
-                "semantic_quantizer_checkpoint"
+            semantic_quantizer_checkpoint=(
+                training_cfg.get("semantic_quantizer_checkpoint")
+                if discrete
+                else None
             ),
             semantic_quantizer_type=training_cfg.get(
                 "semantic_quantizer_type", "std_vq"
@@ -102,7 +122,11 @@ def load_vae(
 
         vae = load_pretrained_model(checkpoint_dir)
         training_cfg = training_cfg or {}
-        if training_cfg.get("semantic_quantizer_checkpoint"):
+        discrete, _ = resolve_modalities(training_cfg)
+        if (
+            discrete
+            and training_cfg.get("semantic_quantizer_checkpoint")
+        ):
             load_external_semantic_quantizer(
                 vae,
                 checkpoint_path=training_cfg["semantic_quantizer_checkpoint"],
@@ -139,6 +163,10 @@ def main(cfg: DictConfig):
     if cfg_dict.get("vae_checkpoint"):
         cfg_dict["vae_checkpoint"] = cfg_dict["vae_checkpoint"].replace("$SCRATCH", scratch_dir)
     training_cfg = cfg_dict.get("training", {})
+    discrete, continuous = resolve_modalities(training_cfg)
+    use_voice_condition = voice_condition_enabled(cfg_dict)
+    if use_voice_condition and not training_cfg.get("online_encode", False):
+        raise RuntimeError("voice_condition requires training.online_encode=true.")
     if training_cfg.get("semantic_quantizer_checkpoint"):
         training_cfg["semantic_quantizer_checkpoint"] = training_cfg[
             "semantic_quantizer_checkpoint"
@@ -198,6 +226,7 @@ def main(cfg: DictConfig):
     
     # DataLoader preparation
     is_online = training_cfg.get("online_encode", False)
+    online_vae = None
     if is_online:
         online_vae_checkpoint = cfg_dict.get("vae_checkpoint")
         logger.info(f"Online VAE encoding: loading VAE from {online_vae_checkpoint}")
@@ -216,8 +245,8 @@ def main(cfg: DictConfig):
             tokenizer=tok,
             vae=online_vae,
             device=online_device,
-            discrete_only=training_cfg.get("discrete_only", False),
-            continuous_only=training_cfg.get("continuous_only", False),
+            discrete=discrete,
+            continuous=continuous,
             quantizer_source=training_cfg.get("audio_quantizer_source", "z"),
             include_quantizer_residual=training_cfg.get(
                 "include_quantizer_residual", False
@@ -306,7 +335,6 @@ def main(cfg: DictConfig):
 
     global_step = starting_step
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    continuous_only = training_cfg.get("continuous_only", False)
     
     running_token_loss = 0.0
     running_diffusion_loss = 0.0
@@ -330,14 +358,17 @@ def main(cfg: DictConfig):
                     attention_mask=batch.get("attention_mask"),
                     continuous_sequence=batch.get("continuous_sequence"),
                     audio_padding_mask=batch.get("audio_padding_mask"),
+                    reference_audios_srs=batch.get("reference_audios_srs"),
+                    voice_conditioner=online_vae if use_voice_condition else None,
                 )
                 
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)
                 
-                if continuous_only:
+                if not discrete:
                     if outputs.diffusion_loss is None:
                         raise RuntimeError(
-                            "continuous_only=True requires continuous_sequence and a diffusion_head."
+                            "training.continuous=true with training.discrete=false "
+                            "requires continuous_sequence and a diffusion_head."
                         )
                     token_loss = torch.tensor(0.0, device=accelerator.device)
                     total_loss = diffusion_loss

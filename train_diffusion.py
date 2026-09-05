@@ -16,6 +16,7 @@ from accelerate import InitProcessGroupKwargs
 from evaluation import run_evaluation
 from torch.utils.data import DataLoader
 from modules.builder import build_model
+from modules.modalities import resolve_modalities
 from omegaconf import DictConfig, OmegaConf
 from data.audio_dataset import DataCollator, DataCollatorWithVAE, DiffusionDataCollator
 from util import build_dataset, build_tokenizer, wandb_init
@@ -29,6 +30,12 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore",
     message="enable_nested_tensor is True, but self.use_nested_tensor is False.*",
+    category=UserWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message="In 2.9, this function's implementation will be changed to use "
+    "torchaudio.load_with_torchcodec.*",
     category=UserWarning,
 )
 
@@ -66,15 +73,25 @@ def get_scheduler(optimizer, warmup_steps, num_training_steps, initial_lr, min_l
         
     return LambdaLR(optimizer, get_lr_lambda)
 
+
+def voice_condition_enabled(cfg_dict: Dict) -> bool:
+    diffusion_cfg = (
+        cfg_dict.get("diffusion_head", cfg_dict.get("diffusion_head_config", {})) or {}
+    )
+    return bool(diffusion_cfg.get("voice_condition", False))
+
 def load_vae_encoder(checkpoint_dir: str, device: torch.device, training_cfg: Dict):
     try:
         from modules.vae_encoder_only import load_encoder_only
 
+        discrete, _ = resolve_modalities(training_cfg)
         vae = load_encoder_only(
             checkpoint_dir=checkpoint_dir,
             device=device,
-            semantic_quantizer_checkpoint=training_cfg.get(
-                "semantic_quantizer_checkpoint"
+            semantic_quantizer_checkpoint=(
+                training_cfg.get("semantic_quantizer_checkpoint")
+                if discrete
+                else None
             ),
             semantic_quantizer_type=training_cfg.get(
                 "semantic_quantizer_type", "std_vq"
@@ -102,7 +119,11 @@ def load_vae(
 
         vae = load_pretrained_model(checkpoint_dir)
         training_cfg = training_cfg or {}
-        if training_cfg.get("semantic_quantizer_checkpoint"):
+        discrete, _ = resolve_modalities(training_cfg)
+        if (
+            discrete
+            and training_cfg.get("semantic_quantizer_checkpoint")
+        ):
             load_external_semantic_quantizer(
                 vae,
                 checkpoint_path=training_cfg["semantic_quantizer_checkpoint"],
@@ -166,7 +187,6 @@ class DiffusionOnlyModel(nn.Module):
         attention_mask: torch.BoolTensor,
         continuous_sequence: torch.FloatTensor,
         audio_padding_mask: torch.BoolTensor,
-        ecapa: Optional[torch.FloatTensor] = None,
         **kwargs
     ):
         # In this simplified scenario, discrete_sequence contains ONLY the discrete tokens 
@@ -185,7 +205,12 @@ class DiffusionOnlyModel(nn.Module):
                 target=continuous_sequence,
                 target_padding_mask=audio_padding_mask,
                 context_vector=context_vector,
-                ecapa=ecapa,
+                speaker_embedding=self._extract_voice_condition(
+                    voice_conditioner=kwargs.get("voice_conditioner"),
+                    reference_audios_srs=kwargs.get("reference_audios_srs"),
+                    device=context_vector.device,
+                    dtype=context_vector.dtype,
+                ),
             ).loss
             
             # compute a fake norm ratio for logging compatibility
@@ -201,6 +226,32 @@ class DiffusionOnlyModel(nn.Module):
         out.norm_ratio = norm_ratio
         return out
 
+    def _extract_voice_condition(
+        self,
+        voice_conditioner,
+        reference_audios_srs,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not self.diffusion_head.voice_condition:
+            return None
+        if voice_conditioner is None:
+            raise RuntimeError("voice_condition=true requires a VAE voice_conditioner.")
+        if reference_audios_srs is None:
+            raise RuntimeError("voice_condition=true requires reference_audios_srs.")
+        if not hasattr(voice_conditioner, "extract_speaker_embedding"):
+            raise RuntimeError(
+                "voice_conditioner must expose extract_speaker_embedding(audios_srs)."
+            )
+        speaker_embedding = voice_conditioner.extract_speaker_embedding(
+            reference_audios_srs
+        )
+        if speaker_embedding is None:
+            raise RuntimeError(
+                "voice_condition=true requires a VAE checkpoint with speaker encoder."
+            )
+        return speaker_embedding.to(device=device, dtype=dtype)
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="main")
 def main(cfg: DictConfig):
@@ -212,6 +263,10 @@ def main(cfg: DictConfig):
         cfg_dict["vae_checkpoint"] = cfg_dict["vae_checkpoint"].replace("$SCRATCH", scratch_dir)
 
     training_cfg = cfg_dict.get("training", {})
+    discrete, continuous = resolve_modalities(training_cfg)
+    use_voice_condition = voice_condition_enabled(cfg_dict)
+    if use_voice_condition and not training_cfg.get("online_encode", False):
+        raise RuntimeError("voice_condition requires training.online_encode=true.")
     if training_cfg.get("semantic_quantizer_checkpoint"):
         training_cfg["semantic_quantizer_checkpoint"] = training_cfg[
             "semantic_quantizer_checkpoint"
@@ -251,7 +306,10 @@ def main(cfg: DictConfig):
     tok = build_tokenizer(cfg_dict, pretrinaed=is_pretrained)
 
     logger.info("Creating Diffusion-only model...")
-    from modules.builder import load_codebook_config_from_cfg
+    from modules.builder import (
+        load_codebook_config_from_cfg,
+        load_speaker_embedding_dim_from_cfg,
+    )
     from modules.configs import HybridTTSConfig, DiTConfig
     
     continuous_dim, _ = load_codebook_config_from_cfg(cfg_dict)
@@ -264,6 +322,14 @@ def main(cfg: DictConfig):
     
     # We use diffusion_config.net_dim as the backbone_dim for the embedding LUT
     diffusion_config.backbone_dim = diffusion_config.net_dim
+    if diffusion_config.voice_condition:
+        speaker_dim = load_speaker_embedding_dim_from_cfg(cfg_dict)
+        if speaker_dim is None:
+            raise ValueError(
+                "diffusion_head.voice_condition=true requires a VAE checkpoint with "
+                "wavlm_module_config.speaker_encoder_config.embedding_dim."
+            )
+        diffusion_config.speaker_dim = int(speaker_dim)
 
     config = HybridTTSConfig(
         backbone_config=None,
@@ -306,6 +372,7 @@ def main(cfg: DictConfig):
     
     # DataLoader preparation
     is_online = training_cfg.get("online_encode", False)
+    online_vae = None
     if is_online:
         online_vae_checkpoint = cfg_dict.get("vae_checkpoint")
         logger.info(f"Online VAE encoding: loading VAE from {online_vae_checkpoint}")
@@ -324,8 +391,8 @@ def main(cfg: DictConfig):
             tokenizer=tok,
             vae=online_vae,
             device=online_device,
-            discrete_only=training_cfg.get("discrete_only", False),
-            continuous_only=training_cfg.get("continuous_only", False),
+            discrete=discrete,
+            continuous=continuous,
             quantizer_source=training_cfg.get("audio_quantizer_source", "z"),
             include_quantizer_residual=training_cfg.get(
                 "include_quantizer_residual", False
@@ -434,7 +501,8 @@ def main(cfg: DictConfig):
                     attention_mask=batch.get("attention_mask"),
                     continuous_sequence=batch.get("continuous_sequence"),
                     audio_padding_mask=batch.get("audio_padding_mask"),
-                    ecapa=batch.get("ecapa"),
+                    reference_audios_srs=batch.get("reference_audios_srs"),
+                    voice_conditioner=online_vae if use_voice_condition else None,
                 )
                 
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)

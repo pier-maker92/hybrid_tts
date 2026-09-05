@@ -17,8 +17,8 @@ class DiTConfig:
     window_attention_seconds: float = 0.0
     use_group_bidirectional: bool = False
     use_mlp_sampler: bool = False
-    use_ecapa_film: bool = False
-    ecapa_dim: int = 192
+    voice_condition: bool = False
+    speaker_dim: Optional[int] = None
 
 
 @dataclass(kw_only=True)
@@ -34,6 +34,7 @@ class BackboneConfig:
     max_position_embeddings: Optional[int] = None
     n_kv_heads: Optional[int] = None
     rope_theta: Optional[float] = None
+    voice_condition: bool = False
 
 
 @dataclass
@@ -51,6 +52,7 @@ class HybridTTSConfig:
     continuous_adapter_config: Optional[AdapterConfig] = field(
         default_factory=AdapterConfig
     )
+    speaker_adapter_config: Optional[AdapterConfig] = None
 
     # Dimensions for Adaptive Norm & Embedding
     pad_token_id: int
@@ -63,8 +65,9 @@ class HybridTTSConfig:
     debug: bool = False
     uncond_prob: float = 0.0
     no_augment_ratio: float = 0.0
-    discrete_only: bool = False
-    continuous_only: bool = False
+    discrete: bool = True
+    continuous: bool = True
+    speaker_embedding_dim: Optional[int] = None
     backbone_hidden_size: Optional[int] = None
     continuous_scaling_mode: Optional[str] = None  # 'fixed' or 'learnable' or None
 
@@ -74,6 +77,9 @@ class HybridTTSConfig:
 
         if self.continuous_adapter_config is not None:
             self.continuous_adapter_config.out_dim = hidden_size
+
+        if self.speaker_adapter_config is not None:
+            self.speaker_adapter_config.out_dim = hidden_size
 
         if self.diffusion_head_config is not None:
             self.diffusion_head_config.backbone_dim = hidden_size

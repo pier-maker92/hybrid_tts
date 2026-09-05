@@ -32,6 +32,9 @@ from modules.submodules.MelCausalVAE.dicodec.modules.semantic_quantizer_ae impor
     load_semantic_quantizer_ae,
     read_semantic_quantizer_config,
 )
+from modules.submodules.MelCausalVAE.dicodec.modules.speaker_encoder import (
+    WavLMSpeakerEncoder,
+)
 
 
 def _filter_dataclass_kwargs(config_cls, values: Optional[dict]) -> dict:
@@ -49,6 +52,7 @@ class DicodecEncoderOnly(nn.Module):
 
         self.wavlm = None
         self.wavlm_extractor = None
+        self.speaker_encoder = None
         if config.wavlm_module_config is not None:
             from transformers import WavLMModel
 
@@ -68,6 +72,12 @@ class DicodecEncoderOnly(nn.Module):
                     feature_extractor_config,
                     wavlm=self.wavlm,
                 )
+            speaker_encoder_config = config.wavlm_module_config.speaker_encoder_config
+            if speaker_encoder_config is not None:
+                self.speaker_encoder = WavLMSpeakerEncoder(
+                    speaker_encoder_config,
+                    wavlm=self.wavlm,
+                )
 
         self.encoder = Encoder(config.encoder_config)
         self.lowpass_filter = LowPassFilter(
@@ -82,9 +92,21 @@ class DicodecEncoderOnly(nn.Module):
         super().train(mode)
         if self.wavlm is not None:
             self.wavlm.eval()
+        if self.speaker_encoder is not None:
+            self.speaker_encoder.eval()
         if self.external_semantic_quantizer is not None:
             self.external_semantic_quantizer.eval()
         return self
+
+    @torch.no_grad()
+    def extract_speaker_embedding(self, audios_srs):
+        if self.speaker_encoder is None:
+            return None
+        self.speaker_encoder = self.speaker_encoder.to(device=self.device)
+        return self.speaker_encoder(audios_srs).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     @torch.no_grad()
     def extract_wavlm_features(
@@ -387,6 +409,7 @@ def load_encoder_only(
         "feature_extractor.",
         "wavlm.",
         "wavlm_extractor.",
+        "speaker_encoder.",
         "encoder.",
         "lowpass_filter.",
     )
@@ -429,6 +452,7 @@ def load_encoder_only(
         key
         for key in missing
         if key.startswith(("encoder.", "feature_extractor.", "wavlm_extractor."))
+        or (model.speaker_encoder is not None and key.startswith("speaker_encoder."))
     ]
     if required_missing:
         raise RuntimeError(

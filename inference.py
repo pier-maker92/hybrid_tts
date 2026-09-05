@@ -197,11 +197,21 @@ def load_kmeans_centroids(
 
 
 def load_voice_condition(path: str, vae: torch.nn.Module, device: torch.device):
+    if not hasattr(vae, "extract_speaker_embedding"):
+        raise RuntimeError("Loaded VAE does not support speaker embedding extraction.")
+    audios_srs = load_voice_reference_audio(path, device)
+    speaker_embedding = vae.extract_speaker_embedding(audios_srs)
+    if speaker_embedding is None:
+        raise RuntimeError(
+            "Voice conditioning requires a VAE checkpoint with speaker_encoder_config."
+        )
+    return speaker_embedding.to(device=device, dtype=next(vae.parameters()).dtype)
+
+
+def load_voice_reference_audio(path: str, device: torch.device):
     path = os.path.expandvars(os.path.expanduser(path))
     if not os.path.exists(path):
         raise FileNotFoundError(f"Voice condition audio not found: {path}")
-    if not hasattr(vae, "extract_speaker_embedding"):
-        raise RuntimeError("Loaded VAE does not support speaker embedding extraction.")
 
     wav, sample_rate = torchaudio.load(path)
     if wav.shape[0] > 1:
@@ -212,12 +222,7 @@ def load_voice_condition(path: str, vae: torch.nn.Module, device: torch.device):
     if max_abs > 0:
         wav = wav / max_abs
 
-    speaker_embedding = vae.extract_speaker_embedding([(wav.to(device), sample_rate)])
-    if speaker_embedding is None:
-        raise RuntimeError(
-            "Voice conditioning requires a VAE checkpoint with speaker_encoder_config."
-        )
-    return speaker_embedding.to(device=device, dtype=next(vae.parameters()).dtype)
+    return [(wav.to(device), sample_rate)]
 
 
 def align_continuous_tokens(
@@ -478,9 +483,14 @@ def main():
         sys.exit(1)
 
     speaker_embedding = None
+    voice_reference_audios_srs = None
     if args.voice_condition:
         logger.info(f"Extracting speaker embedding from {args.voice_condition}...")
         try:
+            voice_reference_audios_srs = load_voice_reference_audio(
+                args.voice_condition,
+                device,
+            )
             speaker_embedding = load_voice_condition(args.voice_condition, vae, device)
         except Exception as e:
             logger.error(f"Could not load voice condition: {e}")
@@ -578,6 +588,8 @@ def main():
             guidance_scale=args.guidance_scale,
             vae=vae,
             generator=generator,
+            reference_audios_srs=voice_reference_audios_srs,
+            voice_conditioner=vae if voice_reference_audios_srs is not None else None,
         )
 
         final_discrete = sample_out["discrete_tokens"]

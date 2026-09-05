@@ -28,8 +28,8 @@ class Transformer(Module):
         use_conv_layer: bool = False,
         is_causal: bool = True,
         window_size: Optional[int] = None,
-        use_ecapa_film: bool = False,
-        ecapa_dim: int = 192,
+        voice_condition: bool = False,
+        speaker_dim: Optional[int] = None,
     ):
         super().__init__()
         assert divisible_by(depth, 2)
@@ -61,9 +61,11 @@ class Transformer(Module):
             nn.SiLU(),
         )
 
-        self.use_ecapa_film = use_ecapa_film
-        if self.use_ecapa_film:
-            self.ecapa_proj = nn.Linear(ecapa_dim, time_hidden_dim)
+        self.voice_condition = voice_condition
+        if self.voice_condition:
+            if speaker_dim is None:
+                raise ValueError("voice_condition=True requires speaker_dim.")
+            self.speaker_proj = nn.Linear(speaker_dim, time_hidden_dim)
 
         if use_conv_layer:
             self.conv_embed = ConvPositionEmbed(
@@ -143,7 +145,7 @@ class Transformer(Module):
         times: torch.FloatTensor,
         attention_mask: Optional[torch.BoolTensor] = None,
         group_size: Optional[int] = None,
-        ecapa: Optional[torch.FloatTensor] = None,
+        speaker_embedding: Optional[torch.FloatTensor] = None,
     ):
         batch, seq_len, *_ = x.shape
         t = times
@@ -161,10 +163,11 @@ class Transformer(Module):
         # time embedding
         time_emb = self.sinu_pos_emb(t)
         
-        # FiLM ECAPA injection
-        if self.use_ecapa_film and ecapa is not None:
-            ecapa = F.normalize(ecapa, p=2, dim=-1)
-            time_emb = time_emb + self.ecapa_proj(ecapa)
+        if self.voice_condition and speaker_embedding is None:
+            raise RuntimeError("voice_condition=True requires speaker_embedding.")
+        if self.voice_condition:
+            speaker_embedding = F.normalize(speaker_embedding, p=2, dim=-1)
+            time_emb = time_emb + self.speaker_proj(speaker_embedding)
 
         # add register tokens to the left
         if self.has_register_tokens:

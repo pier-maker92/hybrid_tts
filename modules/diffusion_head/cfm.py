@@ -33,8 +33,8 @@ class DiT(torch.nn.Module):
         self.use_window_attention = config.use_window_attention
         self.use_group_bidirectional = config.use_group_bidirectional
         self.use_mlp_sampler = config.use_mlp_sampler
-        self.use_ecapa_film = getattr(config, "use_ecapa_film", False)
-        self.ecapa_dim = getattr(config, "ecapa_dim", 192)
+        self.voice_condition = getattr(config, "voice_condition", False)
+        self.speaker_dim = getattr(config, "speaker_dim", None)
 
         latent_fps = 12.5  # 24000 / 256 #FIXME hardcoded to 24kHz dataset
         self.window_size = (
@@ -75,6 +75,10 @@ class DiT(torch.nn.Module):
                 n_residual_blocks=self.net_depth,
             )
             self.sinu_pos_emb = LearnedSinusoidalPosEmb(self.net_dim)
+            if self.voice_condition:
+                if self.speaker_dim is None:
+                    raise ValueError("voice_condition=True requires speaker_dim.")
+                self.mlp_speaker_proj = nn.Linear(self.speaker_dim, self.net_dim)
         else:
             self.net = Transformer(
                 dim=self.net_dim,
@@ -85,8 +89,8 @@ class DiT(torch.nn.Module):
                 is_causal=self.is_causal,
                 attn_flash=True,
                 window_size=self.window_size,
-                use_ecapa_film=self.use_ecapa_film,
-                ecapa_dim=self.ecapa_dim,
+                voice_condition=self.voice_condition,
+                speaker_dim=self.speaker_dim,
             )
 
     def handle_context_vector(
@@ -178,15 +182,17 @@ class DiT(torch.nn.Module):
         state: torch.FloatTensor,
         target: torch.FloatTensor,
         flow_mask: torch.BoolTensor,
-        ecapa: Optional[torch.FloatTensor] = None,
+        speaker_embedding: Optional[torch.FloatTensor] = None,
     ):
         mask_to_loss = ~flow_mask
         v = self.net(
             x=state,
-            times=times,
+            times=self._condition_mlp_times(times, speaker_embedding)
+            if self.use_mlp_sampler
+            else times,
             attention_mask=mask_to_loss if not self.use_mlp_sampler else None,
             group_size=self._group_size if not self.use_mlp_sampler else None,
-            ecapa=ecapa,
+            speaker_embedding=speaker_embedding,
         )
 
         v_to_loss = v[mask_to_loss].view(-1, self.audio_latent_dim)
@@ -200,7 +206,7 @@ class DiT(torch.nn.Module):
         target: torch.FloatTensor,
         target_padding_mask: torch.BoolTensor,
         context_vector: torch.FloatTensor,
-        ecapa: Optional[torch.FloatTensor] = None,
+        speaker_embedding: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         context_vector, prior, _ = self.handle_context_vector(context_vector)
@@ -218,7 +224,7 @@ class DiT(torch.nn.Module):
             state=state,
             target=v_target,
             flow_mask=target_padding_mask,
-            ecapa=ecapa,
+            speaker_embedding=speaker_embedding,
         )
 
         return DecoderOutput(
@@ -233,7 +239,7 @@ class DiT(torch.nn.Module):
         guidance_scale: float = 1.0,
         generator: Optional[torch.Generator] = None,
         padding_mask: Optional[torch.BoolTensor] = None,
-        ecapa: Optional[torch.FloatTensor] = None,
+        speaker_embedding: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
         cfg_scale = guidance_scale
@@ -282,7 +288,7 @@ class DiT(torch.nn.Module):
                     if upsampled_padding_mask is not None
                     else None
                 ),
-                ecapa=ecapa,
+                speaker_embedding=speaker_embedding,
             )
             return features
 
@@ -303,7 +309,7 @@ class DiT(torch.nn.Module):
         cfg_scale: float,
         context_vector,
         attention_mask: Optional[torch.BoolTensor] = None,
-        ecapa: Optional[torch.FloatTensor] = None,
+        speaker_embedding: Optional[torch.FloatTensor] = None,
     ):
         times = times.repeat(state.shape[0])
         if self.use_mlp_sampler:
@@ -318,12 +324,22 @@ class DiT(torch.nn.Module):
 
         cond_state = self.noise_proj(torch.cat([cond_context, state], dim=-1))
         gs = self._group_size
+        cond_times = times
+        uncond_times = times
+        if self.use_mlp_sampler and self.voice_condition:
+            cond_times = self._condition_mlp_times(times, speaker_embedding)
+            uncond_times = self._condition_mlp_times(
+                times,
+                torch.zeros_like(speaker_embedding)
+                if speaker_embedding is not None
+                else None,
+            )
         cond_out = self.net(
             x=cond_state,
-            times=times,
+            times=cond_times,
             attention_mask=attention_mask if not self.use_mlp_sampler else None,
             group_size=gs if not self.use_mlp_sampler else None,
-            ecapa=ecapa,
+            speaker_embedding=speaker_embedding,
         )
         if cfg_scale == 1.0:
             return cond_out
@@ -337,10 +353,14 @@ class DiT(torch.nn.Module):
 
         uncond_out = self.net(
             x=uncond_state,
-            times=times,
+            times=uncond_times,
             attention_mask=attention_mask if not self.use_mlp_sampler else None,
             group_size=gs if not self.use_mlp_sampler else None,
-            ecapa=torch.zeros_like(ecapa) if ecapa is not None else None,
+            speaker_embedding=(
+                torch.zeros_like(speaker_embedding)
+                if speaker_embedding is not None
+                else None
+            ),
         )
 
         final = (cfg_scale * cond_out + (1 - cfg_scale) * uncond_out).to(
@@ -348,6 +368,23 @@ class DiT(torch.nn.Module):
         )
 
         return final
+
+    def _condition_mlp_times(
+        self,
+        times: torch.FloatTensor,
+        speaker_embedding: Optional[torch.FloatTensor],
+    ) -> torch.FloatTensor:
+        if not self.voice_condition:
+            return times
+        if speaker_embedding is None:
+            raise RuntimeError("voice_condition=True requires speaker_embedding.")
+        speaker_embedding = torch.nn.functional.normalize(
+            speaker_embedding, p=2, dim=-1
+        )
+        speaker_cond = self.mlp_speaker_proj(speaker_embedding)
+        if times.ndim == 3:
+            speaker_cond = speaker_cond.unsqueeze(1)
+        return times + speaker_cond.to(dtype=times.dtype)
 
     @property
     def dtype(self):

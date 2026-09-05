@@ -27,7 +27,8 @@ training:
   # cfg
   uncond_prob: 0.0
   no_augment_ratio: 0.7
-  discrete_only: true
+  discrete: true
+  continuous: false
   # resume
   #resume_from_checkpoint: "/scratch/piermel/hybrid_tts/checkpoints/exps/setting-2/checkpoint-2000"
 

@@ -11,3 +11,4 @@ backbone:
   from_pretrained: false
   shift_audio_offset: 0
   force_weight_tying: false
+  voice_condition: false

@@ -1,38 +1,129 @@
+import io
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Sequence
+
 import torch
 import torchaudio
-from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
-import torchaudio.transforms as T
-from torch.utils.data import Dataset
-
-import torch
 import torchaudio.transforms as T
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
 
 
-def _get_audio_duration_seconds(example: Dict) -> Optional[float]:
-    duration = example.get("duration", example.get("duration_sec"))
-    if duration is not None:
-        return float(duration)
-
-    audio = example.get("audio")
-    if audio is None:
-        return None
-    return len(audio["array"]) / audio["sampling_rate"]
-
-
-def _is_within_max_audio_len(example: Dict, max_audio_len: float) -> bool:
-    duration = _get_audio_duration_seconds(example)
+def _is_duration_within_max_audio_len(
+    duration: Optional[float],
+    max_audio_len: float,
+) -> bool:
     return duration is None or duration <= max_audio_len
+
+
+def _alignment_duration_seconds(items) -> Optional[float]:
+    if not items:
+        return None
+    ends = [
+        item.get("end")
+        for item in items
+        if isinstance(item, dict) and item.get("end") is not None
+    ]
+    if not ends:
+        return None
+    return float(max(ends))
+
+
+def _is_alignment_within_max_audio_len(
+    *alignment_columns,
+    max_audio_len: float,
+) -> bool:
+    durations = [
+        duration
+        for duration in (
+            _alignment_duration_seconds(items) for items in alignment_columns
+        )
+        if duration is not None
+    ]
+    duration = max(durations) if durations else None
+    return _is_duration_within_max_audio_len(duration, max_audio_len)
+
+
+def _is_audio_within_max_audio_len(audio: Optional[Dict], max_audio_len: float) -> bool:
+    if audio is None:
+        return True
+    if "array" not in audio:
+        return True
+    duration = len(audio["array"]) / audio["sampling_rate"]
+    return _is_duration_within_max_audio_len(duration, max_audio_len)
+
+
+def _load_audio_data(audio_data, search_dirs=None) -> tuple[torch.Tensor, int]:
+    if isinstance(audio_data, torch.Tensor):
+        return audio_data.to(torch.float32), 24000
+
+    if "array" in audio_data and audio_data["array"] is not None:
+        return torch.as_tensor(audio_data["array"], dtype=torch.float32), int(
+            audio_data["sampling_rate"]
+        )
+
+    if audio_data.get("bytes"):
+        waveform, sample_rate = torchaudio.load(io.BytesIO(audio_data["bytes"]))
+    elif audio_data.get("path"):
+        audio_path = Path(audio_data["path"])
+        tried_paths = [audio_path]
+        if not audio_path.is_absolute() and search_dirs is not None:
+            for search_dir in search_dirs:
+                candidate = Path(search_dir) / audio_path
+                tried_paths.append(candidate)
+                if candidate.exists():
+                    audio_path = candidate
+                    break
+        if not audio_path.exists():
+            tried = ", ".join(str(path) for path in tried_paths)
+            raise FileNotFoundError(
+                f"Audio bytes are missing and audio path could not be resolved. "
+                f"Tried: {tried}"
+            )
+        waveform, sample_rate = torchaudio.load(str(audio_path))
+    else:
+        raise ValueError("Audio example must contain array, path, or bytes.")
+
+    return waveform.to(torch.float32), int(sample_rate)
 
 
 def _filter_by_max_audio_len(dataset, max_audio_len: Optional[float]):
     if max_audio_len is None:
         return dataset
+
+    column_names = set(getattr(dataset, "column_names", []) or [])
+    if "duration" in column_names:
+        return dataset.filter(
+            _is_duration_within_max_audio_len,
+            input_columns=["duration"],
+            fn_kwargs={"max_audio_len": float(max_audio_len)},
+            num_proc=1,
+        )
+    if "duration_sec" in column_names:
+        return dataset.filter(
+            _is_duration_within_max_audio_len,
+            input_columns=["duration_sec"],
+            fn_kwargs={"max_audio_len": float(max_audio_len)},
+            num_proc=1,
+        )
+
+    alignment_columns = [
+        column for column in ("words", "phonemes") if column in column_names
+    ]
+    if alignment_columns:
+        return dataset.filter(
+            _is_alignment_within_max_audio_len,
+            input_columns=alignment_columns,
+            fn_kwargs={"max_audio_len": float(max_audio_len)},
+            num_proc=1,
+        )
+
     return dataset.filter(
-        _is_within_max_audio_len,
+        _is_audio_within_max_audio_len,
+        input_columns=["audio"],
         fn_kwargs={"max_audio_len": float(max_audio_len)},
-        num_proc=8,
+        num_proc=1,
     )
 
 
@@ -81,16 +172,16 @@ class TrainDatasetWrapper(SimpleAudioDataset):
         self,
         dataset: SimpleAudioDataset,
         split: str,
-        discrete_only: bool = False,
+        keep_continuous: bool = True,
         max_audio_len: Optional[float] = None,
     ):
         super().__init__()
         assert split in ["train", "test"], "split must be either train or test"
         self.dataset = getattr(dataset, f"{split}_dataset")
         self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
-        self.discrete_only = discrete_only
+        self.keep_continuous = keep_continuous
 
-        if self.discrete_only and "continuous" in self.dataset.column_names:
+        if not self.keep_continuous and "continuous" in self.dataset.column_names:
             self.dataset = self.dataset.remove_columns("continuous")
 
     def __len__(self):
@@ -101,14 +192,13 @@ class TrainDatasetWrapper(SimpleAudioDataset):
         data = self.dataset[idx]
 
         data_dict["discrete_tokens"] = data.get("discrete")
-        if not self.discrete_only:
+        if self.keep_continuous:
             data_dict["continuous_tokens"] = data.get("continuous")
         else:
             data_dict["continuous_tokens"] = None
 
         data_dict["ids"] = data.get("id")
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
-        data_dict["ecapa"] = data.get("ecapa")
 
         # Pass raw text for on-the-fly char tokenization.
         data_dict["transcription"] = (
@@ -133,7 +223,7 @@ class DataCollator(object):
         self.prompt_vocab_size = tokenizer.prompt_vocab_size
         self.audio_eos_id = self.prompt_vocab_size + self.vq_vocab_size
         self.use_char_tokenizer = getattr(tokenizer, "char_tokenizer", None) is not None
-        self.continuous_only = self.audio_placeholder_id is not None
+        self.uses_audio_placeholder = self.audio_placeholder_id is not None
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = {}
@@ -152,23 +242,25 @@ class DataCollator(object):
 
         d_tokens = [inst.get("discrete_tokens") for inst in instances]
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
-        ecapa_embs = [inst.get("ecapa") for inst in instances]
 
         attention_mask = []
         discrete_sequence = []
         audio_padding_mask = []
         continuous_sequence = []
-        ecapa_sequence = []
         target_tokens = []
-        for p_id, d_token, c_token, ecapa_emb in zip(
-            p_ids, d_tokens, c_tokens, ecapa_embs
-        ):
-            if d_token is not None and getattr(self.tokenizer, "audio_bpe", None) is not None:
+        for p_id, d_token, c_token in zip(p_ids, d_tokens, c_tokens):
+            if (
+                d_token is not None
+                and getattr(self.tokenizer, "audio_bpe", None) is not None
+            ):
                 d_token = self.tokenizer.audio_bpe.encode(d_token)
 
-            if self.continuous_only:
+            if self.uses_audio_placeholder:
                 if c_token is None:
-                    raise ValueError("continuous_only=True requires continuous_tokens.")
+                    raise ValueError(
+                        "training.continuous=true with training.discrete=false "
+                        "requires continuous_tokens."
+                    )
                 audio_len = len(c_token)
                 prompt_tokens = [self.audio_placeholder_id] * len(p_id)
                 shifted_d_token = [self.audio_placeholder_id] * audio_len
@@ -176,7 +268,7 @@ class DataCollator(object):
             else:
                 if d_token is None:
                     raise ValueError(
-                        "discrete_tokens are required unless continuous_only=True."
+                        "discrete_tokens are required when training.discrete=true."
                     )
                 prompt_tokens = p_id
                 shifted_d_token = [d + self.prompt_vocab_size for d in d_token]
@@ -192,12 +284,10 @@ class DataCollator(object):
             attention_mask.append(torch.tensor([1] * len(sequence)).bool())
             # continuous tail
             if c_token is not None and len(c_token) > 0:
-                if not self.continuous_only:
+                if not self.uses_audio_placeholder:
                     assert len(c_token) == len(
                         d_token
-                    ), (  # we have already added the audio_eos token
-                        "continuous_tokens and discrete_tokens must have the same length"
-                    )
+                    ), "continuous_tokens and discrete_tokens must have the same length"  # we have already added the audio_eos token
                 # if (
                 #     len(c_token[0]) == 64
                 # ):  # FIXME this is a temprary fix to handle the way I have extracted continuous token from prepare_data.py
@@ -205,9 +295,6 @@ class DataCollator(object):
                 #     c_token = [c[32:] for c in c_token]
                 continuous_sequence.append(torch.tensor(c_token))
                 audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
-
-            if ecapa_emb:
-                ecapa_sequence.append(torch.tensor(ecapa_emb, dtype=torch.float32))
 
         # all discrete
         discrete_sequence = pad_sequence(
@@ -244,11 +331,6 @@ class DataCollator(object):
             batch["continuous_sequence"] = None
             batch["audio_padding_mask"] = None
 
-        if len(ecapa_sequence) > 0:
-            batch["ecapa"] = torch.stack(ecapa_sequence, dim=0)
-        else:
-            batch["ecapa"] = None
-
         # Include transcriptions if available
         transcriptions = [inst.get("transcription") for inst in instances]
         if all(x is not None for x in transcriptions):
@@ -258,8 +340,9 @@ class DataCollator(object):
 
 
 class DiffusionDataCollator(object):
-    """Collate examples for diffusion-only training. 
-    Passes discrete and continuous tokens exactly as they are without text/phoneme/LLM formatting."""
+    """Collate examples for diffusion-only training.
+    Passes discrete and continuous tokens exactly as they are without text/phoneme/LLM formatting.
+    """
 
     def __init__(self, pad_id=1024, tokenizer=None):
         self.pad_id = pad_id
@@ -273,28 +356,25 @@ class DiffusionDataCollator(object):
 
         d_tokens = [inst.get("discrete_tokens") for inst in instances]
         c_tokens = [inst.get("continuous_tokens") for inst in instances]
-        ecapa_embs = [inst.get("ecapa") for inst in instances]
 
         discrete_sequence = []
         continuous_sequence = []
         attention_mask = []
         audio_padding_mask = []
-        ecapa_sequence = []
-        
+
         for d_token, c_token in zip(d_tokens, c_tokens):
-            if self.tokenizer is not None and getattr(self.tokenizer, "audio_bpe", None) is not None:
+            if (
+                self.tokenizer is not None
+                and getattr(self.tokenizer, "audio_bpe", None) is not None
+            ):
                 d_token = self.tokenizer.audio_bpe.encode(d_token)
-                
+
             discrete_sequence.append(torch.tensor(d_token).long())
             attention_mask.append(torch.tensor([1] * len(d_token)).bool())
-            
+
             if c_token:
                 continuous_sequence.append(torch.tensor(c_token))
                 audio_padding_mask.append(torch.tensor([0] * len(c_token)).bool())
-                
-        for ecapa_emb in ecapa_embs:
-            if ecapa_emb:
-                ecapa_sequence.append(torch.tensor(ecapa_emb, dtype=torch.float32))
 
         # Pad discrete sequences
         discrete_sequence = pad_sequence(
@@ -325,14 +405,7 @@ class DiffusionDataCollator(object):
             batch["continuous_sequence"] = None
             batch["audio_padding_mask"] = None
 
-        if len(ecapa_sequence) > 0:
-            # ecapa is batch x 192 (usually 1D list), just stack them
-            batch["ecapa"] = torch.stack(ecapa_sequence, dim=0)
-        else:
-            batch["ecapa"] = None
-
         return batch
-
 
 
 class TestDatasetWrapper(SimpleAudioDataset):
@@ -340,16 +413,16 @@ class TestDatasetWrapper(SimpleAudioDataset):
         self,
         dataset: SimpleAudioDataset,
         split: str,
-        discrete_only: bool = False,
+        keep_continuous: bool = True,
         max_audio_len: Optional[float] = None,
     ):
         super().__init__()
         assert split in ["test", "train"], "split must be test or train"
         self.dataset = getattr(dataset, f"{split}_dataset")
         self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
-        self.discrete_only = discrete_only
+        self.keep_continuous = keep_continuous
 
-        if self.discrete_only and "continuous" in self.dataset.column_names:
+        if not self.keep_continuous and "continuous" in self.dataset.column_names:
             self.dataset = self.dataset.remove_columns("continuous")
 
     def __len__(self):
@@ -360,14 +433,13 @@ class TestDatasetWrapper(SimpleAudioDataset):
         data = self.dataset[idx]
 
         data_dict["discrete_tokens"] = data.get("discrete")
-        if not self.discrete_only:
+        if self.keep_continuous:
             data_dict["continuous_tokens"] = data.get("continuous")
         else:
-            data_dict["continuous_tokens"] = [None] * len(data.get("continuous"))
+            data_dict["continuous_tokens"] = None
 
         data_dict["ids"] = data.get("id")
         data_dict["phoneme_ids"] = data.get("phoneme_ids")
-        data_dict["ecapa"] = data.get("ecapa")
 
         # Robust transcription field lookup
         transcription = data.get("text_normalized") or data.get("transcript")
@@ -412,6 +484,7 @@ class OnlineTrainDatasetWrapper(Dataset):
         assert split in ["train", "test"]
         self.dataset = getattr(dataset, f"{split}_dataset")
         self.dataset = _filter_by_max_audio_len(self.dataset, max_audio_len)
+        self.audio_roots = getattr(dataset, "audio_roots", {}).get(split, [])
 
     def __len__(self):
         return len(self.dataset)
@@ -421,6 +494,7 @@ class OnlineTrainDatasetWrapper(Dataset):
         phoneme_ids = data.get("phoneme_ids") or []
         return {
             "audio": data["audio"],
+            "audio_roots": self.audio_roots,
             "phoneme_ids": phoneme_ids,
             "ids": data.get("id", str(idx)),
             "transcription": (
@@ -448,18 +522,20 @@ class DataCollatorWithVAE:
         tokenizer,
         vae,
         device,
-        discrete_only: bool = False,
-        continuous_only: bool = False,
+        discrete: bool = True,
+        continuous: bool = True,
         quantizer_source: str = "z",
         include_quantizer_residual: bool = False,
     ):
         self._base = DataCollator(tokenizer)
         self.vae = vae
         self.device = device
-        self.discrete_only = discrete_only
-        self.continuous_only = continuous_only
+        self.discrete = discrete
+        self.continuous = continuous
         self.quantizer_source = quantizer_source
         self.include_quantizer_residual = include_quantizer_residual
+        if not (self.discrete or self.continuous):
+            raise ValueError("At least one of discrete or continuous must be enabled.")
         if self.quantizer_source not in {"z", "z_sem"}:
             raise ValueError("quantizer_source must be either 'z' or 'z_sem'.")
 
@@ -467,34 +543,34 @@ class DataCollatorWithVAE:
     def _encode_batch(self, instances):
         self.vae.eval()  # guard: prevent feature_extractor from updating std/mean statistics
         audios_srs = []
+        reference_audios_srs = []
         for inst in instances:
-            audio_data = inst["audio"]
-            array = audio_data["array"]
-            sr = audio_data["sampling_rate"]
-            if isinstance(array, list):
-                tensor = torch.tensor(array, dtype=torch.float32)
-            else:
-                tensor = torch.as_tensor(array, dtype=torch.float32)
+            tensor, sr = _load_audio_data(inst["audio"], inst.get("audio_roots"))
             if tensor.dim() > 1:
-                tensor = tensor.squeeze(0)
+                tensor = tensor.mean(dim=0)
             tensor = tensor / (tensor.abs().max() + 1e-8)
             if sr != self.TARGET_SR:
                 tensor = torchaudio.functional.resample(tensor, sr, self.TARGET_SR)
+            reference_audios_srs.append((tensor.detach().cpu(), self.TARGET_SR))
             audios_srs.append((tensor.to(self.device), self.TARGET_SR))
 
         features, padding_mask = self.vae.extract_features(audios_srs)[:2]
-        vae_dtype = self.vae.dtype if hasattr(self.vae, "dtype") else next(self.vae.parameters()).dtype
+        vae_dtype = (
+            self.vae.dtype
+            if hasattr(self.vae, "dtype")
+            else next(self.vae.parameters()).dtype
+        )
         features = features.to(vae_dtype)
         encoder_output = self.vae.encode(
             features,
             padding_mask,
-            run_quantizer=not self.continuous_only,
+            run_quantizer=self.discrete,
         )
 
         discrete_list, continuous_list = [], []
         for i in range(len(instances)):
             mask = ~encoder_output.padding_mask[i]
-            if self.continuous_only:
+            if not self.discrete:
                 discrete_list.append(None)
                 continuous_list.append(encoder_output.z[i][mask].float().cpu().tolist())
                 continue
@@ -511,7 +587,7 @@ class DataCollatorWithVAE:
                 )
             discrete_list.append(indices[i][mask].cpu().tolist())
 
-            if self.discrete_only:
+            if not self.continuous:
                 continuous_list.append(None)
                 continue
 
@@ -523,26 +599,28 @@ class DataCollatorWithVAE:
             if self.quantizer_source == "z":
                 if residual is None:
                     raise RuntimeError("source='z' hybrid training requires residual.")
-                continuous = residual
+                continuous_values = residual
             else:
                 if quantizer_output is None or quantizer_output.z_pros is None:
                     raise RuntimeError(
                         "source='z_sem' requires an external semantic quantizer "
                         "that provides z_pros."
                     )
-                continuous = quantizer_output.z_pros
+                continuous_values = quantizer_output.z_pros
                 if self.include_quantizer_residual:
                     if residual is None:
                         raise RuntimeError(
                             "include_quantizer_residual=True requires residual."
                         )
-                    continuous = continuous + residual
+                    continuous_values = continuous_values + residual
 
-            continuous_list.append(continuous[i][mask].float().cpu().tolist())
-        return discrete_list, continuous_list
+            continuous_list.append(continuous_values[i][mask].float().cpu().tolist())
+        return discrete_list, continuous_list, reference_audios_srs
 
     def __call__(self, instances):
-        discrete_list, continuous_list = self._encode_batch(instances)
+        discrete_list, continuous_list, reference_audios_srs = self._encode_batch(
+            instances
+        )
         patched = [
             {
                 "discrete_tokens": discrete_list[i],
@@ -553,4 +631,6 @@ class DataCollatorWithVAE:
             }
             for i in range(len(instances))
         ]
-        return self._base(patched)
+        batch = self._base(patched)
+        batch["reference_audios_srs"] = reference_audios_srs
+        return batch

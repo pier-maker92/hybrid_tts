@@ -4,9 +4,10 @@ import json
 import argparse
 from tqdm import tqdm
 from typing import Optional, List
+from pathlib import Path
 from collections import defaultdict
 from torch.utils.data import DataLoader
-from datasets import load_dataset, concatenate_datasets
+from datasets import Audio, load_dataset, concatenate_datasets
 from data.audio_dataset import (
     SimpleAudioDataset,
     DataCollator,
@@ -23,6 +24,25 @@ if SLURM_TMPDIR is None:
 
 def simple_collate_fn(batch):
     return batch
+
+
+def _find_partition_files(parquet_dir: str, partitions: Optional[List[str]] = None):
+    root = Path(parquet_dir)
+    if partitions is None:
+        return None
+
+    data_files = {}
+    for partition in partitions:
+        partition_dir = root / partition
+        files = sorted(
+            str(path)
+            for path in partition_dir.glob("*.parquet")
+            if not path.name.startswith("._")
+        )
+        if not files:
+            raise FileNotFoundError(f"No parquet files found in {partition_dir}")
+        data_files[partition] = files
+    return data_files
 
 
 def build_vocab_and_map(batch, phoneme_vocab):
@@ -49,18 +69,41 @@ class LibriSpeechAlignDataset(SimpleAudioDataset):
         keep_audio: bool = False,
         dataset_dir_name: str = "librispeech-aligned_prepared",
         build_phoneme_vocab: bool = True,
+        dataset_partitions: Optional[List[str]] = None,
     ):
         super().__init__()
         parquet_dir = os.path.join(SLURM_TMPDIR, "datasets", dataset_dir_name)
+        data_files = _find_partition_files(parquet_dir, dataset_partitions)
+        self.audio_roots = defaultdict(list)
+        if dataset_partitions is not None:
+            for partition in dataset_partitions:
+                destination = self._partition_to_destination(partition)
+                self.audio_roots[destination].append(
+                    str(Path(parquet_dir) / partition)
+                )
+        else:
+            self.audio_roots["train"].append(parquet_dir)
+            self.audio_roots["test"].append(parquet_dir)
         # Load the two datasets
-        dataset = load_dataset(
-            "parquet",
-            data_dir=parquet_dir,
-        )
+        if data_files is not None:
+            dataset = load_dataset("parquet", data_files=data_files)
+        else:
+            dataset = load_dataset(
+                "parquet",
+                data_dir=parquet_dir,
+            )
+        first_split = next(iter(dataset))
+        if keep_audio and "audio" not in dataset[first_split].column_names:
+            raise ValueError(
+                "LibriSpeechAlignDataset was asked to keep audio for online "
+                "encoding, but the loaded dataset has no 'audio' column."
+            )
+        if keep_audio:
+            dataset = dataset.cast_column("audio", Audio(decode=False))
         if not keep_audio:
             audio_columns = [
                 column
-                for column in dataset[next(iter(dataset))].column_names
+                for column in dataset[first_split].column_names
                 if column == "audio"
             ]
             if audio_columns:

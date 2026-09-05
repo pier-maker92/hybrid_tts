@@ -12,3 +12,4 @@ diffusion_head:
   use_window_attention: false
   use_group_bidirectional: false
   use_mlp_sampler: false
+  voice_condition: false

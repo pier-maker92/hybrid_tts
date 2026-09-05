@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """End-to-end TTS evaluation on LibriSpeech test-clean, two scenarios in one pass.
 
-Scenario A — resynthesis (metrics: UTMOS / dWER / SpkSimWavLM):
+Scenario A - resynthesis (metrics: UTMOS / dWER / SpkSimWavLM):
     original audio --VAE.encode--> discrete VQ tokens
                    --diffusion--> acoustic features (z_acoustic)
                    --VAE.sample + vocoder--> generated audio (hyp)
     hyp is scored against the original audio (ref).
 
-Scenario B — full TTS (report RTF, no metrics):
+Scenario B - full TTS (report RTF, no metrics):
     text --hybrid model--> discrete tokens (BPE-decoded to raw VAE tokens)
          --diffusion--> acoustic features --VAE.sample + vocoder--> generated audio
 
@@ -69,7 +69,7 @@ def load_test_clean(num_samples):
 
 @torch.no_grad()
 def synth_from_tokens(raw_tokens, diffusion_model, vae, vocoder, device, dtype,
-                      diff_steps, diff_temp, diff_guid, ecapa=None):
+                      diff_steps, diff_temp, diff_guid, speaker_embedding=None):
     """raw VAE discrete tokens -> diffusion acoustics -> VAE.sample -> vocoder -> audio [1, T]."""
     discrete_sequence = torch.tensor([raw_tokens], dtype=torch.long, device=device)
     attention_mask = torch.ones_like(discrete_sequence, dtype=torch.bool, device=device)
@@ -85,7 +85,7 @@ def synth_from_tokens(raw_tokens, diffusion_model, vae, vocoder, device, dtype,
         temperature=diff_temp,
         guidance_scale=diff_guid,
         padding_mask=~attention_mask,
-        ecapa=ecapa,
+        speaker_embedding=speaker_embedding,
     )
     z_denorm = diffusion_model.dynamic_normalizer.denormalize(diffusion_out.audio_features)
 
@@ -136,7 +136,6 @@ def main():
     p.add_argument("--diffusion_temperature", type=float, default=1.0)
     p.add_argument("--guidance_scale", "-dg", type=float, default=1.0)
     p.add_argument("--audiocodecs_dwer_device", type=str, default="cuda")
-    p.add_argument("--use_ECAPA", action="store_true", help="Enable ECAPA conditioning via film layer")
     args = p.parse_args()
 
     if args.device:
@@ -198,17 +197,6 @@ def main():
     ds = load_test_clean(args.num_samples)
     logger.info(f"Loaded {len(ds)} LibriSpeech test-clean samples.")
 
-    ecapa_classifier = None
-    if args.use_ECAPA:
-        logger.info("Loading ECAPA model...")
-        from speechbrain.inference.speaker import EncoderClassifier
-        ecapa_savedir = os.path.join(os.environ.get("SCRATCH", ""), ".cache/speechbrain/spkrec-ecapa-voxceleb")
-        ecapa_classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir=ecapa_savedir,
-            run_opts={"device": str(device)}
-        )
-
     rtf_list = []
     diff_kwargs = dict(
         diff_steps=args.num_steps,
@@ -227,17 +215,27 @@ def main():
         orig = orig / (orig.abs().max() + 1e-8)
         torchaudio.save(os.path.join(wav_dir, f"sample_{i}_{sid}_original.wav"), orig.unsqueeze(0), SR)
 
-        ecapa_emb = None
-        if ecapa_classifier is not None:
-            wav_16k = torchaudio.functional.resample(audio, sr, 16000)
-            with torch.no_grad():
-                emb = ecapa_classifier.encode_batch(wav_16k.unsqueeze(0).to(device))
-                ecapa_emb = emb.squeeze().unsqueeze(0).to(dtype)
+        speaker_embedding = None
+        if hasattr(vae, "extract_speaker_embedding"):
+            speaker_embedding = vae.extract_speaker_embedding(
+                [(audio.to(device=device, dtype=dtype), sr)]
+            )
+            if speaker_embedding is not None:
+                speaker_embedding = speaker_embedding.to(device=device, dtype=dtype)
 
         # ---- Scenario A: resynthesis (metrics) ----
         try:
             tokens_a = vae_encode_tokens(vae, audio, sr, device, dtype)
-            gen_a = synth_from_tokens(tokens_a, diffusion_model, vae, vocoder, device, dtype, ecapa=ecapa_emb, **diff_kwargs)
+            gen_a = synth_from_tokens(
+                tokens_a,
+                diffusion_model,
+                vae,
+                vocoder,
+                device,
+                dtype,
+                speaker_embedding=speaker_embedding,
+                **diff_kwargs,
+            )
             torchaudio.save(os.path.join(wav_dir, f"sample_{i}_{sid}_scenarioA_gen.wav"), gen_a.cpu(), SR)
             ac_metrics_a.append(sid, gen_a[0].cpu(), orig)
         except Exception:
@@ -253,16 +251,30 @@ def main():
             discrete_sequence = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(discrete_sequence, dtype=torch.bool, device=device)
             sample_out = hybrid_model.sample(
-                batch={"discrete_sequence": discrete_sequence, "attention_mask": attention_mask},
+                batch={
+                    "discrete_sequence": discrete_sequence,
+                    "attention_mask": attention_mask,
+                },
                 max_steps=args.max_len,
                 temperature=args.temperature,
                 num_steps=1,
-                vae=None,
+                vae=vae,
+                reference_audios_srs=[(audio.to(device=device, dtype=dtype), sr)],
+                voice_conditioner=vae,
             )
             audio_tokens = sample_out["discrete_tokens"].squeeze(-1).squeeze(0).tolist()
             if getattr(hybrid_tok, "audio_bpe", None) is not None:
                 audio_tokens = hybrid_tok.audio_bpe.decode(audio_tokens)
-            gen_b = synth_from_tokens(audio_tokens, diffusion_model, vae, vocoder, device, dtype, ecapa=ecapa_emb, **diff_kwargs)
+            gen_b = synth_from_tokens(
+                audio_tokens,
+                diffusion_model,
+                vae,
+                vocoder,
+                device,
+                dtype,
+                speaker_embedding=speaker_embedding,
+                **diff_kwargs,
+            )
             torch.cuda.synchronize() if device.type == "cuda" else None
             elapsed = time.time() - t0
             dur = gen_b.shape[-1] / float(SR)

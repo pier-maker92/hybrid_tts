@@ -27,7 +27,8 @@ training:
   warmup_ratio: 0.05
   uncond_prob: 0.1
   no_augment_ratio: 0.25
-  discrete_only: false
+  discrete: true
+  continuous: true
   group_by_length: false
   dataloader_num_workers: 4
 

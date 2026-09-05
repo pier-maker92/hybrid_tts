@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
+from contextlib import nullcontext
 from typing import Dict, List, Any, Optional
 
 from jiwer import wer as compute_wer, cer as compute_cer
@@ -15,6 +16,41 @@ from faster_whisper import WhisperModel
 from transformers import WhisperTokenizer
 
 logger = logging.getLogger(__name__)
+
+
+def _empty_generation_metrics(
+    sid: str,
+    run_id: str,
+    step: int,
+    gt_text: str,
+    gt_metrics: Dict[str, float],
+    ref_asr_text: Optional[str] = None,
+) -> Dict[str, Any]:
+    recon_dwer = compute_wer(ref_asr_text, "") if ref_asr_text else None
+    recon_dcer = compute_cer(ref_asr_text, "") if ref_asr_text else None
+    return {
+        "id": sid,
+        "run_id": run_id,
+        "step": step,
+        "gt_text": gt_text,
+        "ref_asr_text": ref_asr_text,
+        "recon_asr_text": "",
+        "gt_UTMOS": gt_metrics.get("UTMOS"),
+        "recon_UTMOS": None,
+        "recon_WER": compute_wer(gt_text, ""),
+        "recon_CER": compute_cer(gt_text, ""),
+        "recon_dWER": recon_dwer,
+        "recon_dCER": recon_dcer,
+    }
+
+
+def _metric_mean(df: pd.DataFrame, column: str) -> float:
+    if column not in df:
+        return 0.0
+    values = df[column].dropna()
+    if values.empty:
+        return 0.0
+    return float(values.mean())
 
 
 def _codebook_lookup(quantizer_module: torch.nn.Module, tokens: torch.Tensor):
@@ -101,8 +137,13 @@ class WhisperASR:
     def __init__(self, device: torch.device, model_name: str = "small"):
         logger.info(f"Loading faster-whisper ASR model: {model_name}")
         try:
-            compute_type = "float16" if device.type == "cuda" else "float32"
-            self.model = WhisperModel(model_name, device=device.type, compute_type=compute_type)
+            whisper_device = "cuda" if device.type == "cuda" else "cpu"
+            compute_type = "float16" if whisper_device == "cuda" else "float32"
+            self.model = WhisperModel(
+                model_name,
+                device=whisper_device,
+                compute_type=compute_type,
+            )
             self.tokenizer = WhisperTokenizer.from_pretrained(f"openai/whisper-{model_name}")
         except Exception as e:
             logger.warning(f"Failed to load faster-whisper model: {e}")
@@ -206,16 +247,33 @@ def run_evaluation(
                 k: (v.to(device) if isinstance(v, torch.Tensor) else v)
                 for k, v in batch.items()
             }
+            reference_audios_srs = batch.get("reference_audios_srs")
+            decoder_speaker_embeddings = None
+            if (
+                vae is not None
+                and reference_audios_srs is not None
+                and hasattr(vae, "extract_speaker_embedding")
+            ):
+                with torch.no_grad():
+                    decoder_speaker_embeddings = vae.extract_speaker_embedding(
+                        reference_audios_srs[: len(gt_texts)]
+                    )
 
             with torch.no_grad():
-                # Use bfloat16 autocast for the model
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                autocast_context = (
+                    torch.amp.autocast("cuda", dtype=torch.bfloat16)
+                    if device.type == "cuda"
+                    else nullcontext()
+                )
+                with autocast_context:
                     reconstruction_results = model.sample(
                         batch=batch,
                         num_steps=16,
                         temperature=0.2,
                         guidance_scale=1.3,
                         max_steps=250,
+                        reference_audios_srs=reference_audios_srs,
+                        voice_conditioner=vae,
                     )
 
                 reconstructed_mels = reconstruction_results["continuous_tokens"]
@@ -236,17 +294,69 @@ def run_evaluation(
                     gt_metrics = {"UTMOS": None, "WER": 0.0, "CER": 0.0}
                     gt_cache[sid] = gt_metrics
 
+                if hasattr(asr_model, "tokenizer") and asr_model.tokenizer is not None:
+                    gt_text = asr_model.tokenizer.normalize(gt_text).strip()
+
+                ref_audio = None
+                ref_sr = None
+                ref_asr_text = None
+                if reference_audios_srs is not None and i < len(reference_audios_srs):
+                    ref_audio, ref_sr = reference_audios_srs[i]
+                    if gt_metrics.get("UTMOS") is None:
+                        gt_metrics["UTMOS"] = utmos_predictor.predict(
+                            ref_audio,
+                            ref_sr,
+                        )
+                    ref_asr_text = asr_model.transcribe(ref_audio, ref_sr)
+
                 # 2. Reconstruct audio from mel
                 if reconstructed_mels is None:
+                    logger.warning(
+                        "Generated no continuous tokens for sample %s; recording "
+                        "empty reconstruction.",
+                        sid,
+                    )
+                    samples_metrics.append(
+                        _empty_generation_metrics(
+                            sid=sid,
+                            run_id=run_id,
+                            step=step,
+                            gt_text=gt_text,
+                            gt_metrics=gt_metrics,
+                            ref_asr_text=ref_asr_text,
+                        )
+                    )
+                    processed_count += 1
                     continue
                 z_acoustic = reconstructed_mels[i]
                 mel_len = int(reconstructed_lengths[i].item())
                 mel_len = min(mel_len, z_acoustic.shape[0])
+                if mel_len <= 0:
+                    logger.warning(
+                        "Generated EOS before any audio tokens for sample %s; "
+                        "recording empty reconstruction.",
+                        sid,
+                    )
+                    samples_metrics.append(
+                        _empty_generation_metrics(
+                            sid=sid,
+                            run_id=run_id,
+                            step=step,
+                            gt_text=gt_text,
+                            gt_metrics=gt_metrics,
+                            ref_asr_text=ref_asr_text,
+                        )
+                    )
+                    processed_count += 1
+                    continue
                 z_acoustic = z_acoustic[:mel_len].unsqueeze(0).float().to(device) # shape: [1, L, C]
 
                 with torch.no_grad():
                     if vae is not None:
                         padding_mask = torch.zeros((1, mel_len), dtype=torch.bool, device=device)
+                        speaker_embedding = None
+                        if decoder_speaker_embeddings is not None:
+                            speaker_embedding = decoder_speaker_embeddings[i : i + 1]
                         tokens_tensor = None
                         if reconstructed_discrete is not None:
                             tokens_tensor = reconstructed_discrete[i][:mel_len, 0].to(device) # shape: [L]
@@ -261,6 +371,7 @@ def run_evaluation(
                                 z_semantic=vq_emb,
                                 z_acoustic=z_acoustic,
                                 padding_mask=padding_mask,
+                                speaker_embedding=speaker_embedding,
                             )
                         else:
                             z = z_acoustic
@@ -278,6 +389,7 @@ def run_evaluation(
                                 guidance_scale=1.4,
                                 z=z,
                                 padding_mask=padding_mask,
+                                speaker_embedding=speaker_embedding,
                             )
                         mel = mel[0][~mel_mask[0]].unsqueeze(0).permute(0, 2, 1).float().to(device)
                     else:
@@ -291,23 +403,33 @@ def run_evaluation(
 
                 recon_utmos = utmos_predictor.predict(recon_audio, sr)
                 recon_transcription = asr_model.transcribe(recon_audio, sr)
-                
-                if hasattr(asr_model, "tokenizer") and asr_model.tokenizer is not None:
-                    gt_text = asr_model.tokenizer.normalize(gt_text).strip()
-
 
                 recon_wer = compute_wer(gt_text, recon_transcription)
                 recon_cer = compute_cer(gt_text, recon_transcription)
+                recon_dwer = (
+                    compute_wer(ref_asr_text, recon_transcription)
+                    if ref_asr_text
+                    else None
+                )
+                recon_dcer = (
+                    compute_cer(ref_asr_text, recon_transcription)
+                    if ref_asr_text
+                    else None
+                )
 
                 sample_res = {
                     "id": sid,
                     "run_id": run_id,
                     "step": step,
                     "gt_text": gt_text,
-                    "gt_UTMOS": gt_metrics["UTMOS"],
+                    "ref_asr_text": ref_asr_text,
+                    "recon_asr_text": recon_transcription,
+                    "gt_UTMOS": gt_metrics.get("UTMOS"),
                     "recon_UTMOS": recon_utmos,
                     "recon_WER": recon_wer,
                     "recon_CER": recon_cer,
+                    "recon_dWER": recon_dwer,
+                    "recon_dCER": recon_dcer,
                 }
                 samples_metrics.append(sample_res)
                 processed_count += 1
@@ -324,11 +446,27 @@ def run_evaluation(
         csv_path = csv_dir / f"val_step_{step}.csv"
         df.to_csv(csv_path, index=False)
 
+        avg_utmos_ref = _metric_mean(df, "gt_UTMOS")
+        avg_utmos = _metric_mean(df, "recon_UTMOS")
+        avg_dwer = _metric_mean(df, "recon_dWER")
         summary_metrics = {
-            "eval/avg_UTMOS": df["recon_UTMOS"].mean() if "recon_UTMOS" in df else 0.0,
-            "eval/avg_WER": df["recon_WER"].mean() if "recon_WER" in df else 0.0,
-            "eval/avg_CER": df["recon_CER"].mean() if "recon_CER" in df else 0.0,
+            "eval/avg_UTMOS": avg_utmos,
+            "eval/avg_UTMOS_ref": avg_utmos_ref,
+            "eval/avg_dUTMOS": avg_utmos - avg_utmos_ref,
+            "eval/avg_WER": _metric_mean(df, "recon_WER"),
+            "eval/avg_CER": _metric_mean(df, "recon_CER"),
+            "eval/avg_dWER": avg_dwer,
+            "eval/avg_dCER": _metric_mean(df, "recon_dCER"),
         }
+
+        summary_line = (
+            f"Evaluation step {step}: "
+            f"UTMOS={summary_metrics['eval/avg_UTMOS']:.4f}, "
+            f"dWER={summary_metrics['eval/avg_dWER']:.4f}, "
+            f"WER={summary_metrics['eval/avg_WER']:.4f}"
+        )
+        logger.info(summary_line)
+        print(summary_line, flush=True)
 
         if wandb.run is not None:
             table = wandb.Table(dataframe=df)

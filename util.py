@@ -3,6 +3,7 @@ import json
 import wandb
 from typing import Dict, Any, Tuple, Optional
 from modules.hybrid_model import HybridTokenizer
+from modules.modalities import resolve_modalities
 from data.audio_dataset import (
     TrainDatasetWrapper,
     TestDatasetWrapper,
@@ -31,6 +32,7 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
     train_split = training_cfg.pop("train_split", "train")
     online_encode = training_cfg.get("online_encode", False)
     max_audio_len = training_cfg.get("max_audio_len")
+    discrete, continuous = resolve_modalities(training_cfg)
 
     if dataset_name == "mls":
         from data.mls import MLSDataset
@@ -55,6 +57,7 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
                 "librispeech-aligned_prepared",
             ),
             build_phoneme_vocab=text_tokenizer != "char",
+            dataset_partitions=training_cfg.get("dataset_partitions"),
         )
         if online_encode:
             train_dataset = OnlineTrainDatasetWrapper(
@@ -97,22 +100,20 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
         "libritts-r-prepared",
         "libritts_r_prepared",
         "libritts-r-dicodec18-kmeans512-prepared",
-        "libritts-r-dicodec18-kmeans512-noecapa-prepared",
     ]:
         from data.libri_tts_r_prepared import LibriTTSRPrepared
 
         dataset = LibriTTSRPrepared(dataset_dir_name=dataset_name)
-        discrete_only = training_cfg.get("discrete_only", False)
         train_dataset = TrainDatasetWrapper(
             dataset,
             train_split,
-            discrete_only=discrete_only,
+            keep_continuous=continuous,
             max_audio_len=max_audio_len,
         )
         test_dataset = TrainDatasetWrapper(
             dataset,
             "test",
-            discrete_only=discrete_only,
+            keep_continuous=continuous,
             max_audio_len=max_audio_len,
         )
         return train_dataset, test_dataset, dataset_name
@@ -135,18 +136,17 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 
-    discrete_only = training_cfg.get("discrete_only", False)
     train_dataset = TrainDatasetWrapper(
         dataset,
         "train",
-        discrete_only=discrete_only,
+        keep_continuous=continuous,
         max_audio_len=max_audio_len,
     )
 
     test_dataset = TestDatasetWrapper(
         dataset,
         "train",
-        discrete_only=discrete_only,
+        keep_continuous=continuous,
         max_audio_len=max_audio_len,
         # FIXME handle the test partition in Ljspeech (now missing)
     )
@@ -197,19 +197,18 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
 
     audio_bpe = None
     training_cfg = cfg_dict.get("training", {})
-    continuous_only = training_cfg.get("continuous_only", False)
-    discrete_only = training_cfg.get("discrete_only", False)
+    discrete, continuous = resolve_modalities(training_cfg)
     _, discrete_token_vocab_size = load_codebook_config_from_cfg(cfg_dict)
-    if cfg_dict.get("use_tokenize") and training_cfg.get("discrete_only", False):
+    if cfg_dict.get("use_tokenize") and discrete and not continuous:
         bpe_path = cfg_dict.get("bpe_tokenizer_path", "audio_bpe.json")
         if os.path.exists(bpe_path):
             audio_bpe = AudioTokenizer.load(bpe_path)
             discrete_token_vocab_size = audio_bpe.vocab_size
         else:
-            raise ValueError(f"bpe_tokenizer_path '{bpe_path}' not found, but use_tokenize is True.")
-    if continuous_only and discrete_only:
-        raise ValueError("discrete_only and continuous_only are mutually exclusive.")
-    if not continuous_only and discrete_token_vocab_size <= 0:
+            raise ValueError(
+                f"bpe_tokenizer_path '{bpe_path}' not found, but use_tokenize is True."
+            )
+    if discrete and discrete_token_vocab_size <= 0:
         raise ValueError(
             "Discrete or hybrid training requires a quantizer. Set "
             "training.semantic_quantizer_checkpoint or training.semantic_codebook_size."
@@ -217,9 +216,9 @@ def build_tokenizer(cfg_dict: Dict[str, Any], pretrinaed: bool = False):
     end_audio_id = vocab_size + 2
     pad_token_id = vocab_size + 1
     start_audio_id = vocab_size + 0
-    audio_placeholder_id = vocab_size + 3 if continuous_only else None
+    audio_placeholder_id = vocab_size + 3 if not discrete else None
 
-    prompt_vocab_size = vocab_size + (4 if continuous_only else 3)
+    prompt_vocab_size = vocab_size + (4 if not discrete else 3)
 
     return HybridTokenizer(
         prompt_vocab_size=prompt_vocab_size,

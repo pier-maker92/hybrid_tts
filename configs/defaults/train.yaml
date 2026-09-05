@@ -2,6 +2,7 @@
 training:
   seed: 42
   dataset_name: librispeech_aligned
+  dataset_partitions: null
   max_audio_len: null
   output_dir: outputs/hybrid_tts
   learning_rate: 1e-4
@@ -11,8 +12,8 @@ training:
   warmup_steps: 0
   uncond_prob: 0.0
   no_augment_ratio: 0.0
-  discrete_only: false
-  continuous_only: false
+  discrete: true
+  continuous: true
   online_encode: false
   audio_quantizer_source: z
   include_quantizer_residual: false

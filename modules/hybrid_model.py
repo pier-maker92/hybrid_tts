@@ -298,8 +298,13 @@ class HybridTTS(nn.Module):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_id
         self.uncond_prob = config.uncond_prob
-        self.discrete_only = config.discrete_only
-        self.continuous_only = config.continuous_only
+        self.discrete = config.discrete
+        self.continuous = config.continuous
+        self.backbone_voice_condition = config.backbone_config.voice_condition
+        self.diffusion_voice_condition = (
+            config.diffusion_head_config is not None
+            and config.diffusion_head_config.voice_condition
+        )
         self.end_audio_id = tokenizer.end_audio_id
         self.start_audio_id = tokenizer.start_audio_id
         self.shift_audio_offset = config.shift_audio_offset
@@ -336,7 +341,8 @@ class HybridTTS(nn.Module):
                 dropout=bb_cfg.dropout or 0.0,
                 rope_theta=bb_cfg.rope_theta or 10000.0,
                 max_seq_len=bb_cfg.max_position_embeddings or 4096,
-                tie_word_embeddings=self.discrete_only or bb_cfg.force_weight_tying,
+                tie_word_embeddings=(self.discrete and not self.continuous)
+                or bb_cfg.force_weight_tying,
             )
             hidden_size = bb_cfg.hidden_dim or 512
         else:
@@ -348,7 +354,8 @@ class HybridTTS(nn.Module):
                 bb_cfg.model_type,
                 self.unified_vocab_size,
                 self.pad_token_id,
-                tie_word_embeddings=self.discrete_only or bb_cfg.force_weight_tying,
+                tie_word_embeddings=(self.discrete and not self.continuous)
+                or bb_cfg.force_weight_tying,
             )
             hidden_size = self.backbone.model.config.hidden_size
 
@@ -357,8 +364,13 @@ class HybridTTS(nn.Module):
         # ---- Continuous adapter (VAE latents → hidden_size) ------------------
         if config.continuous_adapter_config is not None:
             self.continuous_adapter = MLPAdapter(config.continuous_adapter_config)
-        elif not self.discrete_only:
+        elif self.continuous:
             self.continuous_adapter = nn.Linear(config.continuous_dim, hidden_size)
+
+        if config.speaker_adapter_config is not None:
+            self.speaker_adapter = MLPAdapter(config.speaker_adapter_config)
+        else:
+            self.speaker_adapter = None
 
         # ---- Normalisations --------------------------------------------------
         self.dynamic_normalizer = DynamicNormalizer(config.continuous_dim)
@@ -384,7 +396,8 @@ class HybridTTS(nn.Module):
         # space, potentially reducing the richness needed for continuous/acoustic
         # conditioning when predicting both discrete and continuous features.
         if (
-            not (self.discrete_only or self.continuous_only)
+            self.discrete
+            and self.continuous
             and not bb_cfg.force_weight_tying
         ):
             print("initializing token head")
@@ -401,8 +414,8 @@ class HybridTTS(nn.Module):
         self,
         codebook_embeddings: torch.Tensor,
     ) -> None:
-        if self.continuous_only:
-            logger.info("Skipping discrete embedding init in continuous-only mode.")
+        if not self.discrete:
+            logger.info("Skipping discrete embedding init because discrete=false.")
             return
 
         if codebook_embeddings.ndim != 2:
@@ -471,6 +484,51 @@ class HybridTTS(nn.Module):
 
     def _make_position_ids(self, attention_mask: torch.BoolTensor):
         return (attention_mask.long().cumsum(dim=1) - 1).clamp_min(0)
+
+    def _extract_voice_condition(
+        self,
+        voice_conditioner,
+        reference_audios_srs,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not (self.backbone_voice_condition or self.diffusion_voice_condition):
+            return None
+        if voice_conditioner is None:
+            raise RuntimeError("voice_condition=true requires a VAE voice_conditioner.")
+        if reference_audios_srs is None:
+            raise RuntimeError("voice_condition=true requires reference_audios_srs.")
+        if not hasattr(voice_conditioner, "extract_speaker_embedding"):
+            raise RuntimeError(
+                "voice_conditioner must expose extract_speaker_embedding(audios_srs)."
+            )
+
+        speaker_embedding = voice_conditioner.extract_speaker_embedding(
+            reference_audios_srs
+        )
+        if speaker_embedding is None:
+            raise RuntimeError(
+                "voice_condition=true requires a VAE checkpoint with speaker encoder."
+            )
+        return speaker_embedding.to(device=device, dtype=dtype)
+
+    def _speaker_hidden(self, speaker_embedding: Optional[torch.Tensor]):
+        if speaker_embedding is None or self.speaker_adapter is None:
+            return None
+        return self.norm_continuous(self.speaker_adapter(speaker_embedding))
+
+    def _add_backbone_voice_condition(
+        self,
+        input_embs: torch.Tensor,
+        attention_mask: torch.BoolTensor,
+        speaker_embedding: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        speaker_hidden = self._speaker_hidden(speaker_embedding)
+        if speaker_hidden is None:
+            return input_embs
+        speaker_hidden = speaker_hidden.unsqueeze(1).to(dtype=input_embs.dtype)
+        valid_mask = attention_mask.unsqueeze(-1).to(dtype=input_embs.dtype)
+        return input_embs + speaker_hidden * valid_mask
 
     def _add_continuous_token(
         self,
@@ -704,6 +762,12 @@ class HybridTTS(nn.Module):
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         embed_layer = self.backbone.get_input_embeddings()
         input_embs = embed_layer(discrete_sequence)
+        speaker_embedding = self._extract_voice_condition(
+            voice_conditioner=kwargs.get("voice_conditioner"),
+            reference_audios_srs=kwargs.get("reference_audios_srs"),
+            device=input_embs.device,
+            dtype=input_embs.dtype,
+        )
 
         norm_ratio = None
 
@@ -731,6 +795,13 @@ class HybridTTS(nn.Module):
                 attention_mask=attention_mask,
             )
 
+        if self.backbone_voice_condition:
+            input_embs = self._add_backbone_voice_condition(
+                input_embs=input_embs,
+                attention_mask=attention_mask,
+                speaker_embedding=speaker_embedding,
+            )
+
         last_hidden_state = self.backbone(
             inputs_embeds=input_embs,
             attention_mask=attention_mask,
@@ -744,7 +815,7 @@ class HybridTTS(nn.Module):
 
         # tokens
         token_logits = None
-        if not self.continuous_only:
+        if self.discrete:
             if self.shift_audio_offset:
                 tokens_hidden_states = audio_hidden_states[
                     :, : -self.shift_audio_offset, :
@@ -763,6 +834,11 @@ class HybridTTS(nn.Module):
                 context_vector=audio_hidden_states[:, self.shift_audio_offset : -1].to(
                     dtype=diffusion_dtype
                 ),  # we stop at last audio frame
+                speaker_embedding=(
+                    speaker_embedding.to(dtype=diffusion_dtype)
+                    if self.diffusion_voice_condition
+                    else None
+                ),
             ).loss
 
         return HybridTTSOutput(
@@ -779,16 +855,46 @@ class HybridTTS(nn.Module):
         token_logits: torch.Tensor,
         temperature: float = 1.0,
     ) -> torch.LongTensor:
+        if temperature is None:
+            temperature = 1.0
         if temperature < 0:
-            raise ValueError("temperature must be > 0")
+            raise ValueError("temperature must be >= 0")
         elif temperature == 0:
             return torch.argmax(token_logits, dim=-1)
-        # scale logits
-        scaled_logits = token_logits / temperature
-        # categorical sampling
-        dist = torch.distributions.Categorical(logits=scaled_logits)
-        # sample ids
-        return dist.sample()
+
+        scaled_logits = (token_logits / temperature).float()
+        finite_mask = torch.isfinite(scaled_logits)
+        invalid_rows = (~finite_mask.any(dim=-1)) | torch.isposinf(scaled_logits).any(
+            dim=-1
+        )
+        if not finite_mask.all():
+            logger.warning(
+                "Non-finite token logits encountered during sampling; forcing EOS "
+                "for affected rows."
+            )
+            scaled_logits = scaled_logits.masked_fill(~finite_mask, -torch.inf)
+            scaled_logits[invalid_rows] = 0.0
+
+        probs = torch.softmax(scaled_logits, dim=-1)
+        prob_sums = probs.sum(dim=-1)
+        invalid_probs = (
+            invalid_rows
+            | (~torch.isfinite(probs).all(dim=-1))
+            | (probs < 0).any(dim=-1)
+            | (~torch.isfinite(prob_sums))
+            | (prob_sums <= 0)
+        )
+        if invalid_probs.any():
+            logger.warning(
+                "Invalid token probabilities encountered during sampling; using EOS "
+                "for affected rows."
+            )
+            probs = probs.clone()
+            probs[invalid_probs] = 0.0
+            probs[invalid_probs, 0] = 1.0
+
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @torch.no_grad()
     def sample(
@@ -804,6 +910,15 @@ class HybridTTS(nn.Module):
         attention_mask = batch["attention_mask"]
 
         embed_layer = self.backbone.get_input_embeddings()
+        speaker_embedding = self._extract_voice_condition(
+            voice_conditioner=kwargs.get("voice_conditioner"),
+            reference_audios_srs=kwargs.get(
+                "reference_audios_srs",
+                batch.get("reference_audios_srs"),
+            ),
+            device=discrete_sequence.device,
+            dtype=embed_layer.weight.dtype,
+        )
 
         max_steps = kwargs.get("max_steps", 250)
 
@@ -811,7 +926,7 @@ class HybridTTS(nn.Module):
         if guidance_scale is None:
             guidance_scale = 1.0
         do_cfg = guidance_scale != 1.0 and not (
-            getattr(self.config, "discrete_only", False) or self.diffusion_head is None
+            (self.discrete and not self.continuous) or self.diffusion_head is None
         )
         B_orig, L = discrete_sequence.shape
 
@@ -845,16 +960,32 @@ class HybridTTS(nn.Module):
                 [embed_layer(discrete_sequence), embed_layer(uncond_discrete)], dim=0
             )
             attention_mask = torch.cat([attention_mask, uncond_mask], dim=0)
+            if self.backbone_voice_condition:
+                speaker_for_backbone = (
+                    torch.cat([speaker_embedding, speaker_embedding], dim=0)
+                    if speaker_embedding is not None
+                    else None
+                )
+                input_embs = self._add_backbone_voice_condition(
+                    input_embs=input_embs,
+                    attention_mask=attention_mask,
+                    speaker_embedding=speaker_for_backbone,
+                )
         else:
             input_embs = embed_layer(discrete_sequence)
+            if self.backbone_voice_condition:
+                input_embs = self._add_backbone_voice_condition(
+                    input_embs=input_embs,
+                    attention_mask=attention_mask,
+                    speaker_embedding=speaker_embedding,
+                )
         position_ids = self._make_position_ids(attention_mask)
-
-        discrete_only = getattr(self.config, "discrete_only")
 
         past_key_values = None
         active_indices = torch.arange(
             B_orig, dtype=torch.long, device=discrete_sequence.device
         )
+        active_speaker_embedding = speaker_embedding
         discrete_outputs = [[] for _ in range(B_orig)]
         continuous_outputs = [[] for _ in range(B_orig)]
 
@@ -881,7 +1012,7 @@ class HybridTTS(nn.Module):
             sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
             eos_mask = sampled_id == 0  # EOS token is assumed to be 0
 
-            if not (discrete_only or self.diffusion_head is None):
+            if self.continuous and self.diffusion_head is not None:
                 if step >= self.shift_audio_offset and (
                     not eos_mask.all() or self.shift_audio_offset > 0
                 ):
@@ -891,6 +1022,11 @@ class HybridTTS(nn.Module):
                         temperature=kwargs.get("diffusion_temperature"),
                         guidance_scale=guidance_scale,
                         generator=kwargs.get("generator", None),
+                        speaker_embedding=(
+                            active_speaker_embedding
+                            if self.diffusion_voice_condition
+                            else None
+                        ),
                     )
                     generated_continuous_tokens = self.diffusion_head.generate(
                         **generation_kwargs
@@ -925,7 +1061,7 @@ class HybridTTS(nn.Module):
                 + self.tokenizer.prompt_vocab_size
             )
 
-            if discrete_only or self.diffusion_head is None:
+            if not self.continuous or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:
                 survivor_feedback = generated_continuous_tokens
@@ -934,6 +1070,14 @@ class HybridTTS(nn.Module):
                         0, survivor_indices
                     )
                 next_token = embed_layer(token_id).unsqueeze(1) + survivor_feedback
+
+            if self.backbone_voice_condition and active_speaker_embedding is not None:
+                next_speaker = active_speaker_embedding.index_select(
+                    0, survivor_indices
+                )
+                next_token = next_token + self._speaker_hidden(next_speaker).unsqueeze(
+                    1
+                ).to(dtype=next_token.dtype)
 
             if do_cfg:
                 next_token = next_token.repeat(2, 1, 1)
@@ -969,6 +1113,10 @@ class HybridTTS(nn.Module):
                 input_embs = next_token
 
             active_indices = active_indices.index_select(0, survivor_indices)
+            if active_speaker_embedding is not None:
+                active_speaker_embedding = active_speaker_embedding.index_select(
+                    0, survivor_indices
+                )
 
         generated_lengths = torch.tensor(
             [len(tokens) for tokens in discrete_outputs],

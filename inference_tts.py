@@ -22,6 +22,7 @@ from inference import (
     load_vae,
     load_vocoder,
     load_voice_condition,
+    load_voice_reference_audio,
     clean_text_and_phonemize,
 )
 from inference_diffusion import load_diffusion_model
@@ -186,9 +187,14 @@ def main():
         sys.exit(1)
 
     speaker_embedding = None
+    voice_reference_audios_srs = None
     if args.voice_condition:
         logger.info(f"Extracting speaker embedding from {args.voice_condition}...")
         try:
+            voice_reference_audios_srs = load_voice_reference_audio(
+                args.voice_condition,
+                device,
+            )
             speaker_embedding = load_voice_condition(args.voice_condition, vae, device)
         except Exception as e:
             logger.error(f"Could not load voice condition: {e}")
@@ -230,7 +236,9 @@ def main():
             max_steps=args.max_len,
             temperature=args.temperature,
             num_steps=1,  # Diffusion not used here
-            vae=None,
+            vae=vae,
+            reference_audios_srs=voice_reference_audios_srs,
+            voice_conditioner=vae if voice_reference_audios_srs is not None else None,
         )
 
         final_discrete = sample_out["discrete_tokens"]
@@ -274,6 +282,7 @@ def main():
             temperature=args.diffusion_temperature,
             guidance_scale=args.guidance_scale,
             padding_mask=upsampled_padding_mask,
+            speaker_embedding=speaker_embedding,
         )
 
         z_denorm = diffusion_out.audio_features

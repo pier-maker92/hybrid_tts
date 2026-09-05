@@ -33,6 +33,7 @@ train = [
     "wandb",
     "jiwer",
     "torchaudio_filters",
+    "faster-whisper",
 ]
 
 [tool.setuptools.packages.find]

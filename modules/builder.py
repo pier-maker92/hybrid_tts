@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .hybrid_model import HybridTTS, HybridTokenizer
+from .modalities import resolve_modalities
 from .configs import (
     HybridTTSConfig,
     BackboneConfig,
@@ -101,12 +102,19 @@ def load_quantizer_embeddings(cfg_dict: Dict[str, Any]) -> Optional[torch.Tensor
     )
 
 
-def load_codebook_config(vae_checkpoint: str, cfg_dict: Dict[str, Any] | None = None):
+def load_codebook_config(
+    vae_checkpoint: str,
+    cfg_dict: Dict[str, Any] | None = None,
+    continuous_without_discrete: bool = False,
+):
     config_path = os.path.join(vae_checkpoint, "config.json")
     with open(config_path, "r") as f:
         vae_cfg = json.load(f)
 
     continuous_dim = vae_cfg.get("latent_dim")
+    if continuous_without_discrete:
+        return int(continuous_dim), 0
+
     vq_vocab_size = 0
     vq_config = vae_cfg.get("encoder_config", {}).get("vq_config", None)
     if vq_config is not None:
@@ -128,13 +136,20 @@ def load_codebook_config_from_cfg(cfg_dict: Dict[str, Any]):
     if not vae_checkpoint:
         raise ValueError("VAE checkpoint is required to build model.")
 
+    training_cfg = cfg_dict.get("training", {}) or {}
+    discrete, continuous = resolve_modalities(training_cfg)
     continuous_dim, discrete_token_vocab_size = load_codebook_config(
         vae_checkpoint,
         cfg_dict,
+        continuous_without_discrete=continuous and not discrete,
     )
 
     kmeans_path = cfg_dict.get("kmeans_path")
     if kmeans_path:
+        if continuous and not discrete:
+            raise ValueError(
+                "kmeans_path is not supported when training.discrete=false."
+            )
         summary_path = (
             os.path.join(kmeans_path, "summary.json")
             if os.path.isdir(kmeans_path)
@@ -155,6 +170,25 @@ def load_codebook_config_from_cfg(cfg_dict: Dict[str, Any]):
         continuous_dim = int(continuous_dim) - continuous_start
 
     return continuous_dim, discrete_token_vocab_size
+
+
+def load_speaker_embedding_dim_from_cfg(cfg_dict: Dict[str, Any]) -> Optional[int]:
+    vae_checkpoint = cfg_dict.get("vae_checkpoint")
+    if not vae_checkpoint:
+        return None
+
+    config_path = os.path.join(vae_checkpoint, "config.json")
+    if not os.path.exists(config_path):
+        return None
+
+    with open(config_path, "r") as f:
+        vae_cfg = json.load(f)
+
+    wavlm_config = vae_cfg.get("wavlm_module_config") or {}
+    speaker_config = wavlm_config.get("speaker_encoder_config") or {}
+    return speaker_config.get("embedding_dim") or vae_cfg.get(
+        "decoder_config", {}
+    ).get("speaker_cond_dim")
 
 
 def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridTTS:
@@ -178,6 +212,12 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
     if adapter_cfg is not None:
         adapter_cfg = adapter_cfg.copy()
 
+    speaker_adapter_cfg = cfg_dict.get("speaker_adapter_config")
+    if speaker_adapter_cfg is None:
+        speaker_adapter_cfg = cfg_dict.get("speaker_adapter")
+    if speaker_adapter_cfg is not None:
+        speaker_adapter_cfg = speaker_adapter_cfg.copy()
+
     token_head_cfg = cfg_dict.get("token_head_config")
     if token_head_cfg is None:
         token_head_cfg = cfg_dict.get("token_head")
@@ -187,28 +227,53 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
     # Dynamic resolution of continuous_dim/discrete vocab from VAE config.json,
     # optionally overridden by an external k-means codebook.
     continuous_dim, discrete_token_vocab_size = load_codebook_config_from_cfg(cfg_dict)
+    speaker_embedding_dim = load_speaker_embedding_dim_from_cfg(cfg_dict)
 
     shift_audio_offset = backbone_cfg.pop("shift_audio_offset")
     backbone_config = BackboneConfig(**backbone_cfg)
 
     training_cfg = cfg_dict.get("training")
-    discrete_only = training_cfg.get("discrete_only", False)
-    continuous_only = training_cfg.get("continuous_only", False)
-    if discrete_only and continuous_only:
-        raise ValueError("discrete_only and continuous_only are mutually exclusive.")
+    discrete, continuous = resolve_modalities(training_cfg)
 
     diffusion_head_config = None
-    if diffusion_head_cfg is not None and not discrete_only:
+    if diffusion_head_cfg is not None and continuous:
         diffusion_head_config = DiTConfig(**diffusion_head_cfg)
 
     continuous_adapter_config = None
-    if adapter_cfg is not None and not discrete_only:
+    if adapter_cfg is not None and continuous:
         continuous_adapter_config = AdapterConfig(**adapter_cfg)
+
+    speaker_adapter_config = None
+    backbone_voice_condition = bool(getattr(backbone_config, "voice_condition", False))
+    diffusion_voice_condition = bool(
+        diffusion_head_cfg.get("voice_condition", False) if diffusion_head_cfg else False
+    )
+    if backbone_voice_condition or diffusion_voice_condition:
+        if backbone_voice_condition and diffusion_voice_condition:
+            raise ValueError(
+                "backbone.voice_condition and diffusion_head.voice_condition are "
+                "mutually exclusive. Enable only one of them."
+            )
+        if speaker_embedding_dim is None:
+            raise ValueError(
+                "voice_condition=true requires a VAE checkpoint with "
+                "wavlm_module_config.speaker_encoder_config.embedding_dim."
+            )
+
+    if backbone_voice_condition:
+        if speaker_adapter_cfg is None:
+            speaker_adapter_cfg = adapter_cfg.copy() if adapter_cfg is not None else {}
+        speaker_adapter_cfg["in_dim"] = int(speaker_embedding_dim)
+        speaker_adapter_config = AdapterConfig(**speaker_adapter_cfg)
+
+    if diffusion_head_config is not None and diffusion_voice_condition:
+        diffusion_head_config.speaker_dim = int(speaker_embedding_dim)
 
     hybrid_config = HybridTTSConfig(
         backbone_config=backbone_config,
         diffusion_head_config=diffusion_head_config,
         continuous_adapter_config=continuous_adapter_config,
+        speaker_adapter_config=speaker_adapter_config,
         prompt_vocab_size=tokenizer.prompt_vocab_size,
         discrete_token_vocab_size=tokenizer.discrete_token_vocab_size,
         continuous_dim=continuous_dim,
@@ -216,16 +281,17 @@ def build_model(cfg_dict: Dict[str, Any], tokenizer: HybridTokenizer) -> HybridT
         start_audio_id=tokenizer.start_audio_id,
         end_audio_id=tokenizer.end_audio_id,
         debug=cfg_dict.get("debug", False),
-        uncond_prob=training_cfg.get("uncond_prob"),
-        no_augment_ratio=training_cfg.get("no_augment_ratio"),
-        discrete_only=discrete_only,
-        continuous_only=continuous_only,
+        uncond_prob=training_cfg.get("uncond_prob", 0.0),
+        no_augment_ratio=training_cfg.get("no_augment_ratio", 0.0),
+        discrete=discrete,
+        continuous=continuous,
+        speaker_embedding_dim=speaker_embedding_dim,
         shift_audio_offset=shift_audio_offset,
         continuous_scaling_mode=cfg_dict.get("continuous_scaling_mode"),
     )
 
     model = HybridTTS(config=hybrid_config, tokenizer=tokenizer)
-    if not continuous_only and training_cfg.get(
+    if discrete and training_cfg.get(
         "init_discrete_embeddings_from_quantizer",
         True,
     ):

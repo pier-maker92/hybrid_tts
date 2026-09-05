@@ -34,10 +34,10 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, input: Tensor) -> Tensor:
-        input_type = input.type()
+        input_dtype = input.dtype
         output = input.float()
         output = output * ((output**2).mean(-1, keepdim=True) + self.norm_eps).rsqrt()
-        output = output.type(input_type)
+        output = output.to(dtype=input_dtype)
         return self.weight * output
 
 

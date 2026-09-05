@@ -1,15 +1,15 @@
 # @package _global_
 training:
-  dataset_name: libritts-r-dicodec18-kmeans512-noecapa-prepared
+  dataset_name: libritts-r-dicodec18-kmeans512-prepared
   train_split: "train"
-  output_dir: checkpoints/exps/libritts-r-dicodec18-kmeans512-noecapa
+  output_dir: checkpoints/exps/libritts-r-dicodec18-kmeans512-no-speaker
   per_device_train_batch_size: 8
   gradient_accumulation_steps: 4
   logging_steps: 10
   save_total_limit: 3
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: libritts-r-dicodec18-kmeans512-noecapa
+  wandb_run_name: libritts-r-dicodec18-kmeans512-no-speaker
   run_id: ""
   bf16: true
   eval_strategy: "no"
@@ -24,7 +24,8 @@ training:
   warmup_ratio: 0.05
   uncond_prob: 0.1
   no_augment_ratio: 0.25
-  discrete_only: false
+  discrete: true
+  continuous: true
   group_by_length: false
   dataloader_num_workers: 4
 
