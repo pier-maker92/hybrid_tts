@@ -23,12 +23,19 @@ logger = logging.getLogger("inference")
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from modules.builder import build_model as build_hybrid_model
-from modules.submodules.MelCausalVAE.modules.builder import build_model as build_vae
+from modules.modalities import resolve_modalities
+from modules.submodules.MelCausalVAE.dicodec.modules.builder import (
+    build_model as build_vae,
+    load_external_semantic_quantizer,
+)
 from util import build_tokenizer
 
 
 def load_vae(
-    checkpoint_dir: str, device: torch.device, dtype: torch.dtype
+    checkpoint_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    training_cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[torch.nn.Module]:
     """Loads the MelCausalVAE model from checkpoint."""
     try:
@@ -47,6 +54,16 @@ def load_vae(
 
         vae.eval()
         vae.to(device=device, dtype=dtype)
+        training_cfg = training_cfg or {}
+        discrete, _ = resolve_modalities(training_cfg)
+        if discrete and training_cfg.get("semantic_quantizer_checkpoint"):
+            load_external_semantic_quantizer(
+                vae,
+                checkpoint_path=training_cfg["semantic_quantizer_checkpoint"],
+                quantizer_type=training_cfg.get("semantic_quantizer_type", "std_vq"),
+                codebook_size=training_cfg.get("semantic_codebook_size"),
+                target_source=training_cfg.get("audio_quantizer_source"),
+            )
         logger.info(f"Successfully loaded VAE from {checkpoint_dir}")
         return vae
     except Exception as e:
@@ -160,6 +177,29 @@ def clean_text_and_phonemize(text: str, vocab: Dict[str, int]) -> List[int]:
     return phoneme_ids
 
 
+def load_phoneme_vocab() -> Dict[str, int]:
+    vocab_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
+    )
+    if not os.path.exists(vocab_path):
+        raise FileNotFoundError(f"Phoneme vocabulary not found at {vocab_path}!")
+    with open(vocab_path, "r") as f:
+        return json.load(f)
+
+
+def encode_text_prompt(
+    text: str, tokenizer, phoneme_vocab: Optional[Dict[str, int]] = None
+) -> List[int]:
+    if getattr(tokenizer, "char_tokenizer", None) is not None:
+        prompt_ids = tokenizer.encode_text(text)
+        logger.info(f"Mapped {len(prompt_ids)} chars to vocabulary IDs: {prompt_ids}")
+        return prompt_ids
+
+    if phoneme_vocab is None:
+        phoneme_vocab = load_phoneme_vocab()
+    return clean_text_and_phonemize(text, phoneme_vocab)
+
+
 def resolve_local_research_path(path: Optional[str], scratch_dir: str) -> Optional[str]:
     if not path:
         return path
@@ -252,6 +292,84 @@ def align_continuous_tokens(
         f"Continuous tokens longer than discrete tokens; trimming {z_denorm.shape[1]} -> {length}."
     )
     return z_denorm[:, :length]
+
+
+def discrete_tokens_to_semantic_latents(
+    vae: torch.nn.Module,
+    tokens_tensor: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    external_quantizer = getattr(vae, "external_semantic_quantizer", None)
+    if external_quantizer is None:
+        if hasattr(vae.encoder, "vq"):
+            return vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0)
+        raise RuntimeError(
+            "Cannot decode discrete tokens: VAE has neither encoder.vq nor an "
+            "external semantic quantizer."
+        )
+
+    logger.info("Decoding discrete tokens with the external semantic quantizer.")
+
+    quantizer = getattr(external_quantizer, "quantizer", None)
+    quantizer_module = getattr(quantizer, "quantizer_module", None)
+    if quantizer_module is None:
+        raise RuntimeError(
+            "Cannot decode discrete tokens: external semantic quantizer does not "
+            "expose quantizer.quantizer_module."
+        )
+
+    embedding = getattr(quantizer_module, "embedding", None)
+    if embedding is None:
+        codebook = getattr(quantizer_module, "codebook", None)
+        if codebook is None:
+            raise RuntimeError(
+                "Cannot decode discrete tokens: missing quantizer codebook."
+            )
+        codes = torch.nn.functional.embedding(tokens_tensor, codebook)
+    elif isinstance(embedding, torch.nn.Embedding):
+        codes = embedding(tokens_tensor)
+    else:
+        codes = torch.nn.functional.embedding(tokens_tensor, embedding)
+
+    codes = codes.unsqueeze(0).to(device=device, dtype=dtype)
+    valid_mask = torch.ones(codes.shape[:2], dtype=torch.bool, device=device)
+    return external_quantizer.decoder(codes, valid_mask=valid_mask.unsqueeze(-1))
+
+
+def vae_context_dim(vae: torch.nn.Module) -> Optional[int]:
+    context_proj = getattr(getattr(vae, "decoder", None), "context_vector_proj", None)
+    if context_proj is None:
+        return None
+    for module in context_proj.modules():
+        if isinstance(module, torch.nn.Linear):
+            return module.in_features
+    return None
+
+
+def combine_semantic_and_acoustic_latents(
+    z_semantic: torch.Tensor,
+    z_acoustic: torch.Tensor,
+    vae: torch.nn.Module,
+) -> torch.Tensor:
+    expected_dim = vae_context_dim(vae)
+    concat_dim = z_semantic.shape[-1] + z_acoustic.shape[-1]
+    if expected_dim == concat_dim:
+        return torch.cat([z_semantic, z_acoustic], dim=-1)
+    if expected_dim == z_semantic.shape[-1] == z_acoustic.shape[-1]:
+        return z_semantic + z_acoustic
+    if expected_dim == z_semantic.shape[-1]:
+        logger.warning(
+            "VAE decoder expects %s dims; ignoring acoustic latents with dim %s.",
+            expected_dim,
+            z_acoustic.shape[-1],
+        )
+        return z_semantic
+    raise RuntimeError(
+        "Cannot combine semantic/acoustic latents for VAE decoder: "
+        f"semantic_dim={z_semantic.shape[-1]}, acoustic_dim={z_acoustic.shape[-1]}, "
+        f"decoder_context_dim={expected_dim}."
+    )
 
 
 def trim_unpaired_discrete_tokens(
@@ -437,6 +555,11 @@ def main():
     cfg_dict["kmeans_path"] = resolve_local_research_path(
         cfg_dict.get("kmeans_path"), scratch_dir
     )
+    training_cfg = cfg_dict.get("training", {}) or {}
+    if training_cfg.get("semantic_quantizer_checkpoint"):
+        training_cfg["semantic_quantizer_checkpoint"] = resolve_local_research_path(
+            training_cfg.get("semantic_quantizer_checkpoint"), scratch_dir
+        )
     # Determine appropriate precision (dtype) for stability on MPS/CPU
     if device.type == "mps":
         # Force float32 on MPS because bfloat16/float16 support is unstable/incomplete in many MPS kernels
@@ -456,19 +579,16 @@ def main():
         dtype = torch.float32
         logger.info("Using float32 precision on CPU.")
 
-    # Load phoneme vocabulary
-    vocab_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
-    )
-    if not os.path.exists(vocab_path):
-        logger.error(f"Phoneme vocabulary not found at {vocab_path}!")
-        sys.exit(1)
-    with open(vocab_path, "r") as f:
-        phoneme_vocab = json.load(f)
-
     # Build tokenizer first as the single source of truth
     logger.info("Building tokenizer...")
     tok = build_tokenizer(cfg_dict, pretrinaed=False)
+    phoneme_vocab = None
+    if getattr(tok, "char_tokenizer", None) is None:
+        try:
+            phoneme_vocab = load_phoneme_vocab()
+        except FileNotFoundError as e:
+            logger.error(str(e))
+            sys.exit(1)
     kmeans_centroids = load_kmeans_centroids(
         cfg_dict.get("kmeans_path"), device=device, dtype=dtype
     )
@@ -477,7 +597,18 @@ def main():
     hybrid_model = load_hybrid_model(
         cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok
     )
-    vae = load_vae(cfg_dict["vae_checkpoint"], device, dtype)
+    requires_voice_condition = bool(
+        getattr(hybrid_model, "backbone_voice_condition", False)
+        or getattr(hybrid_model, "diffusion_voice_condition", False)
+    )
+    if requires_voice_condition and not args.voice_condition:
+        logger.error(
+            "This checkpoint was trained with voice_condition=true. "
+            "Pass --voice_condition with a reference audio file so the loaded VAE can "
+            "extract the speaker embedding."
+        )
+        sys.exit(1)
+    vae = load_vae(cfg_dict["vae_checkpoint"], device, dtype, training_cfg=training_cfg)
     if vae is None:
         logger.error("Could not load VAE model.")
         sys.exit(1)
@@ -508,6 +639,11 @@ def main():
     prompt_batches = []
     input_labels = []
     if args.phonemes:
+        if getattr(tok, "char_tokenizer", None) is not None:
+            logger.error(
+                "--phonemes cannot be used with text_tokenizer='char'. Use --text."
+            )
+            sys.exit(1)
         for phoneme_index, phoneme_text in enumerate(args.phonemes):
             input_phonemes = phoneme_text.split()
             prompt_ids = []
@@ -526,9 +662,11 @@ def main():
             input_labels.append(f"phonemes_{phoneme_index}")
     else:
         for text_index, text in enumerate(args.text):
-            prompt_ids = clean_text_and_phonemize(text, phoneme_vocab)
+            prompt_ids = encode_text_prompt(text, tok, phoneme_vocab)
             if not prompt_ids:
-                logger.error(f"Empty phoneme input for text index {text_index}.")
+                logger.error(
+                    f"Empty text input after tokenization for text index {text_index}."
+                )
                 sys.exit(1)
             prompt_batches.append(prompt_ids)
             input_labels.append(f"text_{text_index}")
@@ -589,7 +727,7 @@ def main():
             vae=vae,
             generator=generator,
             reference_audios_srs=voice_reference_audios_srs,
-            voice_conditioner=vae if voice_reference_audios_srs is not None else None,
+            voice_conditioner=vae,
         )
 
         final_discrete = sample_out["discrete_tokens"]
@@ -686,7 +824,12 @@ def main():
                 logger.info(
                     "Decoding VQ discrete tokens plus continuous features using VAE..."
                 )
-                vq_emb = vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0)
+                vq_emb = discrete_tokens_to_semantic_latents(
+                    vae,
+                    tokens_tensor,
+                    dtype=dtype,
+                    device=device,
+                )
                 if args.decode_only_token or z_sample is None:
                     logger.info(
                         "Using only generated quantized tokens (continuous features zeroed out)."
@@ -704,12 +847,12 @@ def main():
                         dtype=dtype,
                         device=device,
                     )
+                z = combine_semantic_and_acoustic_latents(vq_emb, z_sample, vae)
                 reconstructed_mel, reconstructed_padding_mask = vae.sample(
                     num_steps=8,
                     temperature=0.2,
                     guidance_scale=1.3,
-                    z_semantic=vq_emb,
-                    z_acoustic=z_sample,
+                    z=z,
                     padding_mask=padding_mask,
                     speaker_embedding=speaker_embedding,
                 )

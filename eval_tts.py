@@ -39,7 +39,7 @@ from inference import (
     load_hybrid_model,
     load_vae,
     load_vocoder,
-    clean_text_and_phonemize,
+    encode_text_prompt,
 )
 from inference_diffusion import load_diffusion_model
 from util import build_tokenizer
@@ -161,10 +161,6 @@ def main():
         if tcfg.get("bf16") and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
 
-    vocab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json")
-    with open(vocab_path) as f:
-        phoneme_vocab = json.load(f)
-
     logger.info("Building tokenizers + loading models...")
     hybrid_tok = build_tokenizer(hybrid_cfg, pretrinaed=False)
     diffusion_tok = build_tokenizer(diffusion_cfg, pretrinaed=False)
@@ -246,7 +242,7 @@ def main():
             if not text.strip():
                 raise ValueError("empty transcript")
             t0 = time.time()
-            prompt_ids = clean_text_and_phonemize(text, phoneme_vocab)
+            prompt_ids = encode_text_prompt(text, hybrid_tok)
             prompt_ids.append(hybrid_tok.start_audio_id)
             discrete_sequence = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(discrete_sequence, dtype=torch.bool, device=device)

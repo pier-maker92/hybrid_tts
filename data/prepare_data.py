@@ -11,7 +11,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 from datasets import load_dataset
 from torch.utils.data import DataLoader, DistributedSampler
-from modules.submodules.MelCausalVAE.modules.builder import build_model
+from modules.submodules.MelCausalVAE.dicodec.modules.builder import build_model
 
 
 def collate_fn(batch):

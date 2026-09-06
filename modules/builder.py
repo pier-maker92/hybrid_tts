@@ -27,10 +27,22 @@ def _resolve_quantizer_checkpoint(cfg_dict: Dict[str, Any]) -> str | None:
         or external_cfg.get("checkpoint_path")
     )
     if checkpoint:
-        checkpoint = checkpoint.replace(
-            "$SCRATCH",
-            os.environ.get("SCRATCH", "/Users/software/Research"),
-        )
+        scratch_dir = os.environ.get("SCRATCH", "/Users/software/Research")
+        checkpoint = checkpoint.replace("$SCRATCH", scratch_dir)
+        if not os.path.exists(checkpoint):
+            scratch_prefix = "/scratch/piermel/"
+            if checkpoint.startswith(scratch_prefix):
+                candidate = os.path.join(scratch_dir, checkpoint[len(scratch_prefix) :])
+                if os.path.exists(candidate):
+                    checkpoint = candidate
+        if not os.path.exists(checkpoint):
+            marker = f"{os.sep}quantized{os.sep}"
+            vae_checkpoint = cfg_dict.get("vae_checkpoint")
+            if vae_checkpoint and marker in checkpoint:
+                quantizer_suffix = checkpoint.split(marker, 1)[1]
+                candidate = os.path.join(vae_checkpoint, "quantized", quantizer_suffix)
+                if os.path.exists(candidate):
+                    checkpoint = candidate
     return checkpoint
 
 

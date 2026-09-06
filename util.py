@@ -118,21 +118,26 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
         )
         return train_dataset, test_dataset, dataset_name
     
-    elif dataset_name in ["lj_speech_online", "lj-speech-online"]:
+    elif dataset_name in [
+        "ljspeech",
+        "lj_speech",
+        "lj-speech",
+        "lj_speech_online",
+        "lj-speech-online",
+    ]:
         if not online_encode:
             raise ValueError(
                 f"Dataset {dataset_name} provides raw audio; set "
                 "training.online_encode=true to encode it during training."
             )
-        from data.lj_speech_online import (
-            LJSpeechOnlineDataset,
-            LJSpeechOnlineTrain,
-            LJSpeechOnlineTest,
-        )
-        base = LJSpeechOnlineDataset()
-        train_dataset = LJSpeechOnlineTrain(base)
-        test_dataset = LJSpeechOnlineTest(base)
-        return train_dataset, test_dataset, "libritts-r"  # reuse online collator path
+        if text_tokenizer != "char":
+            raise ValueError("Dataset ljspeech is char-only; set text_tokenizer='char'.")
+        from data.ljspeech import LJSpeechDataset, LJSpeechTest, LJSpeechTrain
+
+        base = LJSpeechDataset(dataset_dir=training_cfg.get("dataset_dir"))
+        train_dataset = LJSpeechTrain(base)
+        test_dataset = LJSpeechTest(base)
+        return train_dataset, test_dataset, "ljspeech"
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
 

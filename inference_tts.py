@@ -23,7 +23,7 @@ from inference import (
     load_vocoder,
     load_voice_condition,
     load_voice_reference_audio,
-    clean_text_and_phonemize,
+    encode_text_prompt,
 )
 from inference_diffusion import load_diffusion_model
 from util import build_tokenizer
@@ -156,16 +156,6 @@ def main():
         if training_cfg.get("bf16") and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
 
-    # Load phoneme vocabulary
-    vocab_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
-    )
-    if not os.path.exists(vocab_path):
-        logger.error(f"Phoneme vocabulary not found at {vocab_path}!")
-        sys.exit(1)
-    with open(vocab_path, "r") as f:
-        phoneme_vocab = json.load(f)
-
     logger.info("Building tokenizers...")
     # Tokenizer from hybrid model configuration
     hybrid_tok = build_tokenizer(hybrid_cfg, pretrinaed=False)
@@ -176,6 +166,17 @@ def main():
     hybrid_model = load_hybrid_model(
         hybrid_cfg, args.hybrid_checkpoint, device, dtype, tokenizer=hybrid_tok
     )
+    requires_voice_condition = bool(
+        getattr(hybrid_model, "backbone_voice_condition", False)
+        or getattr(hybrid_model, "diffusion_voice_condition", False)
+    )
+    if requires_voice_condition and not args.voice_condition:
+        logger.error(
+            "This checkpoint was trained with voice_condition=true. "
+            "Pass --voice_condition with a reference audio file so the loaded VAE can "
+            "extract the speaker embedding."
+        )
+        sys.exit(1)
 
     diffusion_model = load_diffusion_model(
         diffusion_cfg, args.diffusion_checkpoint, device, dtype, tokenizer=diffusion_tok
@@ -209,9 +210,9 @@ def main():
         sys.exit(1)
 
     # 1. Prepare Text Input
-    prompt_ids = clean_text_and_phonemize(args.text, phoneme_vocab)
+    prompt_ids = encode_text_prompt(args.text, hybrid_tok)
     if not prompt_ids:
-        logger.error("Empty phoneme input. Nothing to synthesize.")
+        logger.error("Empty text input after tokenization. Nothing to synthesize.")
         sys.exit(1)
 
     prompt_ids.append(hybrid_tok.start_audio_id)
@@ -238,7 +239,7 @@ def main():
             num_steps=1,  # Diffusion not used here
             vae=vae,
             reference_audios_srs=voice_reference_audios_srs,
-            voice_conditioner=vae if voice_reference_audios_srs is not None else None,
+            voice_conditioner=vae,
         )
 
         final_discrete = sample_out["discrete_tokens"]

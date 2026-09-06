@@ -16,7 +16,7 @@ from data.audio_dataset import (
     TestDatasetWrapper,
 )
 from modules.hybrid_model import HybridTokenizer
-from modules.submodules.MelCausalVAE.modules.feature_extractor import (
+from modules.submodules.MelCausalVAE.dicodec.modules.feature_extractor import (
     FeatureExtractor,
     MelSpectrogramConfig,
 )

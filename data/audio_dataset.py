@@ -625,8 +625,8 @@ class DataCollatorWithVAE:
             {
                 "discrete_tokens": discrete_list[i],
                 "continuous_tokens": continuous_list[i],
-                "phoneme_ids": instances[i]["phoneme_ids"],
-                "ids": instances[i]["ids"],
+                "phoneme_ids": instances[i].get("phoneme_ids"),
+                "ids": instances[i].get("ids"),
                 "transcription": instances[i].get("transcription"),
             }
             for i in range(len(instances))
