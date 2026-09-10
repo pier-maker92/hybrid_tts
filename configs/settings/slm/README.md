@@ -47,3 +47,16 @@ Tests: `python -m unittest data.test_sm_latents` checks all five forward/backwar
 paths, full-z targets, preserved text conditioning, frozen EMA/BSQ/FSQ, and Parquet
 partition loading. Tiny local CLI training/save smoke checks were also run for
 hybrid and continuous-only modes; this does not establish full-scale GPU convergence.
+
+## Autoregressive sampling checks
+
+All five presets use the independent per-frame MLP diffusion head. SM quantizer
+collators run on the training device with `dataloader_num_workers: 0`.
+The continuous-only baseline replaces quantizer tokens with the learned
+`<audio_pad>` input embedding and trains its token head with targets
+`<audio_pad>, ..., <audio_pad>, EOS` (classes 1 and 0). Batch padding is ignored
+with target -100. Generation ends on learned EOS; `--max_len` is a safety cap.
+All five variants train token cross-entropy alongside diffusion loss.
+Before a long run, run `python -m unittest data.test_ar_regressions data.test_sm_latents data.test_sm_inference`.
+These are structural checks; a short real-data overfit and listening test is still
+needed to assess convergence and end-to-end dataset/codec compatibility.

@@ -137,7 +137,15 @@ def load_hybrid_model(
 
     model.load_state_dict(state_dict, strict=True)
     model.eval()
-    model.to(device=device, dtype=dtype)
+    # Module.to(dtype=...) also casts complex RoPE buffers to real values.
+    # These helpers cast only floating-point tensors, preserving complex phases.
+    model.to(device=device)
+    if dtype == torch.bfloat16:
+        model.bfloat16()
+    elif dtype == torch.float16:
+        model.half()
+    else:
+        model.float()
     logger.info(f"Successfully loaded HybridTTS model from {checkpoint_file}")
     return model
 
@@ -387,6 +395,44 @@ def trim_unpaired_discrete_tokens(
     return tokens_tensor
 
 
+
+def configure_sm_inference(config, checkpoint_dir):
+    """Infer the audio vocabulary from TTS weights; SM weights are training-only."""
+    training = config.get("training", {})
+    if not training.get("latent_dataset_path"):
+        return False
+    if not training.get("continuous"):
+        raise ValueError("SM full-z inference requires continuous targets.")
+    if not training.get("discrete"):
+        config["_sm_inference_vocab_size"] = 0
+        return True
+    from pathlib import Path
+    root = Path(checkpoint_dir)
+    if (root / "model.safetensors").is_file():
+        from safetensors import safe_open
+        with safe_open(root / "model.safetensors", framework="pt", device="cpu") as handle:
+            classes = handle.get_slice("token_head.2.weight").get_shape()[0]
+    else:
+        path = root / "pytorch_model.bin"
+        if not path.is_file():
+            path = root / "model.pt"
+        state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        classes = state["token_head.2.weight"].shape[0]
+    config["_sm_inference_vocab_size"] = classes - 1  # classifier includes audio EOS
+    return True
+
+
+def decode_full_z(vae, z, padding_mask, speaker_embedding):
+    if z is None or z.shape[-1] != vae.config.latent_dim:
+        raise ValueError("SM inference requires generated full z with the DiCodec latent dimension.")
+    if z.shape[1] < 1 or padding_mask.shape[1] < z.shape[1]:
+        raise ValueError("Generated z and padding mask have incompatible lengths.")
+    # At the generation cap, the final discrete token may have no continuous pair.
+    padding_mask = padding_mask[:, :z.shape[1]]
+    return vae.sample(num_steps=8, temperature=0.2, guidance_scale=1.3,
+                      z=z, padding_mask=padding_mask, speaker_embedding=speaker_embedding)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Simple TTS Inference Script for HybridTTS Model"
@@ -579,6 +625,10 @@ def main():
         dtype = torch.float32
         logger.info("Using float32 precision on CPU.")
 
+    full_z_mode = configure_sm_inference(cfg_dict, args.hybrid_checkpoint)
+    if full_z_mode and (args.decode_only_token or args.kmeans_path):
+        raise ValueError("SM checkpoints decode full continuous z; token-only/kmeans decoding is not applicable.")
+
     # Build tokenizer first as the single source of truth
     logger.info("Building tokenizer...")
     tok = build_tokenizer(cfg_dict, pretrinaed=False)
@@ -769,7 +819,11 @@ def main():
                 (1, len(audio_tokens)), dtype=torch.bool, device=device
             )
 
-            if kmeans_centroids is not None:
+            if full_z_mode:
+                logger.info("Decoding full generated z with DiCodec speaker conditioning...")
+                reconstructed_mel, reconstructed_padding_mask = decode_full_z(
+                    vae, z_sample, padding_mask, speaker_embedding)
+            elif kmeans_centroids is not None:
                 logger.info(
                     "Decoding kmeans discrete tokens plus continuous features using VAE..."
                 )

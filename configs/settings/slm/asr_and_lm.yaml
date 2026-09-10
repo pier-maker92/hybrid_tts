@@ -27,7 +27,7 @@ training:
   latent_dataset_path: ${oc.env:SLURM_TMPDIR}/datasets/dicodec/${training.dataset_name}
   latent_cache_dir: ${oc.env:SLURM_TMPDIR}/hybrid_arrow_cache
   group_by_length: false
-  dataloader_num_workers: 4
+  dataloader_num_workers: 0
 
   # Model / SLM Quantization Config
   uncond_prob: 0.1

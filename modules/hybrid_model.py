@@ -79,39 +79,28 @@ class DynamicNormalizer(nn.Module):
         self.register_buffer("running_var", torch.ones(1, 1, dim))
 
     def forward(self, x, padding_mask=None):
-        # x: (B, L, C)
+        # Use statistics from preceding batches: current/future targets must not
+        # change the representation of the autoregressive prefix.
+        mean = self.running_mean.detach().clone().to(x.dtype)
+        var = self.running_var.detach().clone().to(x.dtype)
+        valid = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device) if padding_mask is None else ~padding_mask
+        clean = x.masked_fill(~valid.unsqueeze(-1), 0)
+        normalized = ((clean - mean) / (var + self.eps).sqrt()).masked_fill(~valid.unsqueeze(-1), 0)
         if self.training:
-            if padding_mask is not None:
-                mask = (~padding_mask).to(x.dtype).unsqueeze(-1)  # (B, L, 1)
-                count = mask.sum()
-                if count > 0:
-                    # Sum over batch (0) and length (1) dimensions to get channel-wise values
-                    batch_mean = (x * mask).sum(dim=(0, 1)) / count  # (C,)
-                    batch_var = (((x - batch_mean.view(1, 1, -1)) ** 2) * mask).sum(
-                        dim=(0, 1)
-                    ) / count  # (C,)
-
-                    batch_mean = batch_mean.view(1, 1, -1)  # (1, 1, C)
-                    batch_var = batch_var.view(1, 1, -1)  # (1, 1, C)
-                else:
-                    batch_mean = x.mean(dim=(0, 1), keepdim=True)
-                    batch_var = x.var(dim=(0, 1), keepdim=True, unbiased=False)
-            else:
-                batch_mean = x.mean(dim=(0, 1), keepdim=True)
-                batch_var = x.var(dim=(0, 1), keepdim=True, unbiased=False)
-
             with torch.no_grad():
-                self.running_mean.copy_(
-                    (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
-                )
-                self.running_var.copy_(
-                    (1 - self.momentum) * self.running_var + self.momentum * batch_var
-                )
-            return (x - batch_mean) / (batch_var + self.eps).sqrt()
-        else:
-            mean = self.running_mean.to(x.dtype)
-            var = self.running_var.to(x.dtype)
-            return (x - mean) / (var + self.eps).sqrt()
+                values = clean.float()
+                count = valid.sum().to(values.dtype)
+                sums = values.sum(dim=(0, 1))
+                squares = values.square().sum(dim=(0, 1))
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    for statistic in (count, sums, squares):
+                        torch.distributed.all_reduce(statistic)
+                if count > 0:
+                    batch_mean = sums / count
+                    batch_var = (squares / count - batch_mean.square()).clamp_min(0)
+                    self.running_mean.lerp_(batch_mean.view(1, 1, -1).to(self.running_mean), self.momentum)
+                    self.running_var.lerp_(batch_var.view(1, 1, -1).to(self.running_var), self.momentum)
+        return normalized
 
     def denormalize(self, x):
         mean = self.running_mean.to(x.dtype)
@@ -396,17 +385,16 @@ class HybridTTS(nn.Module):
         # space, potentially reducing the richness needed for continuous/acoustic
         # conditioning when predicting both discrete and continuous features.
         if (
-            self.discrete
-            and self.continuous
-            and not bb_cfg.force_weight_tying
+            self.continuous
+            and (not self.discrete or not bb_cfg.force_weight_tying)
         ):
             print("initializing token head")
             self.token_head = nn.Sequential(
                 nn.Linear(hidden_size, hidden_size),
                 nn.SiLU(),
                 nn.Linear(
-                    hidden_size, self.discrete_token_vocab_size + 1, bias=False
-                ),  # Vq tokens + audio EOS
+                    hidden_size, self.discrete_token_vocab_size + 1 if self.discrete else 2, bias=False
+                ),  # Quantizer tokens (or <audio_pad>) plus EOS, class 0.
             )
 
     @torch.no_grad()
@@ -681,7 +669,7 @@ class HybridTTS(nn.Module):
             std = std * keep_mask.to(std.dtype)
 
         noise = torch.randn_like(continuous_tokens)  # * std
-        corrupted_continuous_tokens = continuous_tokens * std + noise * (1 - std)
+        corrupted_continuous_tokens = continuous_tokens + noise * std
         corrupted_continuous_tokens = corrupted_continuous_tokens.masked_fill(
             padding_mask.unsqueeze(-1), 0.0
         )
@@ -772,7 +760,7 @@ class HybridTTS(nn.Module):
         norm_ratio = None
 
         if continuous_sequence is not None:
-            continuous_sequence = self.dynamic_normalizer(continuous_sequence)
+            continuous_sequence = self.dynamic_normalizer(continuous_sequence, audio_padding_mask)
             corrupted_c_seq = self.noise_augment_continuous_token(
                 continuous_sequence.clone(), audio_padding_mask
             )
@@ -815,7 +803,7 @@ class HybridTTS(nn.Module):
 
         # tokens
         token_logits = None
-        if self.discrete:
+        if self.discrete or self.continuous:
             if self.shift_audio_offset:
                 tokens_hidden_states = audio_hidden_states[
                     :, : -self.shift_audio_offset, :
@@ -1061,6 +1049,8 @@ class HybridTTS(nn.Module):
                 + self.tokenizer.prompt_vocab_size
             )
 
+            if not self.discrete:
+                token_id = torch.full_like(token_id, self.tokenizer.audio_placeholder_id)
             if not self.continuous or self.diffusion_head is None:
                 next_token = embed_layer(token_id).unsqueeze(1)  # (B, H) → (B, 1, H)
             else:

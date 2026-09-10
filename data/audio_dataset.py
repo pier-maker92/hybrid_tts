@@ -264,7 +264,7 @@ class DataCollator(object):
                 audio_len = len(c_token)
                 prompt_tokens = p_id
                 shifted_d_token = [self.audio_placeholder_id] * audio_len
-                target_tokens.append(torch.full((audio_len + 1,), -100).long())
+                target_tokens.append(torch.tensor([1] * audio_len + [0]).long())
             else:
                 if d_token is None:
                     raise ValueError(

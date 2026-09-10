@@ -231,6 +231,10 @@ def main(cfg: DictConfig):
         from data.sm_latents import SMLatentCollator
         if is_online or use_voice_condition or training_cfg.get("eval_steps") or not continuous:
             raise ValueError("Latent SM training requires continuous=true, online_encode=false, voice_condition=false and eval_steps=null.")
+        if discrete and training_cfg.get("dataloader_num_workers", 0) != 0:
+            raise ValueError("GPU SM quantization in the collator requires dataloader_num_workers=0.")
+        if not cfg_dict["diffusion_head"].get("use_mlp_sampler", False):
+            raise ValueError("SM autoregressive training requires diffusion_head.use_mlp_sampler=true.")
         data_collator = SMLatentCollator(tok, training_cfg.get("sm_quantizer_checkpoint"),
                                         accelerator.device, discrete=discrete)
     elif is_online:
@@ -370,26 +374,15 @@ def main(cfg: DictConfig):
                 
                 diffusion_loss = outputs.diffusion_loss if outputs.diffusion_loss is not None else torch.tensor(0.0, device=accelerator.device)
                 
-                if not discrete:
-                    if outputs.diffusion_loss is None:
-                        raise RuntimeError(
-                            "training.continuous=true with training.discrete=false "
-                            "requires continuous_sequence and a diffusion_head."
-                        )
-                    token_loss = torch.tensor(0.0, device=accelerator.device)
-                    total_loss = diffusion_loss
-                else:
-                    token_logits = outputs.token_logits
-                    target_tokens = batch.get("target_tokens")
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    vocab_size = unwrapped_model.discrete_token_vocab_size + 1
-
-                    token_loss = loss_fct(
-                        token_logits.view(-1, vocab_size),
-                        target_tokens.view(-1)
-                    )
-
-                    total_loss = token_loss + diffusion_loss
+                if not discrete and outputs.diffusion_loss is None:
+                    raise RuntimeError("Continuous-only training requires a diffusion loss.")
+                token_logits = outputs.token_logits
+                target_tokens = batch["target_tokens"]
+                token_loss = loss_fct(
+                    token_logits.reshape(-1, token_logits.shape[-1]),
+                    target_tokens.reshape(-1),
+                )
+                total_loss = token_loss + diffusion_loss
                 accelerator.backward(total_loss)
 
                 if accelerator.sync_gradients:

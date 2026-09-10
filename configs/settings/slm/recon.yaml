@@ -26,7 +26,7 @@ training:
   latent_dataset_path: ${oc.env:SLURM_TMPDIR}/datasets/dicodec/${training.dataset_name}
   latent_cache_dir: ${oc.env:SLURM_TMPDIR}/hybrid_arrow_cache
   group_by_length: false
-  dataloader_num_workers: 4
+  dataloader_num_workers: 0
 
   # Model / SLM Quantization Config
   uncond_prob: 0.1
@@ -82,11 +82,11 @@ diffusion_head:
   net_depth: 6
   backbone_dim: 512
   uncond_prob: 0.1
-  is_causal: false
-  use_conv_layer: true
+  is_causal: true
+  use_conv_layer: false
   use_window_attention: false
   use_group_bidirectional: false
-  use_mlp_sampler: false
+  use_mlp_sampler: true
   voice_condition: false
 
 continuous_adapter:

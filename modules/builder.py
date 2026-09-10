@@ -125,6 +125,8 @@ def load_codebook_config(
 
     continuous_dim = vae_cfg.get("latent_dim")
     training_cfg = (cfg_dict or {}).get("training", {})
+    if "_sm_inference_vocab_size" in (cfg_dict or {}):
+        return int(continuous_dim), int(cfg_dict["_sm_inference_vocab_size"])
     if training_cfg.get("latent_dataset_path"):
         if not training_cfg["discrete"]:
             return int(continuous_dim), 0
