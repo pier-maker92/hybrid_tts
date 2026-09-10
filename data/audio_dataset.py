@@ -262,7 +262,7 @@ class DataCollator(object):
                         "requires continuous_tokens."
                     )
                 audio_len = len(c_token)
-                prompt_tokens = [self.audio_placeholder_id] * len(p_id)
+                prompt_tokens = p_id
                 shifted_d_token = [self.audio_placeholder_id] * audio_len
                 target_tokens.append(torch.full((audio_len + 1,), -100).long())
             else:

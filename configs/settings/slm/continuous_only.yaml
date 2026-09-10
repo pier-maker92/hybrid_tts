@@ -1,0 +1,92 @@
+# @package _global_
+# Full z continuous targets; frozen SM encoder+quantizer on attributes.z_sem.
+training:
+  seed: 42
+  dataset_name: librispeech-dicodec-v2-ls-25
+  dataset_partitions:
+  - train_clean_100
+  - train_clean_360
+  max_audio_len: null
+  output_dir: checkpoints/slm/continuous_only
+  learning_rate: 0.0003
+  min_learning_rate: 1.0e-05
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.001
+  warmup_steps: 0
+  uncond_prob: 0.1
+  no_augment_ratio: 0.25
+  discrete: false
+  continuous: true
+  online_encode: false
+  audio_quantizer_source: z_sem
+  include_quantizer_residual: false
+  semantic_quantizer_checkpoint: null
+  semantic_quantizer_type: vq_ema
+  semantic_codebook_size: null
+  init_discrete_embeddings_from_quantizer: false
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 1
+  num_train_epochs: 25
+  max_steps: -1
+  logging_steps: 10
+  eval_steps: null
+  eval_num_samples: 0
+  save_steps: 2000
+  save_total_limit: 3
+  report_to: wandb
+  wandb_project: hybrid-tts-sm
+  wandb_run_name: slm-continuous_only
+  run_id: ''
+  resume_from_checkpoint: null
+  latent_dataset_path: ${oc.env:SLURM_TMPDIR}/datasets/dicodec/${training.dataset_name}
+  latent_cache_dir: ${oc.env:SLURM_TMPDIR}/hybrid_arrow_cache
+  sm_quantizer_checkpoint: null
+  dataset_dir_name: librispeech-dicodec-v2-ls-25
+  train_split: train
+  bf16: true
+  eval_strategy: 'no'
+  group_by_length: false
+  dataloader_num_workers: 0
+  fp16: false
+backbone:
+  num_layers: 12
+  num_heads: 4
+  hidden_dim: 512
+  ffn_dim: 2048
+  dropout: 0.0
+  max_position_embeddings: 4096
+  n_kv_heads: 1
+  rope_theta: 10000.0
+  from_pretrained: false
+  shift_audio_offset: 1
+  force_weight_tying: false
+  voice_condition: false
+  model_type: llama3
+diffusion_head:
+  sigma: 1.0e-05
+  audio_latent_dim: 64
+  net_dim: 512
+  net_heads: 8
+  net_depth: 6
+  backbone_dim: 512
+  uncond_prob: 0.1
+  is_causal: false
+  use_conv_layer: true
+  use_window_attention: false
+  use_group_bidirectional: false
+  use_mlp_sampler: false
+  voice_condition: false
+continuous_adapter:
+  hidden_dim: 512
+  num_layers: 4
+speaker_adapter:
+  hidden_dim: 512
+  num_layers: 4
+vae_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/ls/25
+text_tokenizer: char
+use_tokenize: false
+bpe_tokenizer_path: audio_bpe.json
+vocoder_checkpoint: vocos
+debug: false
+continuous_scaling_mode: learnable

@@ -227,7 +227,13 @@ def main(cfg: DictConfig):
     # DataLoader preparation
     is_online = training_cfg.get("online_encode", False)
     online_vae = None
-    if is_online:
+    if training_cfg.get("latent_dataset_path"):
+        from data.sm_latents import SMLatentCollator
+        if is_online or use_voice_condition or training_cfg.get("eval_steps") or not continuous:
+            raise ValueError("Latent SM training requires continuous=true, online_encode=false, voice_condition=false and eval_steps=null.")
+        data_collator = SMLatentCollator(tok, training_cfg.get("sm_quantizer_checkpoint"),
+                                        accelerator.device, discrete=discrete)
+    elif is_online:
         online_vae_checkpoint = cfg_dict.get("vae_checkpoint")
         logger.info(f"Online VAE encoding: loading VAE from {online_vae_checkpoint}")
         online_device = accelerator.device

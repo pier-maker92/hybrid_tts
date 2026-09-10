@@ -34,6 +34,11 @@ def build_dataset(training_cfg: Dict[str, Any], text_tokenizer: Optional[str] = 
     max_audio_len = training_cfg.get("max_audio_len")
     discrete, continuous = resolve_modalities(training_cfg)
 
+    if training_cfg.get("latent_dataset_path"):
+        from data.sm_latents import build_latent_dataset
+        train_data, validation_data = build_latent_dataset(training_cfg)
+        return train_data, validation_data, dataset_name
+
     if dataset_name == "mls":
         from data.mls import MLSDataset
 

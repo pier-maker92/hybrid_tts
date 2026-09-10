@@ -124,6 +124,15 @@ def load_codebook_config(
         vae_cfg = json.load(f)
 
     continuous_dim = vae_cfg.get("latent_dim")
+    training_cfg = (cfg_dict or {}).get("training", {})
+    if training_cfg.get("latent_dataset_path"):
+        if not training_cfg["discrete"]:
+            return int(continuous_dim), 0
+        from data.sm_latents import checkpoint_config
+        quantizer_config = checkpoint_config(training_cfg["sm_quantizer_checkpoint"])
+        if quantizer_config.latent_dim != int(continuous_dim):
+            raise ValueError("SM latent dimension must match DiCodec z dimension.")
+        return int(continuous_dim), quantizer_config.quantizer.codebook_size
     if continuous_without_discrete:
         return int(continuous_dim), 0
 

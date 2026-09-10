@@ -36,3 +36,7 @@ training:
   wandb_run_name: baseline
   run_id: ""
   resume_from_checkpoint: null
+
+  latent_dataset_path: null
+  latent_cache_dir: null
+  sm_quantizer_checkpoint: null
