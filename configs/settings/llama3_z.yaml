@@ -4,7 +4,7 @@ training:
   dataset_name: librispeech-aligned
   dataset_dir_name: librispeech-aligned
   train_split: "train"
-  output_dir: checkpoints/exps/librispeech-aligned-llama3-zsem
+  output_dir: checkpoints/exps/librispeech-aligned-llama3-z
 
   # audio len
   max_audio_len: 20
@@ -17,7 +17,7 @@ training:
   # logging
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: librispeech-aligned-llama3-zsem
+  wandb_run_name: librispeech-aligned-llama3-z
   run_id: ""
 
   bf16: true
@@ -44,9 +44,9 @@ training:
   discrete: true
   continuous: true
   online_encode: true
-  audio_quantizer_source: z_sem
+  audio_quantizer_source: z
   include_quantizer_residual: true
-  semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized/11kstep/z_sem"
+  semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized/11kstep/z"
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: 1024
   

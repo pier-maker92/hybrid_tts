@@ -1,10 +1,10 @@
 # @package _global_
-# Llama 3 decoder + character tokenization + online z_sem discrete/continuous training
+# Llama 3 decoder + character tokenization + online z_sem discrete/continuous training on LJSpeech.
+
 training:
-  dataset_name: librispeech-aligned
-  dataset_dir_name: librispeech-aligned
+  dataset_name: ljspeech
   train_split: "train"
-  output_dir: checkpoints/exps/librispeech-aligned-llama3-zsem
+  output_dir: checkpoints/exps/ljspeech-llama3-zsem
 
   # audio len
   max_audio_len: 20
@@ -17,7 +17,7 @@ training:
   # logging
   report_to: wandb
   wandb_project: hybrid_tts
-  wandb_run_name: librispeech-aligned-llama3-zsem
+  wandb_run_name: ljspeech-llama3-zsem
   run_id: ""
 
   bf16: true
@@ -49,7 +49,7 @@ training:
   semantic_quantizer_checkpoint: "$SCRATCH/MelCausalVAE/checkpoints/paper/baseline/18-denc128-novq/quantized/11kstep/z_sem"
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: 1024
-  
+
   group_by_length: false
   dataloader_num_workers: 8
 
