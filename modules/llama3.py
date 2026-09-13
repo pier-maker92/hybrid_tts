@@ -224,6 +224,12 @@ class LlamaBackbone(nn.Module):
             mask = mask.unsqueeze(0).expand(attention_mask.shape[0], -1, -1).clone()
             bool_mask = ~attention_mask.unsqueeze(1) # (B, 1, curr_pos + T)
             mask = mask.masked_fill(bool_mask, float("-inf"))
+            # Left-padded queries have no valid causal key. MPS SDPA can
+            # produce NaNs for these rows, which then contaminate cached K/V.
+            # Give only those unused query rows one finite entry. Valid queries
+            # still exclude every padded key through the original mask.
+            empty_rows = torch.isneginf(mask).all(dim=-1)
+            mask[..., 0] = mask[..., 0].masked_fill(empty_rows, 0.0)
             return mask
         else:
             if seq_len == 1 and curr_pos > 0:

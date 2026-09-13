@@ -110,9 +110,7 @@ def load_hybrid_model(
         elif os.path.exists(pt_path):
             checkpoint_file = pt_path
         else:
-            raise FileNotFoundError(
-                f"No model weight file (model.safetensors, pytorch_model.bin or model.pt) found in {checkpoint_dir}"
-            )
+            raise FileNotFoundError(f"No model weight file (model.safetensors, pytorch_model.bin or model.pt) found in {checkpoint_dir}")
     else:
         checkpoint_file = checkpoint_dir
 
@@ -160,11 +158,7 @@ def clean_text_and_phonemize(text: str, vocab: Dict[str, int]) -> List[int]:
         phonemes = g2p(text)
         logger.info(f"G2P output: {phonemes}")
     except ImportError:
-        logger.error(
-            "Error: g2p_en is not installed!\n"
-            "Please run: pip install g2p_en\n"
-            "Alternatively, run this script using the --phonemes flag to specify ARPAbet phonemes directly."
-        )
+        logger.error("Error: g2p_en is not installed!\n" "Please run: pip install g2p_en\n" "Alternatively, run this script using the --phonemes flag to specify ARPAbet phonemes directly.")
         sys.exit(1)
 
     phoneme_ids = []
@@ -186,18 +180,14 @@ def clean_text_and_phonemize(text: str, vocab: Dict[str, int]) -> List[int]:
 
 
 def load_phoneme_vocab() -> Dict[str, int]:
-    vocab_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json"
-    )
+    vocab_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "phoneme_vocab.json")
     if not os.path.exists(vocab_path):
         raise FileNotFoundError(f"Phoneme vocabulary not found at {vocab_path}!")
     with open(vocab_path, "r") as f:
         return json.load(f)
 
 
-def encode_text_prompt(
-    text: str, tokenizer, phoneme_vocab: Optional[Dict[str, int]] = None
-) -> List[int]:
+def encode_text_prompt(text: str, tokenizer, phoneme_vocab: Optional[Dict[str, int]] = None) -> List[int]:
     if getattr(tokenizer, "char_tokenizer", None) is not None:
         prompt_ids = tokenizer.encode_text(text)
         logger.info(f"Mapped {len(prompt_ids)} chars to vocabulary IDs: {prompt_ids}")
@@ -224,23 +214,17 @@ def resolve_local_research_path(path: Optional[str], scratch_dir: str) -> Option
     return resolved
 
 
-def load_kmeans_centroids(
-    path: Optional[str], device: torch.device, dtype: torch.dtype
-):
+def load_kmeans_centroids(path: Optional[str], device: torch.device, dtype: torch.dtype):
     if not path:
         return None
-    kmeans_file = (
-        os.path.join(path, "encoder_kmeans.pt") if os.path.isdir(path) else path
-    )
+    kmeans_file = os.path.join(path, "encoder_kmeans.pt") if os.path.isdir(path) else path
     if not os.path.exists(kmeans_file):
         raise FileNotFoundError(f"kmeans checkpoint not found: {kmeans_file}")
     codebook = torch.load(kmeans_file, map_location="cpu")
     if "centroids" not in codebook:
         raise ValueError(f"kmeans checkpoint has no 'centroids': {kmeans_file}")
     centroids = codebook["centroids"].to(device=device, dtype=dtype)
-    logger.info(
-        f"Loaded kmeans centroids from {kmeans_file}: shape={tuple(centroids.shape)}"
-    )
+    logger.info(f"Loaded kmeans centroids from {kmeans_file}: shape={tuple(centroids.shape)}")
     return centroids
 
 
@@ -250,9 +234,7 @@ def load_voice_condition(path: str, vae: torch.nn.Module, device: torch.device):
     audios_srs = load_voice_reference_audio(path, device)
     speaker_embedding = vae.extract_speaker_embedding(audios_srs)
     if speaker_embedding is None:
-        raise RuntimeError(
-            "Voice conditioning requires a VAE checkpoint with speaker_encoder_config."
-        )
+        raise RuntimeError("Voice conditioning requires a VAE checkpoint with speaker_encoder_config.")
     return speaker_embedding.to(device=device, dtype=next(vae.parameters()).dtype)
 
 
@@ -292,13 +274,9 @@ def align_continuous_tokens(
             dtype=z_denorm.dtype,
             device=device,
         )
-        logger.info(
-            f"Continuous tokens shorter than discrete tokens; appending {missing} zero frame(s)."
-        )
+        logger.info(f"Continuous tokens shorter than discrete tokens; appending {missing} zero frame(s).")
         return torch.cat([z_denorm, pad], dim=1)
-    logger.info(
-        f"Continuous tokens longer than discrete tokens; trimming {z_denorm.shape[1]} -> {length}."
-    )
+    logger.info(f"Continuous tokens longer than discrete tokens; trimming {z_denorm.shape[1]} -> {length}.")
     return z_denorm[:, :length]
 
 
@@ -312,28 +290,20 @@ def discrete_tokens_to_semantic_latents(
     if external_quantizer is None:
         if hasattr(vae.encoder, "vq"):
             return vae.encoder.vq.codebook(tokens_tensor).unsqueeze(0)
-        raise RuntimeError(
-            "Cannot decode discrete tokens: VAE has neither encoder.vq nor an "
-            "external semantic quantizer."
-        )
+        raise RuntimeError("Cannot decode discrete tokens: VAE has neither encoder.vq nor an " "external semantic quantizer.")
 
     logger.info("Decoding discrete tokens with the external semantic quantizer.")
 
     quantizer = getattr(external_quantizer, "quantizer", None)
     quantizer_module = getattr(quantizer, "quantizer_module", None)
     if quantizer_module is None:
-        raise RuntimeError(
-            "Cannot decode discrete tokens: external semantic quantizer does not "
-            "expose quantizer.quantizer_module."
-        )
+        raise RuntimeError("Cannot decode discrete tokens: external semantic quantizer does not " "expose quantizer.quantizer_module.")
 
     embedding = getattr(quantizer_module, "embedding", None)
     if embedding is None:
         codebook = getattr(quantizer_module, "codebook", None)
         if codebook is None:
-            raise RuntimeError(
-                "Cannot decode discrete tokens: missing quantizer codebook."
-            )
+            raise RuntimeError("Cannot decode discrete tokens: missing quantizer codebook.")
         codes = torch.nn.functional.embedding(tokens_tensor, codebook)
     elif isinstance(embedding, torch.nn.Embedding):
         codes = embedding(tokens_tensor)
@@ -374,26 +344,19 @@ def combine_semantic_and_acoustic_latents(
         )
         return z_semantic
     raise RuntimeError(
-        "Cannot combine semantic/acoustic latents for VAE decoder: "
-        f"semantic_dim={z_semantic.shape[-1]}, acoustic_dim={z_acoustic.shape[-1]}, "
-        f"decoder_context_dim={expected_dim}."
+        "Cannot combine semantic/acoustic latents for VAE decoder: " f"semantic_dim={z_semantic.shape[-1]}, acoustic_dim={z_acoustic.shape[-1]}, " f"decoder_context_dim={expected_dim}."
     )
 
 
-def trim_unpaired_discrete_tokens(
-    tokens_tensor: torch.Tensor, z_denorm: Optional[torch.Tensor]
-):
+def trim_unpaired_discrete_tokens(tokens_tensor: torch.Tensor, z_denorm: Optional[torch.Tensor]):
     if z_denorm is None:
         return tokens_tensor
     continuous_len = z_denorm.shape[1]
     discrete_len = tokens_tensor.numel()
     if continuous_len < discrete_len:
-        logger.info(
-            f"Dropping {discrete_len - continuous_len} trailing discrete token(s) without matching continuous frame."
-        )
+        logger.info(f"Dropping {discrete_len - continuous_len} trailing discrete token(s) without matching continuous frame.")
         return tokens_tensor[:continuous_len]
     return tokens_tensor
-
 
 
 def configure_sm_inference(config, checkpoint_dir):
@@ -407,9 +370,11 @@ def configure_sm_inference(config, checkpoint_dir):
         config["_sm_inference_vocab_size"] = 0
         return True
     from pathlib import Path
+
     root = Path(checkpoint_dir)
     if (root / "model.safetensors").is_file():
         from safetensors import safe_open
+
         with safe_open(root / "model.safetensors", framework="pt", device="cpu") as handle:
             classes = handle.get_slice("token_head.2.weight").get_shape()[0]
     else:
@@ -428,15 +393,12 @@ def decode_full_z(vae, z, padding_mask, speaker_embedding):
     if z.shape[1] < 1 or padding_mask.shape[1] < z.shape[1]:
         raise ValueError("Generated z and padding mask have incompatible lengths.")
     # At the generation cap, the final discrete token may have no continuous pair.
-    padding_mask = padding_mask[:, :z.shape[1]]
-    return vae.sample(num_steps=8, temperature=0.2, guidance_scale=1.3,
-                      z=z, padding_mask=padding_mask, speaker_embedding=speaker_embedding)
+    padding_mask = padding_mask[:, : z.shape[1]]
+    return vae.sample(num_steps=8, temperature=0.2, guidance_scale=1.3, z=z, padding_mask=padding_mask, speaker_embedding=speaker_embedding)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Simple TTS Inference Script for HybridTTS Model"
-    )
+    parser = argparse.ArgumentParser(description="Simple TTS Inference Script for HybridTTS Model")
     parser.add_argument(
         "-c",
         "--hybrid_checkpoint",
@@ -595,17 +557,11 @@ def main():
     if args.kmeans_path:
         cfg_dict["kmeans_path"] = args.kmeans_path
 
-    cfg_dict["vae_checkpoint"] = resolve_local_research_path(
-        cfg_dict.get("vae_checkpoint"), scratch_dir
-    )
-    cfg_dict["kmeans_path"] = resolve_local_research_path(
-        cfg_dict.get("kmeans_path"), scratch_dir
-    )
+    cfg_dict["vae_checkpoint"] = resolve_local_research_path(cfg_dict.get("vae_checkpoint"), scratch_dir)
+    cfg_dict["kmeans_path"] = resolve_local_research_path(cfg_dict.get("kmeans_path"), scratch_dir)
     training_cfg = cfg_dict.get("training", {}) or {}
     if training_cfg.get("semantic_quantizer_checkpoint"):
-        training_cfg["semantic_quantizer_checkpoint"] = resolve_local_research_path(
-            training_cfg.get("semantic_quantizer_checkpoint"), scratch_dir
-        )
+        training_cfg["semantic_quantizer_checkpoint"] = resolve_local_research_path(training_cfg.get("semantic_quantizer_checkpoint"), scratch_dir)
     # Determine appropriate precision (dtype) for stability on MPS/CPU
     if device.type == "mps":
         # Force float32 on MPS because bfloat16/float16 support is unstable/incomplete in many MPS kernels
@@ -639,24 +595,13 @@ def main():
         except FileNotFoundError as e:
             logger.error(str(e))
             sys.exit(1)
-    kmeans_centroids = load_kmeans_centroids(
-        cfg_dict.get("kmeans_path"), device=device, dtype=dtype
-    )
+    kmeans_centroids = load_kmeans_centroids(cfg_dict.get("kmeans_path"), device=device, dtype=dtype)
 
     logger.info("Loading models...")
-    hybrid_model = load_hybrid_model(
-        cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok
-    )
-    requires_voice_condition = bool(
-        getattr(hybrid_model, "backbone_voice_condition", False)
-        or getattr(hybrid_model, "diffusion_voice_condition", False)
-    )
+    hybrid_model = load_hybrid_model(cfg_dict, args.hybrid_checkpoint, device, dtype, tokenizer=tok)
+    requires_voice_condition = bool(getattr(hybrid_model, "backbone_voice_condition", False) or getattr(hybrid_model, "diffusion_voice_condition", False))
     if requires_voice_condition and not args.voice_condition:
-        logger.error(
-            "This checkpoint was trained with voice_condition=true. "
-            "Pass --voice_condition with a reference audio file so the loaded VAE can "
-            "extract the speaker embedding."
-        )
+        logger.error("This checkpoint was trained with voice_condition=true. " "Pass --voice_condition with a reference audio file so the loaded VAE can " "extract the speaker embedding.")
         sys.exit(1)
     vae = load_vae(cfg_dict["vae_checkpoint"], device, dtype, training_cfg=training_cfg)
     if vae is None:
@@ -676,9 +621,7 @@ def main():
         except Exception as e:
             logger.error(f"Could not load voice condition: {e}")
             sys.exit(1)
-        logger.info(
-            f"Voice conditioning enabled: speaker_embedding shape={tuple(speaker_embedding.shape)}"
-        )
+        logger.info(f"Voice conditioning enabled: speaker_embedding shape={tuple(speaker_embedding.shape)}")
 
     vocoder = load_vocoder(args.vocoder, device)
     if vocoder is None:
@@ -690,9 +633,7 @@ def main():
     input_labels = []
     if args.phonemes:
         if getattr(tok, "char_tokenizer", None) is not None:
-            logger.error(
-                "--phonemes cannot be used with text_tokenizer='char'. Use --text."
-            )
+            logger.error("--phonemes cannot be used with text_tokenizer='char'. Use --text.")
             sys.exit(1)
         for phoneme_index, phoneme_text in enumerate(args.phonemes):
             input_phonemes = phoneme_text.split()
@@ -702,9 +643,7 @@ def main():
                     prompt_ids.append(phoneme_vocab[p])
                 else:
                     logger.warning(f"Phoneme '{p}' not found in vocabulary, skipping.")
-            logger.info(
-                f"Parsed direct phoneme sequence {phoneme_index}: {input_phonemes} -> {prompt_ids}"
-            )
+            logger.info(f"Parsed direct phoneme sequence {phoneme_index}: {input_phonemes} -> {prompt_ids}")
             if not prompt_ids:
                 logger.error(f"Empty phoneme input for phoneme index {phoneme_index}.")
                 sys.exit(1)
@@ -714,9 +653,7 @@ def main():
         for text_index, text in enumerate(args.text):
             prompt_ids = encode_text_prompt(text, tok, phoneme_vocab)
             if not prompt_ids:
-                logger.error(
-                    f"Empty text input after tokenization for text index {text_index}."
-                )
+                logger.error(f"Empty text input after tokenization for text index {text_index}.")
                 sys.exit(1)
             prompt_batches.append(prompt_ids)
             input_labels.append(f"text_{text_index}")
@@ -731,24 +668,15 @@ def main():
 
     # Calculate target length based on prompt length if requested by legacy default.
     if args.max_len == 500 and not args.no_ratio:
-        target_len = max(
-            int(len(prompt_ids) * args.ratio) for prompt_ids in prompt_batches
-        )
-        logger.info(
-            f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})"
-        )
+        target_len = max(int(len(prompt_ids) * args.ratio) for prompt_ids in prompt_batches)
+        logger.info(f"Target generation length calculated from prompt length: {target_len} frames (ratio={args.ratio})")
     else:
         target_len = args.max_len
         logger.info(f"Using max_len as EOS cap: {target_len} frames")
 
     with torch.no_grad():
-        logger.info(
-            f"Running built-in sample function for batch_size={len(prompt_batches)}..."
-        )
-        prompt_tensors = [
-            torch.tensor(prompt_ids, dtype=torch.long, device=device)
-            for prompt_ids in prompt_batches
-        ]
+        logger.info(f"Running built-in sample function for batch_size={len(prompt_batches)}...")
+        prompt_tensors = [torch.tensor(prompt_ids, dtype=torch.long, device=device) for prompt_ids in prompt_batches]
         discrete_sequence = torch.nn.utils.rnn.pad_sequence(
             prompt_tensors,
             batch_first=True,
@@ -803,60 +731,36 @@ def main():
                 audio_tokens = tok.audio_bpe.decode(audio_tokens)
 
             if not audio_tokens:
-                logger.error(
-                    f"No audio tokens were generated for sample {sample_index}."
-                )
+                logger.error(f"No audio tokens were generated for sample {sample_index}.")
                 sys.exit(1)
 
-            z_sample = (
-                None
-                if z_denorm is None
-                else z_denorm[sample_index : sample_index + 1, :token_len]
-            )
+            z_sample = None if z_denorm is None else z_denorm[sample_index : sample_index + 1, :token_len]
 
             tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device=device)
-            padding_mask = torch.zeros(
-                (1, len(audio_tokens)), dtype=torch.bool, device=device
-            )
+            padding_mask = torch.zeros((1, len(audio_tokens)), dtype=torch.bool, device=device)
 
             if full_z_mode:
                 logger.info("Decoding full generated z with DiCodec speaker conditioning...")
-                reconstructed_mel, reconstructed_padding_mask = decode_full_z(
-                    vae, z_sample, padding_mask, speaker_embedding)
+                reconstructed_mel, reconstructed_padding_mask = decode_full_z(vae, z_sample, padding_mask, speaker_embedding)
             elif kmeans_centroids is not None:
-                logger.info(
-                    "Decoding kmeans discrete tokens plus continuous features using VAE..."
-                )
+                logger.info("Decoding kmeans discrete tokens plus continuous features using VAE...")
                 if not args.decode_only_token:
-                    tokens_tensor = trim_unpaired_discrete_tokens(
-                        tokens_tensor, z_sample
-                    )
+                    tokens_tensor = trim_unpaired_discrete_tokens(tokens_tensor, z_sample)
                     audio_tokens = tokens_tensor.tolist()
-                    padding_mask = torch.zeros(
-                        (1, len(audio_tokens)), dtype=torch.bool, device=device
-                    )
+                    padding_mask = torch.zeros((1, len(audio_tokens)), dtype=torch.bool, device=device)
                 if tokens_tensor.numel() == 0:
-                    logger.error(
-                        f"No audio tokens were generated for sample {sample_index}."
-                    )
+                    logger.error(f"No audio tokens were generated for sample {sample_index}.")
                     sys.exit(1)
-                if (
-                    tokens_tensor.min().item() < 0
-                    or tokens_tensor.max().item() >= kmeans_centroids.shape[0]
-                ):
+                if tokens_tensor.min().item() < 0 or tokens_tensor.max().item() >= kmeans_centroids.shape[0]:
                     logger.error(
                         f"Generated token out of kmeans range for sample {sample_index}: "
                         f"min={tokens_tensor.min().item()}, max={tokens_tensor.max().item()}, "
                         f"clusters={kmeans_centroids.shape[0]}"
                     )
                     sys.exit(1)
-                z_semantic = kmeans_centroids.index_select(0, tokens_tensor).unsqueeze(
-                    0
-                )
+                z_semantic = kmeans_centroids.index_select(0, tokens_tensor).unsqueeze(0)
                 if args.decode_only_token or z_sample is None:
-                    logger.info(
-                        "Using only generated kmeans tokens; continuous features zeroed out."
-                    )
+                    logger.info("Using only generated kmeans tokens; continuous features zeroed out.")
                     z_sample = None
                 z_acoustic = align_continuous_tokens(
                     z_sample,
@@ -875,9 +779,7 @@ def main():
                     speaker_embedding=speaker_embedding,
                 )
             else:
-                logger.info(
-                    "Decoding VQ discrete tokens plus continuous features using VAE..."
-                )
+                logger.info("Decoding VQ discrete tokens plus continuous features using VAE...")
                 vq_emb = discrete_tokens_to_semantic_latents(
                     vae,
                     tokens_tensor,
@@ -885,9 +787,7 @@ def main():
                     device=device,
                 )
                 if args.decode_only_token or z_sample is None:
-                    logger.info(
-                        "Using only generated quantized tokens (continuous features zeroed out)."
-                    )
+                    logger.info("Using only generated quantized tokens (continuous features zeroed out).")
                     z_sample = torch.zeros(
                         (1, len(audio_tokens), hybrid_model.config.continuous_dim),
                         dtype=dtype,
@@ -921,19 +821,12 @@ def main():
             if recon_audio.dim() == 1:
                 recon_audio = recon_audio.unsqueeze(0)
 
-            output_path = (
-                f"{output_root}_{sample_index}{output_ext}"
-                if multi_output
-                else args.output
-            )
+            output_path = f"{output_root}_{sample_index}{output_ext}" if multi_output else args.output
             output_dir = os.path.dirname(output_path)
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
             torchaudio.save(output_path, recon_audio.cpu(), 24000)
-            logger.info(
-                f"SUCCESS: Audio generated for {input_labels[sample_index]} "
-                f"({token_len} tokens) and saved to '{output_path}'!"
-            )
+            logger.info(f"SUCCESS: Audio generated for {input_labels[sample_index]} " f"({token_len} tokens) and saved to '{output_path}'!")
 
 
 if __name__ == "__main__":
@@ -961,10 +854,10 @@ if __name__ == "__main__":
 
 # batch inference
 # python inference.py \
-#   -c checkpoints/tmp \
+#   -c checkpoints/v2_exps/lm/68k \
 #   --text "I tripped over my own shoelaces and landed face-first in a pie. At least dessert was served" \
 #   --text "I stood frozen, my heart pounding in my chest, as I witnessed the horrifying moment my father was taken from us, desperate tears streaming down my face as I screamed for someone, anyone, to help." \
-#   --voice_condition /Users/software/Research/MelCausalVAE/ablations/female.wav \
+#   --voice_condition /Users/software/Research/MelCausalVAE/audio_assets/female.wav \
 #   -o output.wav \
 #  --num_steps 6 \
 #  --diffusion_temperature 0.3 \
