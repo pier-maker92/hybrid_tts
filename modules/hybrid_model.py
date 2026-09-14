@@ -728,6 +728,8 @@ class HybridTTS(nn.Module):
         self,
         token_logits: torch.Tensor,
         temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> torch.LongTensor:
         if temperature is None:
             temperature = 1.0
@@ -737,6 +739,7 @@ class HybridTTS(nn.Module):
             return torch.argmax(token_logits, dim=-1)
 
         scaled_logits = (token_logits / temperature).float()
+
         finite_mask = torch.isfinite(scaled_logits)
         invalid_rows = (~finite_mask.any(dim=-1)) | torch.isposinf(scaled_logits).any(dim=-1)
         if not finite_mask.all():
@@ -744,11 +747,32 @@ class HybridTTS(nn.Module):
             scaled_logits = scaled_logits.masked_fill(~finite_mask, -torch.inf)
             scaled_logits[invalid_rows] = 0.0
 
+        if top_k is not None and top_k > 0:
+            top_k = min(max(top_k, 1), scaled_logits.size(-1))  # Safety check
+            # Remove all tokens with a probability less than the last token of the top-k
+            indices_to_remove = scaled_logits < torch.topk(scaled_logits, top_k)[0][..., -1, None]
+            scaled_logits = scaled_logits.masked_fill(indices_to_remove, -float("inf"))
+
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            # Scatter sorted tensors to original indexing
+            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+            scaled_logits = scaled_logits.masked_fill(indices_to_remove, -float("inf"))
+
         probs = torch.softmax(scaled_logits, dim=-1)
         prob_sums = probs.sum(dim=-1)
         invalid_probs = invalid_rows | (~torch.isfinite(probs).all(dim=-1)) | (probs < 0).any(dim=-1) | (~torch.isfinite(prob_sums)) | (prob_sums <= 0)
         if invalid_probs.any():
             logger.warning("Invalid token probabilities encountered during sampling; using EOS " "for affected rows.")
+
             probs = probs.clone()
             probs[invalid_probs] = 0.0
             probs[invalid_probs, 0] = 1.0
@@ -785,39 +809,17 @@ class HybridTTS(nn.Module):
         guidance_scale = kwargs.get("guidance_scale", None)
         if guidance_scale is None:
             guidance_scale = 1.0
-        do_cfg = guidance_scale != 1.0 and not ((self.discrete and not self.continuous) or self.diffusion_head is None)
         B_orig, L = discrete_sequence.shape
 
         discrete_sequence, attention_mask = self._left_pad_valid_tokens(discrete_sequence, attention_mask)
 
-        if do_cfg:
-            start_idx, _ = self._extract_audio_tokens_span(discrete_sequence)
-            uncond_discrete = discrete_sequence.new_full(discrete_sequence.shape, self.pad_token_id)
-            uncond_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
-
-            for b in range(B_orig):
-                s_idx = start_idx[b].item()
-                keep_len = L - s_idx
-                uncond_discrete[b, L - keep_len :] = discrete_sequence[b, s_idx:]
-                uncond_mask[b, L - keep_len :] = attention_mask[b, s_idx:]
-
-            input_embs = torch.cat([embed_layer(discrete_sequence), embed_layer(uncond_discrete)], dim=0)
-            attention_mask = torch.cat([attention_mask, uncond_mask], dim=0)
-            if self.backbone_voice_condition:
-                speaker_for_backbone = torch.cat([speaker_embedding, speaker_embedding], dim=0) if speaker_embedding is not None else None
-                input_embs = self._add_backbone_voice_condition(
-                    input_embs=input_embs,
-                    attention_mask=attention_mask,
-                    speaker_embedding=speaker_for_backbone,
-                )
-        else:
-            input_embs = embed_layer(discrete_sequence)
-            if self.backbone_voice_condition:
-                input_embs = self._add_backbone_voice_condition(
-                    input_embs=input_embs,
-                    attention_mask=attention_mask,
-                    speaker_embedding=speaker_embedding,
-                )
+        input_embs = embed_layer(discrete_sequence)
+        if self.backbone_voice_condition:
+            input_embs = self._add_backbone_voice_condition(
+                input_embs=input_embs,
+                attention_mask=attention_mask,
+                speaker_embedding=speaker_embedding,
+            )
         position_ids = self._make_position_ids(attention_mask)
 
         past_key_values = None
@@ -825,6 +827,7 @@ class HybridTTS(nn.Module):
         active_speaker_embedding = speaker_embedding
         discrete_outputs = [[] for _ in range(B_orig)]
         continuous_outputs = [[] for _ in range(B_orig)]
+        stream_callback = kwargs.get("stream_callback")
 
         for step in tqdm(range(max_steps)):
             B_active = active_indices.numel()
@@ -836,17 +839,15 @@ class HybridTTS(nn.Module):
                 use_cache=True,
             )
 
-            if do_cfg:
-                cond_hidden = last_hidden_state[:B_active]
-                uncond_hidden = last_hidden_state[B_active:]
-                # token_logits = self.get_token_logits(cond_hidden.squeeze(1))
-                token_logits = self.get_token_logits(uncond_hidden.squeeze(1))
-                diffusion_context = (cond_hidden, uncond_hidden)
-            else:
-                token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
-                diffusion_context = last_hidden_state
+            token_logits = self.get_token_logits(last_hidden_state.squeeze(1))
+            diffusion_context = last_hidden_state
 
-            sampled_id = self._sample_token_ids(token_logits, kwargs.get("temperature"))
+            sampled_id = self._sample_token_ids(
+                token_logits,
+                temperature=kwargs.get("temperature"),
+                top_k=kwargs.get("top_k"),
+                top_p=kwargs.get("top_p"),
+            )
             eos_mask = sampled_id == 0  # EOS token is assumed to be 0
 
             if self.continuous and self.diffusion_head is not None:
@@ -876,6 +877,17 @@ class HybridTTS(nn.Module):
                 if not eos_mask[local_idx]:
                     discrete_outputs[original_idx].append(sampled_id[local_idx] - 1)
 
+            # The callback is intentionally invoked after the token and its matching
+            # continuous frame have been collected.  This lets inference consumers
+            # decode/play short chunks while autoregressive generation continues.
+            if stream_callback is not None:
+                stream_callback(
+                    step=step,
+                    discrete_outputs=discrete_outputs,
+                    continuous_outputs=continuous_outputs,
+                    finished_indices=active_indices[eos_mask].tolist(),
+                )
+
             if eos_mask.all():
                 break
 
@@ -896,11 +908,7 @@ class HybridTTS(nn.Module):
                 next_speaker = active_speaker_embedding.index_select(0, survivor_indices)
                 next_token = next_token + self._speaker_hidden(next_speaker).unsqueeze(1).to(dtype=next_token.dtype)
 
-            if do_cfg:
-                next_token = next_token.repeat(2, 1, 1)
-                cache_indices = torch.cat([survivor_indices, survivor_indices + B_active], dim=0)
-            else:
-                cache_indices = survivor_indices
+            cache_indices = survivor_indices
 
             if past_key_values is not None:
                 if hasattr(past_key_values, "batch_select_indices"):

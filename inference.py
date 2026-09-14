@@ -7,6 +7,13 @@ import torch
 import argparse
 import logging
 import torchaudio
+import numpy as np
+import shutil
+import subprocess
+import tempfile
+import threading
+import queue
+import wave
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from typing import List, Dict, Any, Optional
@@ -18,6 +25,93 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("inference")
+
+
+class RealtimeAudioPlayer:
+    """Small PCM player that prefers the native macOS audio player when available."""
+
+    def __init__(self, sample_rate: int = 24000):
+        self.sample_rate = sample_rate
+        self._process = None
+        self._queue = queue.Queue()
+        self._worker = None
+        self._closed = False
+
+        # afplay uses the same output device as the rest of macOS and is much more
+        # dependable than Homebrew ffplay on Apple Silicon.  It has no stdin API,
+        # so a worker writes/plays ordered temporary WAV chunks.
+        if sys.platform == "darwin" and shutil.which("afplay"):
+            self._worker = threading.Thread(target=self._afplay_worker, daemon=True)
+            self._worker.start()
+            logger.info("Realtime playback enabled through native macOS afplay.")
+        else:
+            ffplay = shutil.which("ffplay")
+            if not ffplay:
+                raise RuntimeError("--stream requires afplay on macOS or ffplay on other platforms.")
+            self._process = subprocess.Popen(
+                [
+                    ffplay,
+                    "-loglevel",
+                    "error",
+                    "-nodisp",
+                    "-autoexit",
+                    # ffplay 8 removed the legacy -ac input option.  ch_layout is
+                    # the PCM demuxer's supported way to declare mono input.
+                    "-f",
+                    "f32le",
+                    "-ar",
+                    str(sample_rate),
+                    "-ch_layout",
+                    "mono",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+            )
+            logger.info("Realtime playback enabled through ffplay.")
+
+    def write(self, audio: torch.Tensor) -> None:
+        if self._closed:
+            return
+        pcm = audio.detach().float().cpu().reshape(-1).clamp(-1, 1).numpy()
+        if self._process is not None:
+            try:
+                self._process.stdin.write(pcm.tobytes())
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError("Realtime audio player stopped unexpectedly.") from exc
+        else:
+            self._queue.put(pcm)
+
+    def _afplay_worker(self) -> None:
+        while True:
+            pcm = self._queue.get()
+            if pcm is None:
+                return
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                path = handle.name
+            try:
+                pcm_int16 = (np.clip(pcm, -1, 1) * np.iinfo(np.int16).max).astype("<i2")
+                with wave.open(path, "wb") as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(self.sample_rate)
+                    wav.writeframes(pcm_int16.tobytes())
+                subprocess.run(["afplay", path], check=False)
+            finally:
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._process is not None:
+            self._process.stdin.close()
+            self._process.wait()
+        elif self._worker is not None:
+            self._queue.put(None)
+            self._worker.join()
+
 
 # Add the root directory to path to allow absolute imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -394,7 +488,115 @@ def decode_full_z(vae, z, padding_mask, speaker_embedding):
         raise ValueError("Generated z and padding mask have incompatible lengths.")
     # At the generation cap, the final discrete token may have no continuous pair.
     padding_mask = padding_mask[:, : z.shape[1]]
-    return vae.sample(num_steps=8, temperature=0.2, guidance_scale=1.3, z=z, padding_mask=padding_mask, speaker_embedding=speaker_embedding)
+    return vae.sample(
+        num_steps=8,
+        temperature=0.2,
+        guidance_scale=1.3,
+        z=z,
+        padding_mask=padding_mask,
+        speaker_embedding=speaker_embedding,
+    )
+
+
+class StreamingDecoder:
+    """Turns newly generated token/frame pairs into playable waveform chunks."""
+
+    def __init__(
+        self,
+        *,
+        vae,
+        vocoder,
+        hybrid_model,
+        dtype,
+        device,
+        speaker_embedding,
+        full_z_mode,
+        kmeans_centroids,
+        decode_only_token,
+        player: RealtimeAudioPlayer,
+        chunk_frames: int,
+    ):
+        self.vae = vae
+        self.vocoder = vocoder
+        self.hybrid_model = hybrid_model
+        self.dtype = dtype
+        self.device = device
+        self.speaker_embedding = speaker_embedding
+        self.full_z_mode = full_z_mode
+        self.kmeans_centroids = kmeans_centroids
+        self.decode_only_token = decode_only_token
+        self.player = player
+        self.chunk_frames = chunk_frames
+        self.emitted_frames = 0
+        self._discrete_outputs = None
+        self._continuous_outputs = None
+
+    def __call__(self, *, discrete_outputs, continuous_outputs, finished_indices, **_):
+        # CLI streaming intentionally supports a single input: separate prompts can
+        # finish at different times and cannot share one audio device stream.
+        self._discrete_outputs = discrete_outputs
+        self._continuous_outputs = continuous_outputs
+        usable = min(len(discrete_outputs[0]), len(continuous_outputs[0]))
+        while usable - self.emitted_frames >= self.chunk_frames:
+            self._decode_and_play(discrete_outputs, continuous_outputs, self.chunk_frames)
+            self.emitted_frames += self.chunk_frames
+
+    def _decode_and_play(self, discrete_outputs, continuous_outputs, length: int) -> None:
+        start = self.emitted_frames
+        stop = start + length
+        tokens = torch.stack(discrete_outputs[0][start:stop]).long().to(self.device)
+        # `HybridTTS.sample` denormalizes its final `continuous_tokens` before
+        # the regular VAE decode.  The streaming callback sees the raw diffusion
+        # output earlier in that method, so perform the identical conversion here.
+        z = torch.cat(continuous_outputs[0][start:stop], dim=1).to(self.device)
+        z = self.hybrid_model.dynamic_normalizer.denormalize(z)
+        padding_mask = torch.zeros((1, length), dtype=torch.bool, device=self.device)
+
+        if self.full_z_mode:
+            reconstructed_mel, reconstructed_padding_mask = decode_full_z(self.vae, z, padding_mask, self.speaker_embedding)
+        elif self.kmeans_centroids is not None:
+            z_semantic = self.kmeans_centroids.index_select(0, tokens).unsqueeze(0)
+            z_acoustic = (
+                torch.zeros((1, length, self.hybrid_model.config.continuous_dim), dtype=self.dtype, device=self.device)
+                if self.decode_only_token
+                else align_continuous_tokens(z, length, self.hybrid_model.config.continuous_dim, self.dtype, self.device)
+            )
+            reconstructed_mel, reconstructed_padding_mask = self.vae.sample(
+                num_steps=8,
+                temperature=0.2,
+                guidance_scale=1.3,
+                z=torch.cat([z_semantic, z_acoustic], dim=-1),
+                padding_mask=padding_mask,
+                speaker_embedding=self.speaker_embedding,
+            )
+        else:
+            vq_emb = discrete_tokens_to_semantic_latents(self.vae, tokens, self.dtype, self.device)
+            z_acoustic = (
+                torch.zeros((1, length, self.hybrid_model.config.continuous_dim), dtype=self.dtype, device=self.device)
+                if self.decode_only_token
+                else align_continuous_tokens(z, length, self.hybrid_model.config.continuous_dim, self.dtype, self.device)
+            )
+            reconstructed_mel, reconstructed_padding_mask = self.vae.sample(
+                num_steps=8,
+                temperature=0.2,
+                guidance_scale=1.3,
+                z=combine_semantic_and_acoustic_latents(vq_emb, z_acoustic, self.vae),
+                padding_mask=padding_mask,
+                speaker_embedding=self.speaker_embedding,
+            )
+
+        mel = reconstructed_mel[0][~reconstructed_padding_mask[0]].unsqueeze(0).permute(0, 2, 1).float().to(self.device)
+        logger.info("Playing streamed audio chunk: frames %d-%d.", start, stop)
+        audio = self.vocoder.decode(mel).squeeze()
+        # Match the normal inference path.  Clipping the raw Vocos waveform was
+        # severe distortion when a streamed chunk exceeded the PCM range.
+        audio = audio / (audio.abs().max() + 1e-8)
+        self.player.write(audio)
+
+    def finish(self) -> None:
+        # Leave an incomplete final chunk to the normal full-sequence decode.  It
+        # is then played from exactly the same waveform that is written to disk.
+        return
 
 
 def main():
@@ -451,13 +653,13 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.0,
+        default=0.2,
         help="Temperature for discrete autoregressive token sampling (default: 0.0)",
     )
     parser.add_argument(
         "--diffusion_temperature",
         type=float,
-        default=1.0,
+        default=0.2,
         help="Temperature for the CFM diffusion head (default: 1.0)",
     )
     parser.add_argument(
@@ -470,13 +672,13 @@ def main():
     parser.add_argument(
         "--top_k",
         type=int,
-        default=50,
+        default=100,
         help="Top-k filtering for discrete autoregressive sampling (default: 50, 0 to disable)",
     )
     parser.add_argument(
         "--top_p",
         type=float,
-        default=0.95,
+        default=0.99,
         help="Top-p nucleus filtering for discrete autoregressive sampling (default: 0.95, 1.0 to disable)",
     )
     parser.add_argument(
@@ -488,7 +690,7 @@ def main():
     parser.add_argument(
         "--ratio",
         type=float,
-        default=2.2,
+        default=3.2,
         help="Ratio of generated VQ frames per phoneme (default: 2.2)",
     )
     parser.add_argument(
@@ -523,6 +725,17 @@ def main():
         type=str,
         default=None,
         help="Reference audio file used to extract a speaker embedding for DiCodec decoder FiLM conditioning.",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Decode and play generated audio live on this computer (single input only).",
+    )
+    parser.add_argument(
+        "--stream_chunk_frames",
+        type=int,
+        default=500,
+        help="Frames per live audio chunk; larger chunks more closely match non-streaming VAE decoding (default: 500).",
     )
     args = parser.parse_args()
 
@@ -661,6 +874,12 @@ def main():
     if not prompt_batches:
         logger.error("Empty input. Nothing to synthesize.")
         sys.exit(1)
+    if args.stream and len(prompt_batches) != 1:
+        parser.error("--stream supports one --text/--phonemes input at a time.")
+    if args.stream and getattr(tok, "audio_bpe", None) is not None:
+        parser.error("--stream is not supported for audio-BPE checkpoints yet.")
+    if args.stream and args.stream_chunk_frames < 1:
+        parser.error("--stream_chunk_frames must be at least 1.")
 
     # Map prompt_ids to unified vocab and append <start_audio>
     for prompt_ids in prompt_batches:
@@ -695,10 +914,30 @@ def main():
         generator = torch.Generator(device=device)
         generator.manual_seed(42)
 
+        realtime_player = RealtimeAudioPlayer() if args.stream else None
+        streaming_decoder = (
+            StreamingDecoder(
+                vae=vae,
+                vocoder=vocoder,
+                hybrid_model=hybrid_model,
+                dtype=dtype,
+                device=device,
+                speaker_embedding=speaker_embedding,
+                full_z_mode=full_z_mode,
+                kmeans_centroids=kmeans_centroids,
+                decode_only_token=args.decode_only_token,
+                player=realtime_player,
+                chunk_frames=args.stream_chunk_frames,
+            )
+            if realtime_player is not None
+            else None
+        )
         sample_out = hybrid_model.sample(
             batch=batch,
             max_steps=target_len,
             temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
             num_steps=args.num_steps,
             diffusion_temperature=args.diffusion_temperature,
             guidance_scale=args.guidance_scale,
@@ -706,7 +945,11 @@ def main():
             generator=generator,
             reference_audios_srs=voice_reference_audios_srs,
             voice_conditioner=vae,
+            stream_callback=streaming_decoder,
         )
+        if streaming_decoder is not None:
+            # A generation cap can stop before EOS, leaving a short final chunk.
+            streaming_decoder.finish()
 
         final_discrete = sample_out["discrete_tokens"]
         z_denorm = sample_out["continuous_tokens"]
@@ -804,7 +1047,7 @@ def main():
                 z = combine_semantic_and_acoustic_latents(vq_emb, z_sample, vae)
                 reconstructed_mel, reconstructed_padding_mask = vae.sample(
                     num_steps=8,
-                    temperature=0.2,
+                    temperature=0.3,
                     guidance_scale=1.3,
                     z=z,
                     padding_mask=padding_mask,
@@ -827,6 +1070,16 @@ def main():
                 os.makedirs(output_dir, exist_ok=True)
             torchaudio.save(output_path, recon_audio.cpu(), 24000)
             logger.info(f"SUCCESS: Audio generated for {input_labels[sample_index]} " f"({token_len} tokens) and saved to '{output_path}'!")
+
+            # If generation ended before a full streaming chunk was available,
+            # play the already-normalized final waveform.  This is bit-for-bit
+            # the same audio written to output_path, not a second VAE preview.
+            if realtime_player is not None and sample_index == 0 and streaming_decoder.emitted_frames == 0:
+                logger.info("Playing final waveform (generation shorter than one streaming chunk).")
+                realtime_player.write(recon_audio.squeeze())
+
+        if realtime_player is not None:
+            realtime_player.close()
 
 
 if __name__ == "__main__":
