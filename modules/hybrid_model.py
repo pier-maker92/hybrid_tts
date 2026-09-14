@@ -637,8 +637,8 @@ class HybridTTS(nn.Module):
             continuous_sequence: (B, L_audio, C) continuous tokens
             audio_padding_mask: (B, L_audio) False = valid, True = pad
         """
-        if self.training and getattr(self, "uncond_prob") > 0.0:
-            discrete_sequence, attention_mask = self.uncondition(discrete_sequence, attention_mask)
+        # if self.training and getattr(self, "uncond_prob") > 0.0:
+        #     discrete_sequence, attention_mask = self.uncondition(discrete_sequence, attention_mask)
 
         start_idx, end_idx = self._extract_audio_tokens_span(discrete_sequence)
         embed_layer = self.backbone.get_input_embeddings()
