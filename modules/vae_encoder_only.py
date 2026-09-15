@@ -221,8 +221,6 @@ class DicodecEncoderOnly(nn.Module):
             z_sem=z_sem,
             z_pros=z_pros,
             z_mean=z_mean,
-            z_lp=z_lp,
-            z_hp=z_hp,
         )
 
     def set_external_semantic_quantizer(

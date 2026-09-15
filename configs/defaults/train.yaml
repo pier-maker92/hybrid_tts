@@ -34,6 +34,7 @@ training:
   report_to: wandb
   wandb_project: hybrid_tts
   wandb_run_name: baseline
+  wandb_id: null
   run_id: ""
   resume_from_checkpoint: null
 

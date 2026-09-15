@@ -13,15 +13,16 @@ from data.audio_dataset import (
 
 
 def wandb_init(training_cfg: Dict[str, Any], accelerator):
-    wandb_project = training_cfg.pop("wandb_project")
-    wandb_run_name = training_cfg.pop("wandb_run_name")
-    wandb_id = training_cfg.pop("wandb_id", None)
+    wandb_project = training_cfg.get("wandb_project")
+    wandb_run_name = training_cfg.get("wandb_run_name")
+    wandb_id = training_cfg.get("wandb_id")
     if training_cfg.get("report_to") == "wandb" and accelerator.is_main_process:
         wandb.init(
             project=wandb_project,
             name=wandb_run_name,
             id=wandb_id,
             resume="allow" if wandb_id else None,
+            config=training_cfg.get("_wandb_config"),
         )
 
 

@@ -2,6 +2,8 @@ import os
 import json
 import math
 import random
+import glob
+import shutil
 import numpy as np
 import torch
 import time
@@ -72,6 +74,107 @@ def get_scheduler(optimizer, warmup_steps, num_training_steps, initial_lr, min_l
         return min_lr_ratio + (1.0 - min_lr_ratio) * decay
         
     return LambdaLR(optimizer, get_lr_lambda)
+
+
+def save_training_checkpoint(
+    accelerator,
+    model,
+    output_dir: str,
+    checkpoint_name: str,
+    cfg_dict_to_save: Dict,
+    training_state: Dict,
+) -> str:
+    save_dir = os.path.join(output_dir, checkpoint_name)
+    os.makedirs(save_dir, exist_ok=True)
+    accelerator.save_state(save_dir)
+    rng_state_path = os.path.join(
+        save_dir, f"hybrid_rng_state_{getattr(accelerator, 'process_index', 0)}.pt"
+    )
+    torch.save(capture_rng_state(), rng_state_path)
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        state_dict = unwrapped_model.state_dict()
+        if "backbone.model.lm_head.weight" in state_dict:
+            state_dict["backbone.model.lm_head.weight"] = state_dict["backbone.model.lm_head.weight"].clone()
+        elif "backbone.lm_head.weight" in state_dict:
+            state_dict["backbone.lm_head.weight"] = state_dict["backbone.lm_head.weight"].clone()
+
+        torch.save(state_dict, os.path.join(save_dir, "pytorch_model.bin"))
+        with open(os.path.join(save_dir, "config.json"), "w") as f:
+            json.dump(cfg_dict_to_save, f, indent=4)
+        with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+            json.dump(training_state, f, indent=4)
+
+    accelerator.wait_for_everyone()
+    return save_dir
+
+
+def capture_rng_state() -> Dict:
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "get_rng_state"):
+        try:
+            state["mps"] = torch.mps.get_rng_state()
+        except RuntimeError:
+            pass
+    return state
+
+
+def restore_rng_state(checkpoint_dir: str, accelerator):
+    rng_state_path = os.path.join(
+        checkpoint_dir, f"hybrid_rng_state_{getattr(accelerator, 'process_index', 0)}.pt"
+    )
+    if not os.path.exists(rng_state_path):
+        raise FileNotFoundError(
+            f"{checkpoint_dir} is not a complete resumable checkpoint: "
+            f"missing {os.path.basename(rng_state_path)}."
+        )
+    state = torch.load(rng_state_path, map_location="cpu", weights_only=False)
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if "mps" in state and hasattr(torch, "mps") and hasattr(torch.mps, "set_rng_state"):
+        torch.mps.set_rng_state(state["mps"])
+
+
+def load_training_state(checkpoint_dir: str) -> Dict:
+    state_path = os.path.join(checkpoint_dir, "training_state.json")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(
+            f"{checkpoint_dir} is not a resumable training checkpoint: "
+            "missing training_state.json. Older model-only checkpoints can be "
+            "used for initialization only, not resume_from_checkpoint."
+        )
+    with open(state_path) as f:
+        return json.load(f)
+
+
+def prune_old_checkpoints(output_dir: str, save_total_limit: Optional[int]):
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+    checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+    valid_checkpoints = []
+    for ckpt in checkpoints:
+        basename = os.path.basename(ckpt)
+        if basename.startswith("checkpoint-"):
+            step_str = basename.replace("checkpoint-", "")
+            if step_str.isdigit():
+                valid_checkpoints.append((int(step_str), ckpt))
+    valid_checkpoints.sort(key=lambda x: x[0])
+
+    while len(valid_checkpoints) > save_total_limit:
+        ckpt_to_delete = valid_checkpoints.pop(0)[1]
+        shutil.rmtree(ckpt_to_delete)
+        logger.info(f"Deleted old checkpoint: {ckpt_to_delete}")
 
 
 def voice_condition_enabled(cfg_dict: Dict) -> bool:
@@ -190,6 +293,7 @@ def main(cfg: DictConfig):
     if accelerator.is_main_process:
         if training_cfg.get("report_to") == "wandb":
             logger.info("Initializing W&B...")
+        training_cfg["_wandb_config"] = cfg_dict_to_save
         wandb_init(training_cfg, accelerator)
 
     with accelerator.main_process_first():
@@ -327,12 +431,20 @@ def main(cfg: DictConfig):
     os.makedirs(output_dir, exist_ok=True)
 
     resume_from_checkpoint = training_cfg.get("resume_from_checkpoint")
+    if resume_from_checkpoint:
+        resume_from_checkpoint = resume_from_checkpoint.replace("$SCRATCH", scratch_dir)
     starting_step = 0
     starting_epoch = 0
+    starting_step_in_epoch = 0
     if resume_from_checkpoint:
+        resume_state = load_training_state(resume_from_checkpoint)
         accelerator.load_state(resume_from_checkpoint)
+        restore_rng_state(resume_from_checkpoint, accelerator)
+        logger.info(f"Restored custom RNG state from {resume_from_checkpoint}")
+        starting_step = int(resume_state.get("global_step", 0))
+        starting_epoch = int(resume_state.get("epoch", 0))
+        starting_step_in_epoch = int(resume_state.get("step_in_epoch", 0))
         accelerator.print(f"Resumed from checkpoint: {resume_from_checkpoint}")
-        # Simplification: not strictly mapping steps back for starting_epoch/step
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -360,6 +472,8 @@ def main(cfg: DictConfig):
             train_dataloader.sampler.set_epoch(epoch)
             
         for step, batch in enumerate(train_dataloader):
+            if epoch == starting_epoch and step < starting_step_in_epoch:
+                continue
             with accelerator.accumulate(model):
                 outputs = model(
                     discrete_sequence=batch.get("discrete_sequence"),
@@ -429,39 +543,23 @@ def main(cfg: DictConfig):
                     
                 if save_steps is not None and save_steps > 0 and global_step % save_steps == 0:
                     accelerator.wait_for_everyone()
+                    save_dir = save_training_checkpoint(
+                        accelerator,
+                        model,
+                        output_dir,
+                        f"checkpoint-{global_step}",
+                        cfg_dict_to_save,
+                        {
+                            "global_step": global_step,
+                            "epoch": epoch,
+                            "step_in_epoch": step + 1,
+                            "num_training_steps": num_training_steps,
+                            "completed": False,
+                        },
+                    )
                     if accelerator.is_main_process:
-                        save_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
-                        unwrapped_model = accelerator.unwrap_model(model)
-                        state_dict = unwrapped_model.state_dict()
-                        if "backbone.model.lm_head.weight" in state_dict:
-                            state_dict["backbone.model.lm_head.weight"] = state_dict["backbone.model.lm_head.weight"].clone()
-                        elif "backbone.lm_head.weight" in state_dict:
-                            state_dict["backbone.lm_head.weight"] = state_dict["backbone.lm_head.weight"].clone()
-                            
-                        os.makedirs(save_dir, exist_ok=True)
-                        torch.save(state_dict, os.path.join(save_dir, "pytorch_model.bin"))
-                        with open(os.path.join(save_dir, "config.json"), "w") as f:
-                            json.dump(cfg_dict_to_save, f, indent=4)
                         logger.info(f"Saved checkpoint to {save_dir}")
-                        
-                        save_total_limit = training_cfg.get("save_total_limit")
-                        if save_total_limit is not None and save_total_limit > 0:
-                            import shutil
-                            import glob
-                            checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
-                            valid_checkpoints = []
-                            for ckpt in checkpoints:
-                                basename = os.path.basename(ckpt)
-                                if basename.startswith("checkpoint-"):
-                                    step_str = basename.replace("checkpoint-", "")
-                                    if step_str.isdigit():
-                                        valid_checkpoints.append((int(step_str), ckpt))
-                            valid_checkpoints.sort(key=lambda x: x[0])
-                            
-                            while len(valid_checkpoints) > save_total_limit:
-                                ckpt_to_delete = valid_checkpoints.pop(0)[1]
-                                shutil.rmtree(ckpt_to_delete)
-                                logger.info(f"Deleted old checkpoint: {ckpt_to_delete}")
+                        prune_old_checkpoints(output_dir, training_cfg.get("save_total_limit"))
                         
                 if eval_steps is not None and eval_steps > 0 and global_step % eval_steps == 0:
                     accelerator.wait_for_everyone()
@@ -508,19 +606,21 @@ def main(cfg: DictConfig):
 
     # Final save
     accelerator.wait_for_everyone()
+    save_dir = save_training_checkpoint(
+        accelerator,
+        model,
+        output_dir,
+        "checkpoint-final",
+        cfg_dict_to_save,
+        {
+            "global_step": global_step,
+            "epoch": num_train_epochs,
+            "step_in_epoch": 0,
+            "num_training_steps": num_training_steps,
+            "completed": True,
+        },
+    )
     if accelerator.is_main_process:
-        save_dir = os.path.join(output_dir, f"checkpoint-final")
-        unwrapped_model = accelerator.unwrap_model(model)
-        state_dict = unwrapped_model.state_dict()
-        if "backbone.model.lm_head.weight" in state_dict:
-            state_dict["backbone.model.lm_head.weight"] = state_dict["backbone.model.lm_head.weight"].clone()
-        elif "backbone.lm_head.weight" in state_dict:
-            state_dict["backbone.lm_head.weight"] = state_dict["backbone.lm_head.weight"].clone()
-            
-        os.makedirs(save_dir, exist_ok=True)
-        torch.save(state_dict, os.path.join(save_dir, "pytorch_model.bin"))
-        with open(os.path.join(save_dir, "config.json"), "w") as f:
-            json.dump(cfg_dict_to_save, f, indent=4)
         logger.info(f"Saved final checkpoint to {save_dir}")
 
     accelerator.end_training()

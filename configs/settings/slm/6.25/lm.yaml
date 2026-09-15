@@ -57,6 +57,7 @@ training:
   report_to: wandb
   wandb_project: hybrid-tts-sm
   wandb_run_name: 6.25-lm
+  wandb_id: null
 
 # Architecture Configurations
 backbone:
