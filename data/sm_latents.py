@@ -1,4 +1,5 @@
 """Frozen SM token extraction from exported DiCodec latents, with full z targets."""
+from dataclasses import fields, is_dataclass
 from functools import lru_cache
 from pathlib import Path
 import os
@@ -13,6 +14,19 @@ from modules.submodules.MelCausalVAE.dicodec.modules.sm_quantizer.encoder import
 from modules.submodules.MelCausalVAE.dicodec.modules.sm_quantizer.quantizer import OnlineQuantizer
 
 
+def _known_dataclass_fields(cls, values):
+    if not is_dataclass(cls) or not isinstance(values, dict):
+        return values
+    defaults = cls()
+    pruned = {}
+    for field in fields(cls):
+        if field.name not in values:
+            continue
+        default = getattr(defaults, field.name)
+        pruned[field.name] = _known_dataclass_fields(type(default), values[field.name])
+    return pruned
+
+
 def checkpoint_path(path):
     path = Path(os.path.expandvars(path.replace("$SCRATCH", os.environ.get("SCRATCH", "/Users/software/Research"))))
     return path / "last.pt" if path.is_dir() else path
@@ -23,7 +37,8 @@ def checkpoint_config(path):
     payload = torch.load(checkpoint_path(path), map_location="cpu", weights_only=True, mmap=True)
     if payload["config"]["data"].get("input", "z") != "z_sem":
         raise ValueError("Hybrid SM token extraction requires a checkpoint trained on z_sem.")
-    return from_dict(ModelConfig, payload["config"]["model"])
+    model_config = _known_dataclass_fields(ModelConfig, payload["config"]["model"])
+    return from_dict(ModelConfig, model_config)
 
 
 class FrozenSMTokenizer(nn.Module):

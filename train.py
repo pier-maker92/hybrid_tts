@@ -231,8 +231,6 @@ def main(cfg: DictConfig):
         from data.sm_latents import SMLatentCollator
         if is_online or use_voice_condition or training_cfg.get("eval_steps") or not continuous:
             raise ValueError("Latent SM training requires continuous=true, online_encode=false, voice_condition=false and eval_steps=null.")
-        if discrete and training_cfg.get("dataloader_num_workers", 0) != 0:
-            raise ValueError("GPU SM quantization in the collator requires dataloader_num_workers=0.")
         if not cfg_dict["diffusion_head"].get("use_mlp_sampler", False):
             raise ValueError("SM autoregressive training requires diffusion_head.use_mlp_sampler=true.")
         data_collator = SMLatentCollator(tok, training_cfg.get("sm_quantizer_checkpoint"),

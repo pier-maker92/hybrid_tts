@@ -16,8 +16,8 @@ training:
   max_steps: -1
 
   # Dataset Settings
-  dataset_name: librispeech-dicodec-v2-ls-25
-  dataset_dir_name: librispeech-dicodec-v2-ls-25
+  dataset_name: librispeech-dicodec-v2-ls-12.5
+  dataset_dir_name: librispeech-dicodec-v2-ls-12.5
   dataset_partitions:
   - train_clean_100
   - train_clean_360
@@ -40,10 +40,10 @@ training:
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: null
   init_discrete_embeddings_from_quantizer: false
-  sm_quantizer_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/q-exps/25/continuous_only/step_19000.pt
+  sm_quantizer_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/q-exps/12.5/continuous_only/step_19000.pt
 
   # Environment, Checkpointing & Logging
-  output_dir: checkpoints/slm/25/continuous_only
+  output_dir: checkpoints/slm/12.5/continuous_only
   run_id: ''
   resume_from_checkpoint: null
   bf16: true
@@ -56,7 +56,7 @@ training:
   save_total_limit: 3
   report_to: wandb
   wandb_project: hybrid-tts-sm
-  wandb_run_name: 25-continuous_only
+  wandb_run_name: 12.5-continuous_only
 
 # Architecture Configurations
 backbone:
@@ -98,7 +98,7 @@ speaker_adapter:
   num_layers: 4
 
 # Extra Configurations
-vae_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/ls/25
+vae_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/ls/12.5
 text_tokenizer: char
 use_tokenize: false
 bpe_tokenizer_path: audio_bpe.json

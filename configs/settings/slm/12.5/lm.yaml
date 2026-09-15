@@ -9,7 +9,6 @@ training:
   lr_scheduler_type: cosine
   warmup_ratio: 0.001
   warmup_steps: 0
-  # bs
   per_device_train_batch_size: 16
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 1
@@ -17,8 +16,8 @@ training:
   max_steps: -1
 
   # Dataset Settings
-  dataset_name: librispeech-dicodec-v2-ls-25
-  dataset_dir_name: librispeech-dicodec-v2-ls-25
+  dataset_name: librispeech-dicodec-v2-ls-12.5
+  dataset_dir_name: librispeech-dicodec-v2-ls-12.5
   dataset_partitions:
   - train_clean_100
   - train_clean_360
@@ -27,7 +26,7 @@ training:
   latent_dataset_path: ${oc.env:SLURM_TMPDIR}/datasets/dicodec/${training.dataset_name}
   latent_cache_dir: ${oc.env:SLURM_TMPDIR}/hybrid_arrow_cache
   group_by_length: false
-  dataloader_num_workers: 0
+  dataloader_num_workers: 4
 
   # Model / SLM Quantization Config
   uncond_prob: 0.1
@@ -41,10 +40,10 @@ training:
   semantic_quantizer_type: vq_ema
   semantic_codebook_size: null
   init_discrete_embeddings_from_quantizer: false
-  sm_quantizer_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/exps/10-September-2026/asr_and_lm/last.pt
+  sm_quantizer_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/q-exps/12.5/lm/step_19000.pt
 
   # Environment, Checkpointing & Logging
-  output_dir: checkpoints/slm/asr_and_lm
+  output_dir: checkpoints/slm/12.5/lm
   run_id: ''
   resume_from_checkpoint: null
   bf16: true
@@ -57,7 +56,7 @@ training:
   save_total_limit: 3
   report_to: wandb
   wandb_project: hybrid-tts-sm
-  wandb_run_name: slm-asr_and_lm
+  wandb_run_name: 12.5-lm
 
 # Architecture Configurations
 backbone:
@@ -99,11 +98,10 @@ speaker_adapter:
   num_layers: 4
 
 # Extra Configurations
-vae_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/ls/25
+vae_checkpoint: $SCRATCH/MelCausalVAE/checkpoints/paper/v2/ls/12.5
 text_tokenizer: char
 use_tokenize: false
 bpe_tokenizer_path: audio_bpe.json
 vocoder_checkpoint: vocos
 debug: false
-continuous_scaling_mode: fixed
-
+continuous_scaling_mode: learnable
